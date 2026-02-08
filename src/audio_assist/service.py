@@ -141,6 +141,9 @@ def create_app(settings: Settings) -> FastAPI:
         speaker_client=speaker_client,
         mic_source_id=settings.mic_source_id,
         mic_speaker_name=settings.mic_speaker_name,
+        speaker_async_enrichment=settings.speaker_async_enrichment,
+        speaker_min_confidence=settings.speaker_min_confidence,
+        speaker_queue_size=settings.speaker_queue_size,
     )
     level_tracker = AudioLevelTracker()
 
@@ -276,7 +279,9 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/v1/speaker/status")
     def speaker_status() -> dict[str, object]:
-        return speaker_client.status()
+        payload = speaker_client.status()
+        payload["pipeline"] = transcriber.speaker_pipeline_status()
+        return payload
 
     @app.get("/v1/devices/mic")
     def list_mic_devices() -> list[dict[str, str | int]]:

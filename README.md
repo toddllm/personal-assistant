@@ -36,6 +36,7 @@ UI defaults:
 - transcript APIs now default to session view (one growing transcript per capture session)
 - default mic speaker label is `Todd Deshane` for source `desk-mic`
 - transcript page defaults to interleaved timeline mode with timestamps; enable `Session view` toggle when needed
+- speaker labeling is optional and best-effort; transcription continues if speaker service is slow/unavailable
 
 `audio-assist` defaults:
 - host/port: `127.0.0.1:8787`
@@ -43,6 +44,7 @@ UI defaults:
 - archived audio segments: `data/audio_segments/`
 - whisper model: `base.en` (lazy-loaded on first audio segment)
 - TTS service URL: `http://toddllm:8790`
+- speaker service URL: `http://127.0.0.1:8791` (disabled by default)
 
 ## 3) Run tts-service
 
@@ -80,6 +82,26 @@ If TTS is down/unreachable, `audio-assist` still returns text answers and includ
 ```bash
 export TTS_SERVICE_PROVIDER=stub
 tts-service
+```
+
+## 3b) Run speaker-service (optional)
+
+Use this if you want chunk-level speaker labels (`SPK_01`, `SPK_02`, ...). It is lightweight and fully optional.
+
+```bash
+cd /Users/tdeshane/personal-assistant
+source .venv/bin/activate
+speaker-service
+```
+
+Then enable speaker detection in `audio-assist`:
+
+```bash
+export AUDIO_ASSIST_SPEAKER_ENABLED=true
+export AUDIO_ASSIST_SPEAKER_SERVICE_URL=http://127.0.0.1:8791
+# keep async mode so speaker detection never blocks transcription
+export AUDIO_ASSIST_SPEAKER_ASYNC_ENRICHMENT=true
+audio-assist
 ```
 
 ## 4) Start listening
@@ -170,6 +192,10 @@ tts-service:
 - `POST /v1/synthesize/stream` (SSE chunked synthesis)
 - `GET /v1/audio/{file_name}`
 
+speaker-service:
+- `GET /health`
+- `POST /v1/diarize/chunk`
+
 ## 7) Config
 
 audio-assist env vars:
@@ -195,6 +221,9 @@ audio-assist env vars:
 - `AUDIO_ASSIST_SPEAKER_SERVICE_URL` (default `http://127.0.0.1:8791`)
 - `AUDIO_ASSIST_SPEAKER_TIMEOUT_SECONDS`
 - `AUDIO_ASSIST_SPEAKER_COOLDOWN_SECONDS`
+- `AUDIO_ASSIST_SPEAKER_ASYNC_ENRICHMENT` (default `true`, recommended)
+- `AUDIO_ASSIST_SPEAKER_QUEUE_SIZE` (default `1024`)
+- `AUDIO_ASSIST_SPEAKER_MIN_CONFIDENCE` (default `0.55`)
 - `AUDIO_ASSIST_ARCHIVE_AUDIO`
 - `AUDIO_ASSIST_ARCHIVE_AUDIO_DIR`
 
@@ -211,3 +240,14 @@ tts-service env vars:
 - `TTS_SERVICE_DEFAULT_VOICE`
 - `TTS_SERVICE_DEFAULT_LANGUAGE`
 - `TTS_SERVICE_DEFAULT_INSTRUCT`
+
+speaker-service env vars:
+- `SPEAKER_SERVICE_HOST`
+- `SPEAKER_SERVICE_PORT`
+- `SPEAKER_SERVICE_WINDOW_SECONDS`
+- `SPEAKER_SERVICE_MIN_WINDOW_SECONDS`
+- `SPEAKER_SERVICE_MIN_VOICE_DBFS`
+- `SPEAKER_SERVICE_SIMILARITY_THRESHOLD`
+- `SPEAKER_SERVICE_CREATE_THRESHOLD`
+- `SPEAKER_SERVICE_MAX_CLUSTERS_PER_SOURCE`
+- `SPEAKER_SERVICE_STALE_SOURCE_SECONDS`

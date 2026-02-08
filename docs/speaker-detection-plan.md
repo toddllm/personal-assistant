@@ -10,6 +10,7 @@
 - Status endpoint:
   - `GET /v1/speaker/status`
 - If the speaker service is down, capture/transcription continues with no speaker labels.
+- When enabled, speaker labeling is processed asynchronously by default, so transcription/capture stays real-time.
 
 ## Expected Speaker Service Contract
 
@@ -22,6 +23,7 @@ Request JSON:
 ```json
 {
   "source_id": "system-audio",
+  "session_id": "system-audio-abc123",
   "sample_rate": 16000,
   "started_at": "2026-02-08T20:00:00Z",
   "ended_at": "2026-02-08T20:00:04.5Z",
@@ -60,6 +62,16 @@ or
    - Low latency chunk-level diarization for “who said what”.
 4. Handle noisy overlap:
    - Keep “unknown” label when confidence is low, rather than guessing.
+
+## Reliability Model
+
+- Core pipeline:
+  - capture -> transcribe -> store transcript (always first)
+- Optional speaker path:
+  - store transcript -> enqueue speaker enrichment -> backfill `speaker` field when available
+- If speaker queue is full or service is down:
+  - transcripts still persist normally
+  - speaker labels are skipped until service recovers
 
 ## Model/Approach Options
 

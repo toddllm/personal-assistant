@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     speaker_service_url: str = "http://127.0.0.1:8791"
     speaker_timeout_seconds: float = 1.8
     speaker_cooldown_seconds: float = 30.0
+    speaker_async_enrichment: bool = True
+    speaker_queue_size: int = 1024
+    speaker_min_confidence: float = 0.55
 
 
 settings = Settings()

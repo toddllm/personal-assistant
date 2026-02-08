@@ -30,6 +30,7 @@ tts = [
 [project.scripts]
 audio-assist = "audio_assist.main:main"
 tts-service = "tts_service.main:main"
+speaker-service = "speaker_service.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

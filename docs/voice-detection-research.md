@@ -36,6 +36,13 @@ Create a separate microservice (for example `voice-detect-service`) that perform
 - `GET /v1/profiles`
   - output: enrolled speaker list
 
+### Current baseline in this repo
+
+This repo now includes an optional `speaker-service` with a lightweight clustering baseline:
+- endpoint-compatible with `POST /v1/diarize/chunk`
+- returns stable per-session labels such as `SPK_01`, `SPK_02`
+- intended for local experimentation and low-friction fallback, not final production accuracy
+
 ## How Qwen3-TTS helps detection
 
 Qwen3-TTS cloned voice workflow can provide:

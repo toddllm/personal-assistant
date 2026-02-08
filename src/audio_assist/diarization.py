@@ -64,6 +64,7 @@ class SpeakerDiarizationClient:
 
         payload = {
             "source_id": segment.source_id,
+            "session_id": segment.session_id,
             "sample_rate": segment.sample_rate,
             "started_at": segment.started_at.astimezone(UTC).isoformat(),
             "ended_at": segment.ended_at.astimezone(UTC).isoformat(),

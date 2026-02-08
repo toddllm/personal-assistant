@@ -986,21 +986,38 @@ async function refreshTtsVoices() {
 async function refreshSpeakerStatus() {
   try {
     const payload = await request("/v1/speaker/status");
+    const pipeline = payload && typeof payload.pipeline === "object" ? payload.pipeline : {};
+    const modeRaw = String(pipeline.mode || "off").toLowerCase();
+    const modeLabel = modeRaw === "async" ? "async post-processing" : modeRaw === "inline" ? "inline" : "off";
+    const queueSize = Number(pipeline.queue_size || 0);
+    const labeled = Number(pipeline.labeled || 0);
+    const processed = Number(pipeline.processed || 0);
+    const dropped = Number(pipeline.dropped || 0);
+    const errors = Number(pipeline.errors || 0);
+
     if (!payload.enabled) {
-      el.speakerStatus.textContent = "Speaker detection disabled (enable AUDIO_ASSIST_SPEAKER_ENABLED=true).";
+      el.speakerStatus.textContent =
+        "Speaker detection disabled (enable AUDIO_ASSIST_SPEAKER_ENABLED=true).";
       return;
     }
     if (payload.cooldown_active) {
       el.speakerStatus.textContent =
-        "Speaker detection microservice unreachable. Running capture without speaker labels.";
+        `Speaker service unreachable (mode: ${modeLabel}). Capture/transcription continue without speaker labels.`;
       return;
     }
     if (payload.reachable === false) {
       el.speakerStatus.textContent =
-        "Speaker detection may be unavailable. Running capture without speaker labels.";
+        `Speaker service may be unavailable (mode: ${modeLabel}). Capture/transcription continue without speaker labels.`;
       return;
     }
-    el.speakerStatus.textContent = "Speaker detection active.";
+    if (modeRaw === "async") {
+      el.speakerStatus.textContent =
+        `Speaker detection active (${modeLabel}). Labeled ${labeled}/${processed} chunks, queue ${queueSize}` +
+        `${dropped > 0 ? `, dropped ${dropped}` : ""}` +
+        `${errors > 0 ? `, errors ${errors}` : ""}.`;
+      return;
+    }
+    el.speakerStatus.textContent = `Speaker detection active (${modeLabel}).`;
   } catch (error) {
     el.speakerStatus.textContent = `Speaker status check failed: ${error.message}`;
   }

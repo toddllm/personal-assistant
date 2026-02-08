@@ -467,6 +467,38 @@ class TranscriptStore:
         records = [self._to_record(row) for row in rows]
         return self._compact_records(records, target_limit=limit)
 
+    def update_speaker(
+        self,
+        transcript_id: int,
+        speaker: str,
+        *,
+        overwrite: bool = False,
+    ) -> bool:
+        speaker_norm = str(speaker or "").strip()[:64]
+        if not speaker_norm:
+            return False
+        with self._lock, self._conn:
+            if overwrite:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE transcripts
+                    SET speaker = ?
+                    WHERE id = ?
+                    """,
+                    (speaker_norm, transcript_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE transcripts
+                    SET speaker = ?
+                    WHERE id = ?
+                      AND (speaker IS NULL OR TRIM(speaker) = '')
+                    """,
+                    (speaker_norm, transcript_id),
+                )
+            return cursor.rowcount > 0
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
