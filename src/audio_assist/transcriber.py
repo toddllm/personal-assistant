@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from threading import Lock, Thread
 from queue import Empty, Full, Queue
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -43,6 +44,10 @@ class TranscriptionWorker:
         speaker_async_enrichment: bool = True,
         speaker_min_confidence: float = 0.55,
         speaker_queue_size: int = 1024,
+        speaker_backfill_enabled: bool = True,
+        speaker_backfill_interval_seconds: float = 20.0,
+        speaker_backfill_batch_size: int = 24,
+        speaker_backfill_since_seconds: int = 4 * 3600,
     ):
         self._store = store
         self._model_name = model_name
@@ -55,12 +60,18 @@ class TranscriptionWorker:
         self._mic_speaker_name = (mic_speaker_name or "").strip() or None
         self._speaker_async_enrichment = bool(speaker_async_enrichment)
         self._speaker_min_confidence = float(max(0.0, min(1.0, speaker_min_confidence)))
+        self._speaker_backfill_enabled = bool(speaker_backfill_enabled)
+        self._speaker_backfill_interval_seconds = float(max(3.0, speaker_backfill_interval_seconds))
+        self._speaker_backfill_batch_size = int(max(4, min(200, speaker_backfill_batch_size)))
+        self._speaker_backfill_since_seconds = int(max(60, speaker_backfill_since_seconds))
         self._queue: Queue[AudioSegment] = Queue(maxsize=512)
         self._speaker_queue: Queue[tuple[int, AudioSegment]] = Queue(maxsize=max(64, speaker_queue_size))
         self._thread: Thread | None = None
         self._speaker_thread: Thread | None = None
+        self._speaker_backfill_thread: Thread | None = None
         self._running = False
         self._speaker_running = False
+        self._speaker_backfill_running = False
         self._model = None
         self._model_load_failed = False
         self._speaker_stats_lock = Lock()
@@ -70,6 +81,12 @@ class TranscriptionWorker:
         self._speaker_labeled = 0
         self._speaker_errors = 0
         self._speaker_low_confidence = 0
+        self._speaker_backfill_runs = 0
+        self._speaker_backfill_scanned = 0
+        self._speaker_backfill_labeled = 0
+        self._speaker_backfill_missing_audio = 0
+        self._speaker_backfill_errors = 0
+        self._speaker_backfill_last_run_at: datetime | None = None
 
     def start(self) -> None:
         if self._running:
@@ -82,11 +99,18 @@ class TranscriptionWorker:
             self._speaker_running = True
             self._speaker_thread = Thread(target=self._run_speaker_enrichment, daemon=True)
             self._speaker_thread.start()
+            if self._can_run_backfill():
+                self._speaker_backfill_running = True
+                self._speaker_backfill_thread = Thread(target=self._run_speaker_backfill_loop, daemon=True)
+                self._speaker_backfill_thread.start()
 
     def stop(self) -> None:
         self._running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+        self._speaker_backfill_running = False
+        if self._speaker_backfill_thread and self._speaker_backfill_thread.is_alive():
+            self._speaker_backfill_thread.join(timeout=2)
         self._speaker_running = False
         if self._speaker_thread and self._speaker_thread.is_alive():
             self._speaker_thread.join(timeout=2)
@@ -248,6 +272,104 @@ class TranscriptionWorker:
             finally:
                 self._speaker_queue.task_done()
 
+    def _can_run_backfill(self) -> bool:
+        return (
+            self._speaker_client is not None
+            and self._speaker_async_enrichment
+            and self._speaker_backfill_enabled
+            and self._archiver is not None
+        )
+
+    def _run_speaker_backfill_loop(self) -> None:
+        while self._speaker_backfill_running:
+            try:
+                # Prioritize live queue first.
+                if self._speaker_queue.qsize() >= max(24, self._speaker_backfill_batch_size):
+                    time.sleep(1.5)
+                    continue
+                self.run_speaker_backfill_once()
+            except Exception:  # noqa: BLE001
+                with self._speaker_stats_lock:
+                    self._speaker_backfill_errors += 1
+                logger.exception("Speaker backfill loop failed.")
+            time.sleep(self._speaker_backfill_interval_seconds)
+
+    def run_speaker_backfill_once(self, limit: int | None = None, since_seconds: int | None = None) -> dict[str, int]:
+        if not self._can_run_backfill():
+            return {
+                "runs": 0,
+                "scanned": 0,
+                "labeled": 0,
+                "missing_audio": 0,
+                "errors": 0,
+            }
+        if self._archiver is None:
+            return {
+                "runs": 0,
+                "scanned": 0,
+                "labeled": 0,
+                "missing_audio": 0,
+                "errors": 0,
+            }
+
+        batch_limit = int(max(1, min(limit or self._speaker_backfill_batch_size, 500)))
+        since = int(max(60, since_seconds or self._speaker_backfill_since_seconds))
+        scanned = 0
+        labeled = 0
+        missing_audio = 0
+        errors = 0
+
+        records = self._store.recent_unlabeled(limit=batch_limit, since_seconds=since)
+        for record in records:
+            if record.source_id == self._mic_source_id and self._mic_speaker_name:
+                continue
+            loaded = self._archiver.load_segment(
+                source_id=record.source_id,
+                started_at=record.started_at,
+                ended_at=record.ended_at,
+            )
+            if loaded is None:
+                missing_audio += 1
+                continue
+            pcm, sample_rate = loaded
+            segment = AudioSegment(
+                source_id=record.source_id,
+                session_id=record.session_id,
+                started_at=record.started_at,
+                ended_at=record.ended_at,
+                pcm_s16le=pcm,
+                sample_rate=sample_rate,
+            )
+            scanned += 1
+            try:
+                detection = self._detect_remote_speaker(segment)
+                speaker = self._speaker_from_detection(detection)
+                if speaker and self._store.update_speaker(record.id, speaker):
+                    labeled += 1
+            except Exception:  # noqa: BLE001
+                errors += 1
+                logger.exception(
+                    "Speaker backfill failed for transcript_id=%s source=%s",
+                    record.id,
+                    record.source_id,
+                )
+
+        now = datetime.now(tz=UTC)
+        with self._speaker_stats_lock:
+            self._speaker_backfill_runs += 1
+            self._speaker_backfill_scanned += scanned
+            self._speaker_backfill_labeled += labeled
+            self._speaker_backfill_missing_audio += missing_audio
+            self._speaker_backfill_errors += errors
+            self._speaker_backfill_last_run_at = now
+        return {
+            "runs": 1,
+            "scanned": scanned,
+            "labeled": labeled,
+            "missing_audio": missing_audio,
+            "errors": errors,
+        }
+
     def speaker_pipeline_status(self) -> dict[str, object]:
         mode = "off"
         if self._speaker_client is not None:
@@ -263,4 +385,12 @@ class TranscriptionWorker:
                 "errors": self._speaker_errors,
                 "low_confidence": self._speaker_low_confidence,
                 "min_confidence": self._speaker_min_confidence,
+                "backfill_enabled": self._can_run_backfill(),
+                "backfill_running": self._speaker_backfill_running,
+                "backfill_runs": self._speaker_backfill_runs,
+                "backfill_scanned": self._speaker_backfill_scanned,
+                "backfill_labeled": self._speaker_backfill_labeled,
+                "backfill_missing_audio": self._speaker_backfill_missing_audio,
+                "backfill_errors": self._speaker_backfill_errors,
+                "backfill_last_run_at": self._speaker_backfill_last_run_at,
             }

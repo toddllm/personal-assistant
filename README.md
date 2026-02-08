@@ -37,6 +37,7 @@ UI defaults:
 - default mic speaker label is `Todd Deshane` for source `desk-mic`
 - transcript page defaults to interleaved timeline mode with timestamps; enable `Session view` toggle when needed
 - speaker labeling is optional and best-effort; transcription continues if speaker service is slow/unavailable
+- speaker backfill can relabel recent unlabeled chunks from archived WAV files as audio keeps growing
 
 `audio-assist` defaults:
 - host/port: `127.0.0.1:8787`
@@ -174,6 +175,7 @@ audio-assist:
 - `GET /v1/tts/status`
 - `GET /v1/tts/voices`
 - `GET /v1/speaker/status`
+- `POST /v1/speaker/backfill`
 - `POST /v1/tts/synthesize/stream` (SSE chunked voice stream)
 - `GET /v1/sources`
 - `POST /v1/sources/start`
@@ -224,6 +226,10 @@ audio-assist env vars:
 - `AUDIO_ASSIST_SPEAKER_ASYNC_ENRICHMENT` (default `true`, recommended)
 - `AUDIO_ASSIST_SPEAKER_QUEUE_SIZE` (default `1024`)
 - `AUDIO_ASSIST_SPEAKER_MIN_CONFIDENCE` (default `0.55`)
+- `AUDIO_ASSIST_SPEAKER_BACKFILL_ENABLED` (default `true`)
+- `AUDIO_ASSIST_SPEAKER_BACKFILL_INTERVAL_SECONDS` (default `20`)
+- `AUDIO_ASSIST_SPEAKER_BACKFILL_BATCH_SIZE` (default `24`)
+- `AUDIO_ASSIST_SPEAKER_BACKFILL_SINCE_SECONDS` (default `14400`)
 - `AUDIO_ASSIST_ARCHIVE_AUDIO`
 - `AUDIO_ASSIST_ARCHIVE_AUDIO_DIR`
 

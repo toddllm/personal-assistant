@@ -69,6 +69,9 @@ or
   - capture -> transcribe -> store transcript (always first)
 - Optional speaker path:
   - store transcript -> enqueue speaker enrichment -> backfill `speaker` field when available
+- Archive-assisted upgrades:
+  - a background backfill pass reuses saved WAV chunk files to label recent unlabeled rows
+  - this lets labels improve over time even if the speaker service was temporarily unavailable
 - If speaker queue is full or service is down:
   - transcripts still persist normally
   - speaker labels are skipped until service recovers

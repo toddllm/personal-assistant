@@ -42,6 +42,7 @@ This repo now includes an optional `speaker-service` with a lightweight clusteri
 - endpoint-compatible with `POST /v1/diarize/chunk`
 - returns stable per-session labels such as `SPK_01`, `SPK_02`
 - intended for local experimentation and low-friction fallback, not final production accuracy
+- `audio-assist` can also run archive-assisted backfill to relabel recent unlabeled transcript rows as more WAV chunks accumulate
 
 ## How Qwen3-TTS helps detection
 

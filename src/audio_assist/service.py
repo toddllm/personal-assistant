@@ -144,6 +144,10 @@ def create_app(settings: Settings) -> FastAPI:
         speaker_async_enrichment=settings.speaker_async_enrichment,
         speaker_min_confidence=settings.speaker_min_confidence,
         speaker_queue_size=settings.speaker_queue_size,
+        speaker_backfill_enabled=settings.speaker_backfill_enabled,
+        speaker_backfill_interval_seconds=settings.speaker_backfill_interval_seconds,
+        speaker_backfill_batch_size=settings.speaker_backfill_batch_size,
+        speaker_backfill_since_seconds=settings.speaker_backfill_since_seconds,
     )
     level_tracker = AudioLevelTracker()
 
@@ -282,6 +286,15 @@ def create_app(settings: Settings) -> FastAPI:
         payload = speaker_client.status()
         payload["pipeline"] = transcriber.speaker_pipeline_status()
         return payload
+
+    @app.post("/v1/speaker/backfill")
+    def speaker_backfill(limit: int | None = None, since_seconds: int | None = None) -> dict[str, object]:
+        result = transcriber.run_speaker_backfill_once(limit=limit, since_seconds=since_seconds)
+        return {
+            "ok": True,
+            "result": result,
+            "pipeline": transcriber.speaker_pipeline_status(),
+        }
 
     @app.get("/v1/devices/mic")
     def list_mic_devices() -> list[dict[str, str | int]]:

@@ -994,6 +994,9 @@ async function refreshSpeakerStatus() {
     const processed = Number(pipeline.processed || 0);
     const dropped = Number(pipeline.dropped || 0);
     const errors = Number(pipeline.errors || 0);
+    const backfillRuns = Number(pipeline.backfill_runs || 0);
+    const backfillScanned = Number(pipeline.backfill_scanned || 0);
+    const backfillLabeled = Number(pipeline.backfill_labeled || 0);
 
     if (!payload.enabled) {
       el.speakerStatus.textContent =
@@ -1013,6 +1016,7 @@ async function refreshSpeakerStatus() {
     if (modeRaw === "async") {
       el.speakerStatus.textContent =
         `Speaker detection active (${modeLabel}). Labeled ${labeled}/${processed} chunks, queue ${queueSize}` +
+        `, backfill ${backfillLabeled}/${backfillScanned} (${backfillRuns} runs)` +
         `${dropped > 0 ? `, dropped ${dropped}` : ""}` +
         `${errors > 0 ? `, errors ${errors}` : ""}.`;
       return;

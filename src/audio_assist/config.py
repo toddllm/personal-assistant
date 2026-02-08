@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     speaker_async_enrichment: bool = True
     speaker_queue_size: int = 1024
     speaker_min_confidence: float = 0.55
+    speaker_backfill_enabled: bool = True
+    speaker_backfill_interval_seconds: float = 20.0
+    speaker_backfill_batch_size: int = 24
+    speaker_backfill_since_seconds: int = 4 * 3600
 
 
 settings = Settings()

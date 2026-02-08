@@ -304,6 +304,37 @@ class TranscriptStore:
             rows = self._conn.execute(query, params).fetchall()
         return [self._to_record(row) for row in rows]
 
+    def recent_unlabeled(
+        self,
+        limit: int = 100,
+        source_id: str | None = None,
+        since_seconds: int | None = None,
+    ) -> list[TranscriptRecord]:
+        safe_limit = max(1, min(limit, 2000))
+        filters: list[str] = ["(speaker IS NULL OR TRIM(speaker) = '')"]
+        params: list[object] = []
+        if source_id:
+            filters.append("source_id = ?")
+            params.append(source_id)
+        if since_seconds:
+            cutoff = datetime.now(tz=UTC) - timedelta(seconds=since_seconds)
+            filters.append("ended_at >= ?")
+            params.append(cutoff.isoformat())
+
+        where_clause = f"WHERE {' AND '.join(filters)}" if filters else ""
+        query = f"""
+            SELECT id, source_id, session_id, started_at, ended_at, text, speaker
+            FROM transcripts
+            {where_clause}
+            ORDER BY id DESC
+            LIMIT ?
+        """
+        params.append(safe_limit)
+
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._to_record(row) for row in rows]
+
     def recent_compact(
         self,
         limit: int = 50,
