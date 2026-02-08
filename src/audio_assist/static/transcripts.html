@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audio Assist - Full Transcripts</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="layout">
+      <header class="panel hero fade">
+        <div>
+          <h1>Full Transcripts</h1>
+          <p>
+            Stable transcript browser with pagination, copy/export, and source filtering for
+            long-form review.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <a class="ghost-btn" href="/">Back to Console</a>
+          <a class="ghost-btn" href="/docs" target="_blank" rel="noreferrer">Open API Docs</a>
+        </div>
+      </header>
+
+      <section class="panel fade delay-1">
+        <h2>Transcript Manager</h2>
+        <div class="grid">
+          <label>
+            Source
+            <select id="source-filter"></select>
+          </label>
+          <label>
+            Since (hours)
+            <input id="since-hours" type="number" min="1" value="24" />
+          </label>
+          <label>
+            Page Size
+            <input id="page-size" type="number" min="20" max="1000" value="200" />
+          </label>
+          <label>
+            Compact Merge
+            <div class="toggle-row">
+              <label class="toggle">
+                <input id="compact" type="checkbox" />
+                <span>Merge neighboring chunks</span>
+              </label>
+            </div>
+          </label>
+          <label>
+            View Mode
+            <div class="toggle-row">
+              <label class="toggle">
+                <input id="sessionized" type="checkbox" />
+                <span>Session view (one item per source session)</span>
+              </label>
+            </div>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="load-first" type="button">Load Latest</button>
+          <button id="load-more" class="ghost-btn" type="button">Load Older</button>
+          <button id="load-all" class="ghost-btn" type="button">Load All</button>
+          <button id="copy-loaded" class="ghost-btn" type="button">Copy Loaded</button>
+          <button id="download-txt" class="ghost-btn" type="button">Download TXT</button>
+          <button id="download-json" class="ghost-btn" type="button">Download JSON</button>
+          <button id="clear" class="ghost-btn" type="button">Clear View</button>
+        </div>
+        <p id="status" class="status muted">Ready.</p>
+      </section>
+
+      <section class="panel fade delay-2">
+        <div class="panel-header">
+          <h2>Loaded Transcript Entries</h2>
+          <p id="meta" class="muted">No entries loaded.</p>
+        </div>
+        <div id="list" class="list transcript-list"></div>
+      </section>
+
+      <section class="panel fade delay-3">
+        <h2>Plain Text View</h2>
+        <p class="muted">Chronological combined text for copy/paste into notes or docs.</p>
+        <div class="actions">
+          <button id="copy-plain" type="button">Copy Plain Text</button>
+          <button id="paste-plain" class="ghost-btn" type="button">Paste from Clipboard</button>
+        </div>
+        <textarea id="plain-text" rows="16" spellcheck="false"></textarea>
+      </section>
+    </main>
+
+    <script src="/static/transcripts.js" defer></script>
+  </body>
+</html>

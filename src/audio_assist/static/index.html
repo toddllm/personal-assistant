@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audio Assist Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="layout">
+      <header class="panel hero fade">
+        <div>
+          <h1>Audio Assist Console</h1>
+          <p>
+            Live transcript monitor with a verbose mode and local Ollama Q&A grounded in transcript
+            evidence.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <a class="ghost-btn" href="/transcripts">Full Transcripts</a>
+          <a class="ghost-btn" href="/docs" target="_blank" rel="noreferrer">Open API Docs</a>
+        </div>
+      </header>
+
+      <section class="panel controls fade delay-1">
+        <h2>Capture Control</h2>
+        <p class="muted section-intro">
+          Quick Add is recommended for day-to-day capture. Manual source controls are for custom mic/ffmpeg setup.
+        </p>
+
+        <div class="source-block">
+          <h3>Quick Add (Recommended)</h3>
+          <div class="grid">
+            <label>
+              Source Preset
+              <select id="source-preset"></select>
+            </label>
+            <label>
+              Auto Start
+              <div class="toggle-row">
+                <label class="toggle">
+                  <input id="auto-start-sources" type="checkbox" checked />
+                  <span>Auto-start common sources</span>
+                </label>
+              </div>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="add-source" type="button">Add Selected Source</button>
+            <button id="refresh-sources" class="ghost-btn" type="button">Refresh Sources</button>
+          </div>
+        </div>
+
+        <div class="source-block">
+          <h3>Manual Source (Advanced)</h3>
+          <div class="grid">
+            <label>
+              Source Type
+              <select id="manual-source-type">
+                <option value="mic">Mic</option>
+                <option value="ffmpeg">ffmpeg</option>
+              </select>
+            </label>
+            <label>
+              Source ID
+              <input id="source-id" value="desk-mic-manual" />
+            </label>
+            <label id="manual-mic-fields">
+              Mic Device
+              <div class="inline">
+                <select id="mic-device"></select>
+                <button id="refresh-devices" class="ghost-btn" type="button">Refresh</button>
+                <button id="detect-devices" class="ghost-btn" type="button">Detect Active</button>
+                <button id="cycle-devices" class="ghost-btn" type="button">Cycle & Find</button>
+              </div>
+            </label>
+            <label id="manual-ffmpeg-input" class="hidden">
+              ffmpeg Input
+              <input id="ffmpeg-input" placeholder=":0" />
+            </label>
+            <label id="manual-ffmpeg-format" class="hidden">
+              ffmpeg Input Format
+              <input id="ffmpeg-format" placeholder="avfoundation" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="start-manual-source" type="button">Start Manual Source</button>
+          </div>
+          <p id="mic-scan-status" class="muted">Run Detect Active to find which input currently has audio.</p>
+          <div id="mic-scan-list" class="list compact"></div>
+        </div>
+
+        <div class="source-block">
+          <h3>Transcript View</h3>
+          <div class="grid">
+            <label>
+              Source Filter
+              <select id="source-filter"></select>
+            </label>
+            <label>
+              Since (seconds)
+              <input id="since-seconds" type="number" min="1" value="3600" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="refresh-now" class="ghost-btn" type="button">Refresh Transcripts</button>
+            <button id="stop-source" class="danger" type="button">Stop Selected Source</button>
+            <label class="toggle">
+              <input id="show-stopped-sources" type="checkbox" />
+              <span>Show stopped sources</span>
+            </label>
+            <label class="toggle">
+              <input id="verbose" type="checkbox" />
+              <span>Verbose</span>
+            </label>
+          </div>
+        </div>
+
+        <p id="control-status" class="status muted">Ready.</p>
+        <div>
+          <p class="muted">Running Sources</p>
+          <div id="running-sources" class="list compact"></div>
+        </div>
+      </section>
+
+      <section class="panel transcripts fade delay-2">
+        <div class="panel-header">
+          <h2>Live Transcripts</h2>
+          <p id="transcript-meta" class="muted">Waiting for transcript chunks...</p>
+        </div>
+        <div id="transcript-list" class="list"></div>
+      </section>
+
+      <section class="panel qa fade delay-3">
+        <h2>Ask Ollama</h2>
+        <label>
+          Question
+          <textarea id="question" rows="4" placeholder="What action items were mentioned?"></textarea>
+        </label>
+        <div class="grid">
+          <label>
+            Ollama Model
+            <div class="inline">
+              <select id="ollama-model"></select>
+              <button id="refresh-models" class="ghost-btn" type="button">Refresh</button>
+            </div>
+          </label>
+          <label>
+            Evidence Limit
+            <input id="query-limit" type="number" min="1" max="50" value="8" />
+          </label>
+          <label>
+            TTS Voice
+            <div class="inline">
+              <select id="tts-voice"></select>
+              <button id="refresh-tts-voices" class="ghost-btn" type="button">Refresh</button>
+            </div>
+          </label>
+          <label>
+            Speak Answer
+            <div class="toggle-row">
+              <label class="toggle">
+                <input id="speak-answer" type="checkbox" checked />
+                <span>Enable voice response</span>
+              </label>
+            </div>
+          </label>
+          <label>
+            Stream Voice
+            <div class="toggle-row">
+              <label class="toggle">
+                <input id="stream-voice" type="checkbox" checked />
+                <span>Stream chunks while generating</span>
+              </label>
+            </div>
+          </label>
+        </div>
+        <p id="ollama-status" class="muted">Loading local Ollama models...</p>
+        <p id="tts-status" class="muted">Loading TTS voice options...</p>
+        <p id="speaker-status" class="muted">Loading speaker detection status...</p>
+        <div class="actions">
+          <button id="ask-ollama" type="button">Ask from Transcript Context</button>
+        </div>
+        <div class="answer-block">
+          <p class="muted">Answer</p>
+          <pre id="answer">No question asked yet.</pre>
+          <p id="answer-provider" class="muted"></p>
+          <audio id="answer-audio" controls></audio>
+        </div>
+        <div>
+          <p class="muted">Evidence Used</p>
+          <div id="evidence-list" class="list compact"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

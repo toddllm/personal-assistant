@@ -1,0 +1,422 @@
+:root {
+  --bg-top: #f8f3ea;
+  --bg-bottom: #e7eef8;
+  --ink: #1d2430;
+  --muted: #5c6470;
+  --panel: #ffffffde;
+  --line: #ccd7e4;
+  --primary: #0f62fe;
+  --primary-ink: #ffffff;
+  --danger: #bf2f39;
+  --radius: 14px;
+  --shadow: 0 14px 40px rgba(25, 36, 55, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  font-family: "Chivo", sans-serif;
+  color: var(--ink);
+  min-height: 100%;
+  background: linear-gradient(165deg, var(--bg-top), var(--bg-bottom));
+}
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background-image:
+    radial-gradient(circle at 10% 8%, rgba(253, 194, 48, 0.22), transparent 30%),
+    radial-gradient(circle at 92% 18%, rgba(15, 98, 254, 0.15), transparent 36%),
+    repeating-linear-gradient(
+      0deg,
+      rgba(17, 34, 68, 0.03) 0,
+      rgba(17, 34, 68, 0.03) 1px,
+      transparent 1px,
+      transparent 24px
+    );
+  pointer-events: none;
+}
+
+.layout {
+  position: relative;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 24px;
+  display: grid;
+  gap: 16px;
+}
+
+.panel {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  padding: 16px;
+}
+
+.hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 2rem;
+  letter-spacing: 0.01em;
+}
+
+h2 {
+  margin-bottom: 10px;
+}
+
+h3 {
+  margin: 0 0 10px;
+  font-size: 1.08rem;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.section-intro {
+  margin-bottom: 12px;
+}
+
+.source-block {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fbff;
+  padding: 12px;
+  margin-top: 10px;
+}
+
+.source-block:first-of-type {
+  margin-top: 0;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.94rem;
+}
+
+input,
+textarea,
+select,
+button {
+  font: inherit;
+  border-radius: 10px;
+}
+
+input,
+textarea,
+select {
+  border: 1px solid var(--line);
+  padding: 10px;
+  background: #fff;
+}
+
+textarea {
+  resize: vertical;
+}
+
+.inline {
+  display: flex;
+  gap: 8px;
+}
+
+.actions {
+  margin-top: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+button {
+  border: none;
+  background: var(--primary);
+  color: var(--primary-ink);
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: transform 140ms ease, filter 140ms ease;
+}
+
+button:hover {
+  filter: brightness(1.05);
+  transform: translateY(-1px);
+}
+
+.ghost-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink);
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 14px;
+}
+
+.danger {
+  background: var(--danger);
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.toggle-row {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+}
+
+.hidden {
+  display: none;
+}
+
+.status {
+  margin-top: 10px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.list {
+  margin-top: 10px;
+  display: grid;
+  gap: 8px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.list.compact {
+  max-height: 220px;
+}
+
+.transcript-list {
+  max-height: min(68vh, 920px);
+}
+
+.entry {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+  animation: rise 220ms ease;
+}
+
+.entry .meta {
+  color: var(--muted);
+  font-size: 0.78rem;
+  margin-bottom: 6px;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.entry .text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.source-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.source-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.level-meta {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.level-meter {
+  margin-top: 6px;
+  height: 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #eef3fa;
+  overflow: hidden;
+}
+
+.level-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #3d7d17, #b8b319);
+  transition: width 220ms ease;
+}
+
+.level-fill.silent {
+  background: linear-gradient(90deg, #98a4b3, #c2ccd8);
+}
+
+.level-fill.clip {
+  background: linear-gradient(90deg, #d95d15, #bf2f39);
+}
+
+.level-flags {
+  margin-top: 6px;
+  min-height: 20px;
+  display: flex;
+  gap: 6px;
+}
+
+.level-flag {
+  font-size: 0.72rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  color: var(--muted);
+  background: #fff;
+}
+
+.level-flag.clip {
+  color: #9c1d2a;
+  border-color: #e2a8af;
+  background: #fff1f2;
+}
+
+.scan-meter {
+  margin-top: 6px;
+  height: 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #eef3fa;
+  overflow: hidden;
+}
+
+.scan-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #3d7d17, #b8b319);
+  transition: width 220ms ease;
+}
+
+.scan-fill.silent,
+.scan-fill.low {
+  background: linear-gradient(90deg, #98a4b3, #c2ccd8);
+}
+
+.scan-fill.hot {
+  background: linear-gradient(90deg, #d95d15, #bf2f39);
+}
+
+.scan-fill.error {
+  background: linear-gradient(90deg, #bf2f39, #bf2f39);
+}
+
+.source-row-actions {
+  display: flex;
+  align-items: center;
+}
+
+.source-row-actions .ghost-btn {
+  padding: 6px 10px;
+}
+
+.answer-block {
+  margin-top: 12px;
+}
+
+pre {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px;
+  margin: 6px 0;
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+#answer-audio {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.fade {
+  opacity: 0;
+  transform: translateY(10px);
+  animation: fade-up 360ms ease forwards;
+}
+
+.delay-1 {
+  animation-delay: 70ms;
+}
+
+.delay-2 {
+  animation-delay: 130ms;
+}
+
+.delay-3 {
+  animation-delay: 190ms;
+}
+
+@keyframes fade-up {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 860px) {
+  .layout {
+    padding: 14px;
+  }
+  .hero {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  .panel-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
