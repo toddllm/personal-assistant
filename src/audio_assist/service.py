@@ -15,6 +15,7 @@ from audio_assist.archive import AudioArchiver
 from audio_assist.config import Settings
 from audio_assist.diarization import SpeakerDiarizationClient
 from audio_assist.levels import AudioLevelTracker
+from audio_assist.postprocess import TranscriptPostProcessor
 from audio_assist.qa import QAEngine
 from audio_assist.schemas import (
     PCMIngestRequest,
@@ -27,6 +28,8 @@ from audio_assist.schemas import (
     TranscriptPage,
     TranscriptIngestRequest,
     TranscriptItem,
+    TranscriptPostprocessRequest,
+    TranscriptPostprocessResult,
 )
 from audio_assist.sources import SourceManager
 from audio_assist.storage import SessionRecord, TranscriptRecord, TranscriptStore
@@ -197,6 +200,18 @@ def create_app(settings: Settings) -> FastAPI:
         default_language=settings.tts_default_language,
         default_instruct=settings.tts_default_instruct,
     )
+    postprocessor = (
+        TranscriptPostProcessor(
+            store=store,
+            archiver=archiver,
+            default_model_name=settings.whisper_postprocess_model,
+            default_device=settings.whisper_postprocess_device,
+            default_compute_type=settings.whisper_postprocess_compute_type,
+            default_language=settings.whisper_postprocess_language,
+        )
+        if archiver is not None
+        else None
+    )
 
     @app.on_event("startup")
     def startup() -> None:
@@ -295,6 +310,18 @@ def create_app(settings: Settings) -> FastAPI:
             "result": result,
             "pipeline": transcriber.speaker_pipeline_status(),
         }
+
+    @app.post("/v1/transcripts/postprocess", response_model=TranscriptPostprocessResult)
+    def postprocess_transcripts(req: TranscriptPostprocessRequest) -> TranscriptPostprocessResult:
+        if postprocessor is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Audio archive is disabled. Enable archive_audio to post-process WAV chunks.",
+            )
+        try:
+            return postprocessor.process_recent(req)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.get("/v1/devices/mic")
     def list_mic_devices() -> list[dict[str, str | int]]:

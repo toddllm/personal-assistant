@@ -56,6 +56,41 @@ class TranscriptPage(BaseModel):
     has_more: bool = False
 
 
+class TranscriptPostprocessRequest(BaseModel):
+    source_id: str | None = None
+    since_seconds: int | None = Field(default=3600, ge=1)
+    limit: int = Field(default=30, ge=1, le=500)
+    apply: bool = True
+    language: str | None = None
+    model_name: str | None = None
+    include_unchanged: bool = False
+
+
+class TranscriptPostprocessItem(BaseModel):
+    id: int
+    source_id: str
+    started_at: datetime
+    ended_at: datetime
+    old_text: str
+    new_text: str | None = None
+    changed: bool = False
+    applied: bool = False
+    detected_language: str | None = None
+    language_probability: float | None = None
+    error: str | None = None
+
+
+class TranscriptPostprocessResult(BaseModel):
+    scanned: int = 0
+    changed: int = 0
+    applied: int = 0
+    missing_audio: int = 0
+    failed: int = 0
+    model_name: str
+    language: str | None = None
+    items: list[TranscriptPostprocessItem] = Field(default_factory=list)
+
+
 class TranscriptIngestRequest(BaseModel):
     source_id: str
     session_id: str | None = None

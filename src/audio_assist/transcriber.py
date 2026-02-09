@@ -53,7 +53,7 @@ class TranscriptionWorker:
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
-        self._language = language
+        self._language = self._normalize_language(language)
         self._archiver = archiver
         self._speaker_client = speaker_client
         self._mic_source_id = mic_source_id
@@ -201,6 +201,13 @@ class TranscriptionWorker:
             without_timestamps=True,
         )
         return " ".join(part.text.strip() for part in parts if part.text.strip()).strip()
+
+    @staticmethod
+    def _normalize_language(language: str | None) -> str | None:
+        value = str(language or "").strip().lower()
+        if not value or value in {"auto", "none", "null"}:
+            return None
+        return value
 
     def _owner_speaker_for_segment(self, segment: AudioSegment) -> str | None:
         if self._mic_speaker_name and segment.source_id == self._mic_source_id:

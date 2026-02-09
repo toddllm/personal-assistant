@@ -183,6 +183,7 @@ audio-assist:
 - `GET /v1/transcripts/recent`
 - `GET /v1/transcripts/page`
 - `GET /v1/transcripts/sources`
+- `POST /v1/transcripts/postprocess` (re-transcribe archived WAV chunks; optional apply)
 - `POST /v1/query`
 - `POST /v1/ingest/transcript`
 - `POST /v1/ingest/pcm`
@@ -208,6 +209,11 @@ audio-assist env vars:
 - `AUDIO_ASSIST_WHISPER_MODEL`
 - `AUDIO_ASSIST_WHISPER_DEVICE`
 - `AUDIO_ASSIST_WHISPER_COMPUTE_TYPE`
+- `AUDIO_ASSIST_WHISPER_LANGUAGE` (use `auto` for language detection)
+- `AUDIO_ASSIST_WHISPER_POSTPROCESS_MODEL`
+- `AUDIO_ASSIST_WHISPER_POSTPROCESS_DEVICE`
+- `AUDIO_ASSIST_WHISPER_POSTPROCESS_COMPUTE_TYPE`
+- `AUDIO_ASSIST_WHISPER_POSTPROCESS_LANGUAGE` (default `auto`)
 - `AUDIO_ASSIST_QA_PROVIDER` (`extractive` or `ollama`)
 - `AUDIO_ASSIST_OLLAMA_URL`
 - `AUDIO_ASSIST_OLLAMA_MODEL`

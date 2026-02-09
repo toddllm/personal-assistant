@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     whisper_compute_type: str = "int8"
     whisper_device: str = "cpu"
     whisper_language: str = "en"
+    whisper_postprocess_model: str = "small"
+    whisper_postprocess_compute_type: str = "int8"
+    whisper_postprocess_device: str = "cpu"
+    whisper_postprocess_language: str = "auto"
 
     database_path: Path = Field(default_factory=lambda: Path("data/audio_assist.db"))
     archive_audio: bool = True

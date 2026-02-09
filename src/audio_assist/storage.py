@@ -530,6 +530,38 @@ class TranscriptStore:
                 )
             return cursor.rowcount > 0
 
+    def update_text(
+        self,
+        transcript_id: int,
+        text: str,
+        *,
+        overwrite_empty_only: bool = False,
+    ) -> bool:
+        text_norm = str(text or "").strip()
+        if not text_norm:
+            return False
+        with self._lock, self._conn:
+            if overwrite_empty_only:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE transcripts
+                    SET text = ?
+                    WHERE id = ?
+                      AND (text IS NULL OR TRIM(text) = '')
+                    """,
+                    (text_norm, transcript_id),
+                )
+            else:
+                cursor = self._conn.execute(
+                    """
+                    UPDATE transcripts
+                    SET text = ?
+                    WHERE id = ?
+                    """,
+                    (text_norm, transcript_id),
+                )
+            return cursor.rowcount > 0
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
