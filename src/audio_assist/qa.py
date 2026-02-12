@@ -107,6 +107,7 @@ class QAEngine:
                 "return only their English translations.\n"
                 "Output format: one translated line per line, no headers, no analysis, no labels.\n"
             )
+        context_block = "\n".join(context_lines)
         prompt = (
             "You answer questions using only transcript evidence.\n"
             "If evidence is insufficient, say exactly: Insufficient evidence.\n"
@@ -116,7 +117,7 @@ class QAEngine:
             "Do not include source citations like [1] or 【1】.\n\n"
             f"Question: {question}\n\n"
             "Evidence:\n"
-            f"{'\n'.join(context_lines)}"
+            f"{context_block}"
         )
         payload = {
             "model": model,
@@ -147,13 +148,14 @@ class QAEngine:
     ) -> tuple[str, bool]:
         max_words = int(max(3, min(max_words, 16)))
         context_lines = self._build_context_lines(evidence, max_items=28, max_chars=7000)
+        context_block = "\n".join(context_lines)
         prompt = (
             "You create concise meeting titles from transcript evidence.\n"
             f"Return exactly one title, at most {max_words} words.\n"
             "Use plain title case text only. No quotes, no punctuation at the ends, no emojis.\n"
             "If evidence is unclear, return exactly: General Discussion.\n\n"
             "Transcript Evidence:\n"
-            f"{'\n'.join(context_lines)}"
+            f"{context_block}"
         )
         payload = {
             "model": model,
