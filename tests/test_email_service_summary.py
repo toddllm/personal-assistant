@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from email_service.config import Settings
-from email_service.service import summarize_gmail_messages
+from email_service.service import _extract_ollama_content, summarize_gmail_messages
 
 
 def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
@@ -60,3 +60,13 @@ def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
     assert top_thread.thread_id == "t-1"
     assert top_thread.unread_count == 1
     assert "boss@example.com" in top_thread.participants
+
+
+def test_extract_ollama_content_supports_chat_and_generate_shapes() -> None:
+    chat_payload = {"message": {"role": "assistant", "content": "Hello from chat"}}
+    generate_payload = {"response": "Hello from generate"}
+    empty_payload = {"done": True}
+
+    assert _extract_ollama_content(chat_payload) == "Hello from chat"
+    assert _extract_ollama_content(generate_payload) == "Hello from generate"
+    assert _extract_ollama_content(empty_payload) is None

@@ -21,7 +21,10 @@ Default bind:
 
 ## Core endpoints
 
+- `GET /` (simple local frontend)
 - `GET /health`
+- `GET /v1/assistant/status`
+- `POST /v1/assistant/query`
 - `POST /v1/inbox/refresh`
 - `GET /v1/inbox/overview`
 - `GET /v1/inbox/focus`
@@ -33,6 +36,7 @@ Default bind:
 1. `email-service` calls local `google-sync-service` (`/v1/gmail/sync` or `/v1/gmail/latest`).
 2. Messages are scored/clustered locally.
 3. Snapshot is written to local storage and served by `email-service`.
+4. Optional Ollama query endpoint answers questions using only local snapshot context.
 
 ## Logging
 
@@ -47,6 +51,15 @@ Config prefix: `EMAIL_SERVICE_`
 
 Default log path:
 - `data/logs/email-service.log`
+
+## Ollama config
+
+- `EMAIL_SERVICE_OLLAMA_ENABLED` (default: `true`)
+- `EMAIL_SERVICE_OLLAMA_URL` (default: `http://127.0.0.1:11434`)
+- `EMAIL_SERVICE_OLLAMA_MODEL` (default: `llama3.1:8b`)
+- `EMAIL_SERVICE_OLLAMA_TIMEOUT_SECONDS`
+- `EMAIL_SERVICE_OLLAMA_TEMPERATURE`
+- `EMAIL_SERVICE_OLLAMA_MAX_CONTEXT_MESSAGES`
 
 ## Notes
 

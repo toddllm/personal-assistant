@@ -10,10 +10,14 @@ import re
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 import httpx
 
 from email_service.config import Settings
 from email_service.schemas import (
+    AssistantQueryRequest,
+    AssistantQueryResponse,
+    AssistantStatusResponse,
     EmailMessage,
     EmailThread,
     HealthResponse,
@@ -35,6 +39,297 @@ REPLY_HINT_TERMS = (
     "follow up",
     "follow-up",
 )
+
+_INDEX_HTML = """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>Email Service</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
+    :root {
+      --bg: #f5f7f2;
+      --ink: #1f2a1f;
+      --muted: #516154;
+      --surface: #ffffff;
+      --accent: #0b7a5a;
+      --accent-2: #d2f5dd;
+      --line: #d7e1d8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Space Grotesk', sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 10%, #dff8ea 0, transparent 45%),
+        radial-gradient(circle at 90% 0, #f3ead3 0, transparent 38%),
+        var(--bg);
+    }
+    .wrap {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 28px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 4px;
+      font-size: 1.7rem;
+      letter-spacing: -0.02em;
+    }
+    .sub { color: var(--muted); margin-bottom: 18px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    button, input, textarea {
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      font: inherit;
+    }
+    button {
+      background: var(--accent);
+      color: white;
+      border: 0;
+      padding: 10px 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: var(--surface);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+    input {
+      padding: 10px 12px;
+      min-width: 140px;
+      background: var(--surface);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+    }
+    .k { color: var(--muted); font-size: 0.88rem; }
+    .v { font-size: 1.35rem; font-weight: 700; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .panel h2 { margin: 0 0 10px; font-size: 1.1rem; }
+    .focus-item {
+      border-top: 1px solid var(--line);
+      padding: 10px 0;
+    }
+    .focus-item:first-child { border-top: 0; padding-top: 0; }
+    .meta {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .subject { font-weight: 700; margin-bottom: 4px; }
+    .snippet { color: var(--muted); font-size: 0.95rem; }
+    textarea {
+      width: 100%;
+      min-height: 96px;
+      resize: vertical;
+      padding: 10px 12px;
+      margin-bottom: 8px;
+      background: #fbfdf9;
+    }
+    .answer {
+      white-space: pre-wrap;
+      background: var(--accent-2);
+      border-radius: 10px;
+      padding: 10px;
+      min-height: 58px;
+    }
+    .tiny { color: var(--muted); font-size: 0.84rem; }
+    .status {
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      background: #eef3ed;
+      border: 1px solid var(--line);
+      display: inline-block;
+    }
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <h1>Email Service</h1>
+    <div class=\"sub\">Local inbox triage + Ollama Q&A over your synced Gmail snapshot.</div>
+
+    <div class=\"row\">
+      <button id=\"refreshBtn\">Refresh Inbox</button>
+      <button id=\"reloadBtn\" class=\"secondary\">Reload Snapshot</button>
+      <span id=\"healthBadge\" class=\"status\">Loading…</span>
+    </div>
+
+    <div class=\"grid\">
+      <div class=\"card\"><div class=\"k\">Messages</div><div id=\"mCount\" class=\"v\">-</div></div>
+      <div class=\"card\"><div class=\"k\">Unread</div><div id=\"uCount\" class=\"v\">-</div></div>
+      <div class=\"card\"><div class=\"k\">Threads</div><div id=\"tCount\" class=\"v\">-</div></div>
+      <div class=\"card\"><div class=\"k\">Focus Queue</div><div id=\"fCount\" class=\"v\">-</div></div>
+    </div>
+
+    <div class=\"panel\">
+      <h2>Ask About Inbox (Ollama)</h2>
+      <textarea id=\"question\" placeholder=\"What needs my response tonight?\"></textarea>
+      <div class=\"row\">
+        <input id=\"maxMessages\" type=\"number\" min=\"1\" max=\"200\" value=\"30\" />
+        <label class=\"tiny\"><input id=\"focusOnly\" type=\"checkbox\" /> focus only</label>
+        <button id=\"askBtn\">Ask</button>
+      </div>
+      <div id=\"answer\" class=\"answer\">No answer yet.</div>
+      <div id=\"answerMeta\" class=\"tiny\"></div>
+    </div>
+
+    <div class=\"panel\">
+      <h2>Focus Items</h2>
+      <div id=\"focusList\" class=\"tiny\">No data yet.</div>
+    </div>
+  </div>
+
+  <script>
+    const state = { snapshot: null };
+
+    const healthBadge = document.getElementById('healthBadge');
+    const focusList = document.getElementById('focusList');
+
+    function fmtTs(ts) {
+      try { return new Date(ts).toLocaleString(); }
+      catch (_) { return ts || ''; }
+    }
+
+    function setSummary(snapshot) {
+      document.getElementById('mCount').textContent = snapshot.message_count ?? '-';
+      document.getElementById('uCount').textContent = snapshot.unread_count ?? '-';
+      document.getElementById('tCount').textContent = snapshot.thread_count ?? '-';
+      document.getElementById('fCount').textContent = snapshot.focus_count ?? '-';
+    }
+
+    function renderFocus(items) {
+      if (!items || items.length === 0) {
+        focusList.textContent = 'No focus items.';
+        return;
+      }
+      focusList.innerHTML = items.map((m) => {
+        const sender = m.sender_email || m.from_header || 'unknown';
+        const subj = m.subject || '(no subject)';
+        return `
+          <div class=\"focus-item\">
+            <div class=\"meta\">${sender} • ${fmtTs(m.received_at)} • p${m.priority_score}</div>
+            <div class=\"subject\">${subj}</div>
+            <div class=\"snippet\">${m.snippet || ''}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function loadHealth() {
+      try {
+        const r = await fetch('/health');
+        const h = await r.json();
+        const ollama = h.ollama_enabled
+          ? (h.ollama_reachable ? 'ollama:ok' : 'ollama:down')
+          : 'ollama:off';
+        healthBadge.textContent = `${h.status} • google:${h.google_sync_reachable ? 'ok' : 'down'} • ${ollama}`;
+      } catch (e) {
+        healthBadge.textContent = 'health unavailable';
+      }
+    }
+
+    async function loadOverview(refresh = false) {
+      const url = refresh ? '/v1/inbox/overview?refresh=true' : '/v1/inbox/overview';
+      const r = await fetch(url);
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || `overview failed (${r.status})`);
+      }
+      const data = await r.json();
+      state.snapshot = data;
+      setSummary(data);
+      renderFocus(data.focus || []);
+    }
+
+    async function refreshInbox() {
+      const r = await fetch('/v1/inbox/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ force_sync: true, max_results: 50, label_ids: ['INBOX'] }),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || `refresh failed (${r.status})`);
+      }
+      const data = await r.json();
+      state.snapshot = data;
+      setSummary(data);
+      renderFocus(data.focus || []);
+    }
+
+    async function askAssistant() {
+      const question = document.getElementById('question').value.trim();
+      if (!question) return;
+      const answer = document.getElementById('answer');
+      const meta = document.getElementById('answerMeta');
+      answer.textContent = 'Thinking…';
+      meta.textContent = '';
+
+      const payload = {
+        question,
+        refresh: false,
+        focus_only: document.getElementById('focusOnly').checked,
+        max_messages: Number(document.getElementById('maxMessages').value || 30),
+      };
+
+      const r = await fetch('/v1/assistant/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        answer.textContent = err.detail || `ask failed (${r.status})`;
+        return;
+      }
+      const data = await r.json();
+      answer.textContent = data.answer || '(empty answer)';
+      meta.textContent = `model=${data.model} • messages=${data.messages_used}`;
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', async () => {
+      try { await refreshInbox(); await loadHealth(); }
+      catch (e) { alert(e.message); }
+    });
+
+    document.getElementById('reloadBtn').addEventListener('click', async () => {
+      try { await loadOverview(false); await loadHealth(); }
+      catch (e) { alert(e.message); }
+    });
+
+    document.getElementById('askBtn').addEventListener('click', async () => {
+      try { await askAssistant(); }
+      catch (e) { alert(e.message); }
+    });
+
+    (async () => {
+      await loadHealth();
+      try { await loadOverview(false); }
+      catch (_) {}
+    })();
+  </script>
+</body>
+</html>
+"""
 
 
 def summarize_gmail_messages(
@@ -234,6 +529,125 @@ class EmailInboxManager:
         except Exception:  # noqa: BLE001
             return False, None
 
+    def assistant_status(self) -> AssistantStatusResponse:
+        if not self._settings.ollama_enabled:
+            return AssistantStatusResponse(
+                enabled=False,
+                reachable=False,
+                model=self._settings.ollama_model,
+                url=self._settings.ollama_url,
+                detail="disabled by EMAIL_SERVICE_OLLAMA_ENABLED",
+            )
+
+        try:
+            timeout = httpx.Timeout(self._settings.ollama_timeout_seconds)
+            with httpx.Client(timeout=timeout) as client:
+                response = client.get(f"{self._settings.ollama_url.rstrip('/')}/api/tags")
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response)
+                return AssistantStatusResponse(
+                    enabled=True,
+                    reachable=False,
+                    model=self._settings.ollama_model,
+                    url=self._settings.ollama_url,
+                    detail=detail,
+                )
+            return AssistantStatusResponse(
+                enabled=True,
+                reachable=True,
+                model=self._settings.ollama_model,
+                url=self._settings.ollama_url,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return AssistantStatusResponse(
+                enabled=True,
+                reachable=False,
+                model=self._settings.ollama_model,
+                url=self._settings.ollama_url,
+                detail=str(exc),
+            )
+
+    def answer_question(self, request: AssistantQueryRequest) -> AssistantQueryResponse:
+        if not self._settings.ollama_enabled:
+            raise RuntimeError("Ollama is disabled. Set EMAIL_SERVICE_OLLAMA_ENABLED=true.")
+
+        snapshot = self._resolve_snapshot_for_query(request.refresh)
+        selected = _select_context_messages(
+            snapshot,
+            max_messages=min(request.max_messages, self._settings.ollama_max_context_messages),
+            focus_only=request.focus_only,
+        )
+        answer = self._query_ollama(request.question, selected)
+        return AssistantQueryResponse(
+            answer=answer,
+            model=self._settings.ollama_model,
+            generated_at=_utc_now(),
+            messages_used=len(selected),
+            warnings=snapshot.warnings,
+        )
+
+    def _resolve_snapshot_for_query(self, refresh: bool) -> InboxSnapshotResponse:
+        if refresh:
+            return self.refresh(
+                InboxRefreshRequest(
+                    force_sync=True,
+                    max_results=self._settings.google_sync_default_max_results,
+                    label_ids=self._settings.default_label_ids_list,
+                    allow_cache_fallback=True,
+                )
+            )
+
+        snapshot = self.load_snapshot()
+        if snapshot is not None:
+            return snapshot
+
+        return self.refresh(
+            InboxRefreshRequest(
+                force_sync=True,
+                max_results=self._settings.google_sync_default_max_results,
+                label_ids=self._settings.default_label_ids_list,
+                allow_cache_fallback=True,
+            )
+        )
+
+    def _query_ollama(self, question: str, messages: list[EmailMessage]) -> str:
+        context_lines = _render_context_lines(messages)
+        system_prompt = (
+            "You are a concise email assistant. Answer using only the provided inbox context. "
+            "If the answer is unknown, say that directly. Cite message ids used in your answer."
+        )
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Current time (UTC): {_utc_now().isoformat()}\n"
+            "Inbox context:\n"
+            f"{context_lines}"
+        )
+        body: dict[str, Any] = {
+            "model": self._settings.ollama_model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "options": {
+                "temperature": self._settings.ollama_temperature,
+            },
+        }
+
+        timeout = httpx.Timeout(self._settings.ollama_timeout_seconds)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(f"{self._settings.ollama_url.rstrip('/')}/api/chat", json=body)
+
+        if response.status_code >= 400:
+            detail = _extract_error_detail(response)
+            raise RuntimeError(f"ollama {response.status_code}: {detail}")
+
+        payload = response.json()
+        content = _extract_ollama_content(payload)
+        if not content:
+            raise RuntimeError("Ollama response missing message content.")
+        return content
+
     def _fetch_google_payload(self, request: InboxRefreshRequest) -> tuple[str, dict[str, Any]]:
         base_url = self._settings.google_sync_service_url.rstrip("/")
         timeout = httpx.Timeout(self._settings.google_sync_timeout_seconds)
@@ -274,9 +688,14 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="email-service", version="0.1.0")
     manager = EmailInboxManager(settings)
 
+    @app.get("/", response_class=HTMLResponse)
+    def home() -> str:
+        return _INDEX_HTML
+
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         google_sync_reachable, google_sync_configured = manager.google_sync_status()
+        assistant = manager.assistant_status()
         snapshot = manager.load_snapshot()
 
         cache_exists = snapshot is not None
@@ -291,10 +710,28 @@ def create_app(settings: Settings) -> FastAPI:
             service="email-service",
             google_sync_reachable=google_sync_reachable,
             google_sync_configured=google_sync_configured,
+            ollama_enabled=assistant.enabled,
+            ollama_reachable=assistant.reachable,
+            ollama_model=assistant.model,
             cache_exists=cache_exists,
             cache_message_count=cache_message_count,
             now=_utc_now(),
         )
+
+    @app.get("/v1/assistant/status", response_model=AssistantStatusResponse)
+    def assistant_status() -> AssistantStatusResponse:
+        return manager.assistant_status()
+
+    @app.post("/v1/assistant/query", response_model=AssistantQueryResponse)
+    def assistant_query(request: AssistantQueryRequest) -> AssistantQueryResponse:
+        if not request.question.strip():
+            raise HTTPException(status_code=400, detail="Question is required.")
+        if request.max_messages < 1:
+            raise HTTPException(status_code=400, detail="max_messages must be >= 1")
+        try:
+            return manager.answer_question(request)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/v1/inbox/refresh", response_model=InboxSnapshotResponse)
     def inbox_refresh(request: InboxRefreshRequest) -> InboxSnapshotResponse:
@@ -440,6 +877,66 @@ def _priority_score(
         score += 1
 
     return score
+
+
+def _select_context_messages(
+    snapshot: InboxSnapshotResponse,
+    *,
+    max_messages: int,
+    focus_only: bool,
+) -> list[EmailMessage]:
+    source = snapshot.focus if focus_only else snapshot.messages
+    if max_messages <= 0:
+        return []
+    return source[:max_messages]
+
+
+def _render_context_lines(messages: list[EmailMessage]) -> str:
+    if not messages:
+        return "(no messages available)"
+
+    lines: list[str] = []
+    for item in messages:
+        sender = item.sender_email or item.from_header or "unknown"
+        subject = item.subject or "(no subject)"
+        snippet = (item.snippet or "").replace("\n", " ").strip()
+        if len(snippet) > 260:
+            snippet = f"{snippet[:257]}..."
+        lines.append(
+            " | ".join(
+                [
+                    f"id={item.message_id}",
+                    f"time={item.received_at.isoformat()}",
+                    f"unread={item.unread}",
+                    f"priority={item.priority_score}",
+                    f"sender={sender}",
+                    f"subject={subject}",
+                    f"snippet={snippet}",
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def _extract_ollama_content(payload: object) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    message = payload.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            content = content.strip()
+            if content:
+                return content
+
+    response = payload.get("response")
+    if isinstance(response, str):
+        response = response.strip()
+        if response:
+            return response
+
+    return None
 
 
 def _extract_error_detail(response: httpx.Response) -> str:

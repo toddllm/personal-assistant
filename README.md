@@ -75,12 +75,26 @@ source .venv/bin/activate
 email-service
 ```
 
+Open UI:
+
+```bash
+open http://127.0.0.1:8793/
+```
+
 Initial inbox refresh:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8793/v1/inbox/refresh \
   -H "Content-Type: application/json" \
   -d '{"force_sync":true,"max_results":50,"label_ids":["INBOX"]}'
+```
+
+Email Q&A via Ollama:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8793/v1/assistant/query \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What should I reply to first?","focus_only":true,"max_messages":30}'
 ```
 
 ### tts-service
@@ -173,6 +187,8 @@ Operational guide:
 
 `email-service`:
 - `GET /health`
+- `GET /v1/assistant/status`
+- `POST /v1/assistant/query`
 - `POST /v1/inbox/refresh`
 - `GET /v1/inbox/overview`
 - `GET /v1/inbox/focus`

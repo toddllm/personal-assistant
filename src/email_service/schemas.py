@@ -10,6 +10,9 @@ class HealthResponse(BaseModel):
     service: str
     google_sync_reachable: bool
     google_sync_configured: bool | None = None
+    ollama_enabled: bool
+    ollama_reachable: bool | None = None
+    ollama_model: str | None = None
     cache_exists: bool
     cache_message_count: int
     now: datetime
@@ -65,4 +68,28 @@ class InboxSnapshotResponse(BaseModel):
     messages: list[EmailMessage] = Field(default_factory=list)
     threads: list[EmailThread] = Field(default_factory=list)
     focus: list[EmailMessage] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class AssistantStatusResponse(BaseModel):
+    enabled: bool
+    reachable: bool
+    model: str
+    url: str
+    detail: str | None = None
+
+
+class AssistantQueryRequest(BaseModel):
+    question: str
+    refresh: bool = False
+    focus_only: bool = False
+    max_messages: int = 30
+
+
+class AssistantQueryResponse(BaseModel):
+    answer: str
+    provider: str = "ollama"
+    model: str
+    generated_at: datetime
+    messages_used: int
     warnings: list[str] = Field(default_factory=list)

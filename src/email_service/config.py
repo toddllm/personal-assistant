@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     urgent_terms: str = "urgent,asap,action required,deadline,follow up,follow-up"
     important_senders: str = ""
 
+    ollama_enabled: bool = True
+    ollama_url: str = "http://127.0.0.1:11434"
+    ollama_model: str = "llama3.1:8b"
+    ollama_timeout_seconds: float = 45.0
+    ollama_temperature: float = 0.2
+    ollama_max_context_messages: int = 40
+
     @property
     def default_label_ids_list(self) -> list[str]:
         values = [part.strip() for part in self.google_sync_default_label_ids.split(",")]
