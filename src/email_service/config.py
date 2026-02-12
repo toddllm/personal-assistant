@@ -23,6 +23,10 @@ class Settings(BaseSettings):
     google_sync_timeout_seconds: float = 20.0
     google_sync_default_max_results: int = 50
     google_sync_default_label_ids: str = "INBOX"
+    google_sync_autostart: bool = True
+    google_sync_autostart_command: str = "google-sync-service"
+    google_sync_autostart_timeout_seconds: float = 10.0
+    google_sync_autostart_cwd: Path | None = None
 
     local_cache_path: Path = Field(default_factory=lambda: Path("data/email_service/inbox_latest.json"))
     focus_default_limit: int = 15

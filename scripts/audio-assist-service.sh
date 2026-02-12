@@ -16,16 +16,12 @@ else
 fi
 
 is_running() {
-  local command=""
   local listener_pid=""
   if [[ ! -f "$PID_FILE" ]]; then
     listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
     if [[ -n "$listener_pid" ]]; then
-      command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
-      if [[ "$command" == *"audio-assist"* ]]; then
-        echo "$listener_pid" >"$PID_FILE"
-        return 0
-      fi
+      echo "$listener_pid" >"$PID_FILE"
+      return 0
     fi
     return 1
   fi
@@ -34,11 +30,8 @@ is_running() {
   if [[ -z "$pid" ]]; then
     listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
     if [[ -n "$listener_pid" ]]; then
-      command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
-      if [[ "$command" == *"audio-assist"* ]]; then
-        echo "$listener_pid" >"$PID_FILE"
-        return 0
-      fi
+      echo "$listener_pid" >"$PID_FILE"
+      return 0
     fi
     return 1
   fi
@@ -47,11 +40,8 @@ is_running() {
   fi
   listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
   if [[ -n "$listener_pid" ]]; then
-    command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
-    if [[ "$command" == *"audio-assist"* ]]; then
-      echo "$listener_pid" >"$PID_FILE"
-      return 0
-    fi
+    echo "$listener_pid" >"$PID_FILE"
+    return 0
   fi
   return 1
 }

@@ -7,6 +7,10 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
+import subprocess
+import sys
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -792,21 +796,32 @@ class EmailInboxManager:
         return content
 
     def _fetch_google_payload(self, request: InboxRefreshRequest) -> tuple[str, dict[str, Any]]:
+        self._maybe_start_google_sync_service()
         base_url = self._settings.google_sync_service_url.rstrip("/")
         timeout = httpx.Timeout(self._settings.google_sync_timeout_seconds)
-        with httpx.Client(timeout=timeout) as client:
-            if request.force_sync:
-                sync_body: dict[str, Any] = {}
-                max_results = request.max_results or self._settings.google_sync_default_max_results
-                sync_body["max_results"] = max(1, int(max_results))
-                sync_body["label_ids"] = request.label_ids or self._settings.default_label_ids_list
-                if request.query:
-                    sync_body["query"] = request.query
-                response = client.post(f"{base_url}/v1/gmail/sync", json=sync_body)
-                source = "google_sync_live"
-            else:
-                response = client.get(f"{base_url}/v1/gmail/latest")
-                source = "google_sync_cache"
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                if request.force_sync:
+                    sync_body: dict[str, Any] = {}
+                    max_results = request.max_results or self._settings.google_sync_default_max_results
+                    sync_body["max_results"] = max(1, int(max_results))
+                    sync_body["label_ids"] = request.label_ids or self._settings.default_label_ids_list
+                    if request.query:
+                        sync_body["query"] = request.query
+                    response = client.post(f"{base_url}/v1/gmail/sync", json=sync_body)
+                    source = "google_sync_live"
+                else:
+                    response = client.get(f"{base_url}/v1/gmail/latest")
+                    source = "google_sync_cache"
+        except httpx.ConnectError as exc:
+            raise RuntimeError(
+                "google-sync-service is not reachable. Start it with "
+                "`bash scripts/google-sync-service.sh start` and retry."
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise RuntimeError(
+                "google-sync-service timed out. Check `data/logs/google-sync-service-supervisor.log`."
+            ) from exc
 
         if response.status_code >= 400:
             detail = _extract_error_detail(response)
@@ -816,6 +831,66 @@ class EmailInboxManager:
         if not isinstance(payload, dict):
             raise RuntimeError("google-sync-service response is not a JSON object.")
         return source, payload
+
+    def _google_sync_health_reachable(self, timeout_seconds: float = 1.0) -> bool:
+        base_url = self._settings.google_sync_service_url.rstrip("/")
+        try:
+            with httpx.Client(timeout=timeout_seconds) as client:
+                response = client.get(f"{base_url}/health")
+            return response.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _maybe_start_google_sync_service(self) -> None:
+        if not self._settings.google_sync_autostart:
+            return
+        if self._google_sync_health_reachable(timeout_seconds=1.2):
+            return
+
+        command = str(self._settings.google_sync_autostart_command or "").strip()
+        cmd = shlex.split(command) if command else []
+        if not cmd:
+            cmd = ["google-sync-service"]
+
+        env = os.environ.copy()
+        cwd = str(self._settings.google_sync_autostart_cwd) if self._settings.google_sync_autostart_cwd else None
+        started_process: subprocess.Popen[bytes] | None = None
+        try:
+            started_process = subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            fallback_cmd = [sys.executable, "-m", "google_sync_service.main"]
+            started_process = subprocess.Popen(  # noqa: S603
+                fallback_cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("failed to auto-start google-sync-service: %s", exc)
+            return
+
+        timeout_seconds = max(2.0, float(self._settings.google_sync_autostart_timeout_seconds))
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self._google_sync_health_reachable(timeout_seconds=1.0):
+                logger.info("google-sync-service auto-started successfully.")
+                return
+            if started_process.poll() is not None:
+                logger.warning(
+                    "google-sync-service exited before becoming ready (exit_code=%s).",
+                    started_process.returncode,
+                )
+                return
+            time.sleep(0.3)
 
     def _write_snapshot(self, snapshot: InboxSnapshotResponse) -> None:
         path: Path = self._settings.local_cache_path
