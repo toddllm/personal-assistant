@@ -542,7 +542,7 @@ def create_app(settings: Settings) -> FastAPI:
         except Exception:  # noqa: BLE001
             return None
 
-        candidates: list[tuple[int, int, int]] = []
+        candidates: list[dict[str, object]] = []
         for idx, raw in enumerate(devices):
             max_input_channels = int(raw.get("max_input_channels", 0))
             if max_input_channels <= 0:
@@ -552,12 +552,80 @@ def create_app(settings: Settings) -> FastAPI:
             score = sum(1 for keyword in COMMON_SYSTEM_AUDIO_KEYWORDS if keyword in lowered)
             if score <= 0:
                 continue
-            # Highest keyword score first, then bigger channel count.
-            candidates.append((score, max_input_channels, idx))
+            candidates.append(
+                {
+                    "index": idx,
+                    "name": name,
+                    "score": score,
+                    "max_input_channels": max_input_channels,
+                }
+            )
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], item[1], -item[2]), reverse=True)
-        return int(candidates[0][2])
+
+        # Prefer whichever virtual loopback path currently has real signal.
+        # This avoids sticky mis-selection when multiple virtual devices exist.
+        probe_duration_ms = 300
+        activity_floor_dbfs = -78.0
+        active_candidates: list[dict[str, object]] = []
+        for candidate in candidates:
+            idx = int(candidate["index"])
+            name = str(candidate["name"])
+            max_input_channels = int(candidate["max_input_channels"])
+            probe = _probe_input_level(
+                sd,
+                device_index=idx,
+                device_name=name,
+                max_input_channels=max_input_channels,
+                sample_rate=settings.sample_rate,
+                channels=settings.channels,
+                duration_ms=probe_duration_ms,
+            )
+            level_dbfs = float(probe.get("level_dbfs") or -96.0)
+            error = str(probe.get("error") or "").strip()
+            if not error and level_dbfs >= activity_floor_dbfs:
+                active_candidates.append(
+                    {
+                        **candidate,
+                        "level_dbfs": level_dbfs,
+                        "peak_dbfs": float(probe.get("peak_dbfs") or -96.0),
+                    }
+                )
+
+        if active_candidates:
+            active_candidates.sort(
+                key=lambda item: (
+                    float(item.get("level_dbfs") or -96.0),
+                    int(item.get("score") or 0),
+                    int(item.get("max_input_channels") or 0),
+                ),
+                reverse=True,
+            )
+            selected = active_candidates[0]
+            logger.info(
+                "Auto-selected active system-audio device index=%s name=%s level=%.1f",
+                selected["index"],
+                selected["name"],
+                float(selected.get("level_dbfs") or -96.0),
+            )
+            return int(selected["index"])
+
+        # Fallback: best semantic match (keyword score, then channels).
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("score") or 0),
+                int(item.get("max_input_channels") or 0),
+                -int(item.get("index") or 0),
+            ),
+            reverse=True,
+        )
+        selected = candidates[0]
+        logger.info(
+            "Auto-selected fallback system-audio device index=%s name=%s (no active loopback signal detected).",
+            selected["index"],
+            selected["name"],
+        )
+        return int(selected["index"])
 
     def close_stale_session(runtime: SourceRuntime | None) -> None:
         if runtime is None:
@@ -1247,6 +1315,30 @@ def create_app(settings: Settings) -> FastAPI:
                     f"{safe_recent_seconds}s."
                 ),
                 recommendation="Check mic routing and ASR thresholds; active mic should produce transcript rows.",
+            )
+
+        system_level = level_map.get(system_source_id)
+        system_running = system_source_id in running_ids
+        system_signal_active = bool(
+            system_level is not None
+            and system_level.age_seconds <= safe_level_stale_seconds
+            and not system_level.silent
+            and system_level.level_dbfs >= safe_active_level_dbfs
+        )
+        if required_system_audio and system_running and mic_recent_count > 0 and system_recent_count == 0:
+            severity = "critical" if system_signal_active else "warning"
+            add_issue(
+                code="system_audio_missing_during_active_capture",
+                severity=severity,
+                source_id=system_source_id,
+                message=(
+                    f"System-audio source '{system_source_id}' has no transcript rows in the last "
+                    f"{safe_recent_seconds}s while mic activity is present."
+                ),
+                recommendation=(
+                    "Verify macOS output routing into your virtual loopback (for example BlackHole/Cluely) "
+                    "or switch the system-audio source device."
+                ),
             )
 
         queue_size = int(transcriber_pipeline.get("queue_size") or 0)
