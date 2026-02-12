@@ -15,6 +15,7 @@ import httpx
 
 from email_service.config import Settings
 from email_service.schemas import (
+    AssistantModelsResponse,
     AssistantQueryRequest,
     AssistantQueryResponse,
     AssistantStatusResponse,
@@ -79,7 +80,7 @@ _INDEX_HTML = """<!doctype html>
     }
     .sub { color: var(--muted); margin-bottom: 18px; }
     .row { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
-    button, input, textarea {
+    button, input, textarea, select {
       border: 1px solid var(--line);
       border-radius: 11px;
       font: inherit;
@@ -100,6 +101,11 @@ _INDEX_HTML = """<!doctype html>
     input {
       padding: 10px 12px;
       min-width: 140px;
+      background: var(--surface);
+    }
+    select {
+      padding: 10px 12px;
+      min-width: 180px;
       background: var(--surface);
     }
     .grid {
@@ -184,10 +190,14 @@ _INDEX_HTML = """<!doctype html>
       <h2>Ask About Inbox (Ollama)</h2>
       <textarea id=\"question\" placeholder=\"What needs my response tonight?\"></textarea>
       <div class=\"row\">
+        <select id=\"assistantModel\"></select>
+        <button id=\"refreshModelsBtn\" class=\"secondary\">Refresh Models</button>
+        <button id=\"setDefaultModelBtn\" class=\"secondary\">Set Default Model</button>
         <input id=\"maxMessages\" type=\"number\" min=\"1\" max=\"200\" value=\"30\" />
         <label class=\"tiny\"><input id=\"focusOnly\" type=\"checkbox\" /> focus only</label>
         <button id=\"askBtn\">Ask</button>
       </div>
+      <div id=\"modelStatus\" class=\"tiny\"></div>
       <div id=\"answer\" class=\"answer\">No answer yet.</div>
       <div id=\"answerMeta\" class=\"tiny\"></div>
     </div>
@@ -199,10 +209,34 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   <script>
+    const DEFAULT_MODEL_STORAGE_KEY = 'email_service_default_model';
     const state = { snapshot: null };
 
     const healthBadge = document.getElementById('healthBadge');
     const focusList = document.getElementById('focusList');
+    const assistantModel = document.getElementById('assistantModel');
+    const modelStatus = document.getElementById('modelStatus');
+
+    function getStoredModel() {
+      try {
+        const value = localStorage.getItem(DEFAULT_MODEL_STORAGE_KEY);
+        return value ? value.trim() : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function setStoredModel(model) {
+      if (!model) return;
+      try {
+        localStorage.setItem(DEFAULT_MODEL_STORAGE_KEY, model);
+      } catch (_) {}
+    }
+
+    function selectedModel() {
+      const value = (assistantModel.value || '').trim();
+      return value || null;
+    }
 
     function fmtTs(ts) {
       try { return new Date(ts).toLocaleString(); }
@@ -276,6 +310,43 @@ _INDEX_HTML = """<!doctype html>
       renderFocus(data.focus || []);
     }
 
+    async function loadAssistantModels() {
+      const current = selectedModel();
+      const stored = getStoredModel();
+      const r = await fetch('/v1/assistant/models');
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || `models failed (${r.status})`);
+      }
+      const data = await r.json();
+      const models = Array.isArray(data.models) && data.models.length
+        ? data.models
+        : [data.default_model || 'llama3.1:8b'];
+      let selected = models[0];
+      if (current && models.includes(current)) {
+        selected = current;
+      } else if (stored && models.includes(stored)) {
+        selected = stored;
+      } else if (data.default_model && models.includes(data.default_model)) {
+        selected = data.default_model;
+      }
+      assistantModel.innerHTML = '';
+      for (const model of models) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        assistantModel.appendChild(option);
+      }
+      assistantModel.value = selected;
+
+      const saved = getStoredModel();
+      if (data.reachable === false) {
+        modelStatus.textContent = `Ollama unreachable. Using fallback model list. Saved default: ${saved || 'none'}.`;
+      } else {
+        modelStatus.textContent = `Loaded ${models.length} model(s). Saved default: ${saved || 'none'}.`;
+      }
+    }
+
     async function askAssistant() {
       const question = document.getElementById('question').value.trim();
       if (!question) return;
@@ -289,6 +360,7 @@ _INDEX_HTML = """<!doctype html>
         refresh: false,
         focus_only: document.getElementById('focusOnly').checked,
         max_messages: Number(document.getElementById('maxMessages').value || 30),
+        model: selectedModel(),
       };
 
       const r = await fetch('/v1/assistant/query', {
@@ -321,8 +393,25 @@ _INDEX_HTML = """<!doctype html>
       catch (e) { alert(e.message); }
     });
 
+    document.getElementById('refreshModelsBtn').addEventListener('click', async () => {
+      try { await loadAssistantModels(); }
+      catch (e) { alert(e.message); }
+    });
+
+    document.getElementById('setDefaultModelBtn').addEventListener('click', () => {
+      const model = selectedModel();
+      if (!model) {
+        modelStatus.textContent = 'Select a model first.';
+        return;
+      }
+      setStoredModel(model);
+      modelStatus.textContent = `Saved default model: ${model}`;
+    });
+
     (async () => {
       await loadHealth();
+      try { await loadAssistantModels(); }
+      catch (_) {}
       try { await loadOverview(false); }
       catch (_) {}
     })();
@@ -567,6 +656,52 @@ class EmailInboxManager:
                 detail=str(exc),
             )
 
+    def assistant_models(self) -> AssistantModelsResponse:
+        default_model = self._settings.ollama_model
+        if not self._settings.ollama_enabled:
+            return AssistantModelsResponse(
+                reachable=False,
+                models=[default_model],
+                default_model=default_model,
+                detail="disabled by EMAIL_SERVICE_OLLAMA_ENABLED",
+            )
+
+        try:
+            timeout = httpx.Timeout(self._settings.ollama_timeout_seconds)
+            with httpx.Client(timeout=timeout) as client:
+                response = client.get(f"{self._settings.ollama_url.rstrip('/')}/api/tags")
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response)
+                return AssistantModelsResponse(
+                    reachable=False,
+                    models=[default_model],
+                    default_model=default_model,
+                    detail=detail,
+                )
+
+            payload = response.json()
+            names: list[str] = []
+            for item in payload.get("models", []):
+                name = str(item.get("name", "")).strip()
+                if name:
+                    names.append(name)
+            if not names:
+                names = [default_model]
+            if default_model not in names:
+                names.append(default_model)
+            return AssistantModelsResponse(
+                reachable=True,
+                models=names,
+                default_model=default_model,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return AssistantModelsResponse(
+                reachable=False,
+                models=[default_model],
+                default_model=default_model,
+                detail=str(exc),
+            )
+
     def answer_question(self, request: AssistantQueryRequest) -> AssistantQueryResponse:
         if not self._settings.ollama_enabled:
             raise RuntimeError("Ollama is disabled. Set EMAIL_SERVICE_OLLAMA_ENABLED=true.")
@@ -577,10 +712,12 @@ class EmailInboxManager:
             max_messages=min(request.max_messages, self._settings.ollama_max_context_messages),
             focus_only=request.focus_only,
         )
-        answer = self._query_ollama(request.question, selected)
+        requested_model = str(request.model or "").strip() or None
+        model_name = requested_model or self._settings.ollama_model
+        answer = self._query_ollama(request.question, selected, model_name=model_name)
         return AssistantQueryResponse(
             answer=answer,
-            model=self._settings.ollama_model,
+            model=model_name,
             generated_at=_utc_now(),
             messages_used=len(selected),
             warnings=snapshot.warnings,
@@ -610,7 +747,13 @@ class EmailInboxManager:
             )
         )
 
-    def _query_ollama(self, question: str, messages: list[EmailMessage]) -> str:
+    def _query_ollama(
+        self,
+        question: str,
+        messages: list[EmailMessage],
+        *,
+        model_name: str,
+    ) -> str:
         context_lines = _render_context_lines(messages)
         system_prompt = (
             "You are a concise email assistant. Answer using only the provided inbox context. "
@@ -623,7 +766,7 @@ class EmailInboxManager:
             f"{context_lines}"
         )
         body: dict[str, Any] = {
-            "model": self._settings.ollama_model,
+            "model": model_name,
             "stream": False,
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -721,6 +864,10 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/v1/assistant/status", response_model=AssistantStatusResponse)
     def assistant_status() -> AssistantStatusResponse:
         return manager.assistant_status()
+
+    @app.get("/v1/assistant/models", response_model=AssistantModelsResponse)
+    def assistant_models() -> AssistantModelsResponse:
+        return manager.assistant_models()
 
     @app.post("/v1/assistant/query", response_model=AssistantQueryResponse)
     def assistant_query(request: AssistantQueryRequest) -> AssistantQueryResponse:

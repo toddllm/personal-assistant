@@ -13,6 +13,7 @@ const COMMON_SYSTEM_AUDIO_KEYWORDS = [
   "krisp",
   "cluely",
 ];
+const OLLAMA_DEFAULT_MODEL_KEY = "audio_assist_default_ollama_model";
 
 const el = {
   sourcePreset: document.getElementById("source-preset"),
@@ -59,6 +60,7 @@ const el = {
   evidenceList: document.getElementById("evidence-list"),
   refreshDevices: document.getElementById("refresh-devices"),
   refreshModels: document.getElementById("refresh-models"),
+  setDefaultModel: document.getElementById("set-default-model"),
   refreshTtsVoices: document.getElementById("refresh-tts-voices"),
   refreshSources: document.getElementById("refresh-sources"),
   startManualSource: document.getElementById("start-manual-source"),
@@ -130,6 +132,30 @@ function isSummaryQuestion(question) {
 function selectedOllamaModel() {
   const value = (el.ollamaModel.value || "").trim();
   return value || null;
+}
+
+function storedOllamaDefaultModel() {
+  try {
+    const value = localStorage.getItem(OLLAMA_DEFAULT_MODEL_KEY);
+    if (!value) {
+      return null;
+    }
+    const trimmed = String(value).trim();
+    return trimmed || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function saveOllamaDefaultModel(modelName) {
+  if (!modelName) {
+    return;
+  }
+  try {
+    localStorage.setItem(OLLAMA_DEFAULT_MODEL_KEY, modelName);
+  } catch (_) {
+    // Ignore storage failures. Selection still works for this session.
+  }
 }
 
 function selectedTtsVoice() {
@@ -892,25 +918,46 @@ async function autoStartCommonSources() {
 
 async function refreshOllamaModels() {
   const current = selectedOllamaModel();
+  const savedDefault = storedOllamaDefaultModel();
   try {
     const payload = await request("/v1/ollama/models");
     const models = Array.isArray(payload.models) && payload.models.length
       ? payload.models
       : [payload.default_model || "llama3.1:8b"];
-    const selected = models.includes(current) ? current : models[0];
+    let selected = models[0];
+    if (current && models.includes(current)) {
+      selected = current;
+    } else if (savedDefault && models.includes(savedDefault)) {
+      selected = savedDefault;
+    } else if (payload.default_model && models.includes(payload.default_model)) {
+      selected = payload.default_model;
+    }
     el.ollamaModel.innerHTML = models
       .map((model) => `<option value="${escapeHtml(String(model))}">${escapeHtml(String(model))}</option>`)
       .join("");
     el.ollamaModel.value = selected;
     if (payload.reachable === false) {
-      el.ollamaStatus.textContent = "Ollama not reachable. Showing configured fallback model.";
+      el.ollamaStatus.textContent = `Ollama not reachable. Using fallback model list. Saved default: ${savedDefault || "none"}.`;
     } else {
-      el.ollamaStatus.textContent = `Loaded ${models.length} local Ollama model(s).`;
+      el.ollamaStatus.textContent = `Loaded ${models.length} local Ollama model(s). Saved default: ${savedDefault || "none"}.`;
     }
   } catch (error) {
-    el.ollamaModel.innerHTML = '<option value="llama3.1:8b">llama3.1:8b</option>';
-    el.ollamaStatus.textContent = `Model load failed: ${error.message}`;
+    const fallbackModel = savedDefault || "llama3.1:8b";
+    el.ollamaModel.innerHTML = `<option value="${escapeHtml(fallbackModel)}">${escapeHtml(fallbackModel)}</option>`;
+    el.ollamaModel.value = fallbackModel;
+    el.ollamaStatus.textContent = `Model load failed: ${error.message}. Using ${fallbackModel}.`;
   }
+}
+
+function setDefaultOllamaModel() {
+  const modelName = selectedOllamaModel();
+  if (!modelName) {
+    setStatus("Select an Ollama model first.", true);
+    return;
+  }
+  saveOllamaDefaultModel(modelName);
+  el.ollamaStatus.textContent = `Loaded local Ollama models. Saved default: ${modelName}.`;
+  setStatus(`Default model saved: ${modelName}`);
 }
 
 function clearStreamQueue() {
@@ -1441,6 +1488,7 @@ function wireEvents() {
   el.detectDevices.addEventListener("click", detectActiveDevices);
   el.cycleDevices.addEventListener("click", cycleAndFindDevice);
   el.refreshModels.addEventListener("click", refreshOllamaModels);
+  el.setDefaultModel.addEventListener("click", setDefaultOllamaModel);
   el.refreshTtsVoices.addEventListener("click", refreshTtsVoices);
   el.refreshSources.addEventListener("click", () => refreshRunningSources());
   el.startManualSource.addEventListener("click", startManualSource);

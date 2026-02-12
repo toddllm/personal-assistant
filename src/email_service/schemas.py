@@ -79,11 +79,19 @@ class AssistantStatusResponse(BaseModel):
     detail: str | None = None
 
 
+class AssistantModelsResponse(BaseModel):
+    reachable: bool
+    models: list[str] = Field(default_factory=list)
+    default_model: str
+    detail: str | None = None
+
+
 class AssistantQueryRequest(BaseModel):
     question: str
     refresh: bool = False
     focus_only: bool = False
     max_messages: int = 30
+    model: str | None = None
 
 
 class AssistantQueryResponse(BaseModel):

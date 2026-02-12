@@ -1,7 +1,14 @@
 from datetime import UTC, datetime
 
 from email_service.config import Settings
-from email_service.service import _extract_ollama_content, summarize_gmail_messages
+from email_service.schemas import AssistantQueryRequest
+from email_service.service import (
+    EmailInboxManager,
+    _extract_ollama_content,
+    create_app,
+    summarize_gmail_messages,
+)
+from fastapi.testclient import TestClient
 
 
 def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
@@ -70,3 +77,69 @@ def test_extract_ollama_content_supports_chat_and_generate_shapes() -> None:
     assert _extract_ollama_content(chat_payload) == "Hello from chat"
     assert _extract_ollama_content(generate_payload) == "Hello from generate"
     assert _extract_ollama_content(empty_payload) is None
+
+
+def test_answer_question_uses_request_model_override(tmp_path, monkeypatch) -> None:
+    settings = Settings(
+        local_cache_path=tmp_path / "inbox_latest.json",
+        ollama_model="llama3.1:8b",
+    )
+    manager = EmailInboxManager(settings)
+    snapshot = summarize_gmail_messages(
+        [
+            {
+                "message_id": "m-1",
+                "thread_id": "t-1",
+                "from_header": "alice@example.com",
+                "subject": "hello",
+                "snippet": "need a reply",
+                "label_ids": ["INBOX", "UNREAD"],
+                "received_at": "2026-02-12T01:00:00Z",
+            }
+        ],
+        settings=settings,
+        source="unit_test",
+        now=datetime(2026, 2, 12, 3, 0, 0, tzinfo=UTC),
+    )
+    manager._write_snapshot(snapshot)
+
+    captured: dict[str, object] = {}
+
+    def fake_query(question: str, messages: list[object], *, model_name: str) -> str:
+        captured["question"] = question
+        captured["messages"] = len(messages)
+        captured["model_name"] = model_name
+        return "ok"
+
+    monkeypatch.setattr(manager, "_query_ollama", fake_query)
+
+    response = manager.answer_question(
+        AssistantQueryRequest(
+            question="what needs my reply?",
+            model="mistral:latest",
+            max_messages=20,
+        )
+    )
+
+    assert response.model == "mistral:latest"
+    assert response.answer == "ok"
+    assert captured["model_name"] == "mistral:latest"
+    assert captured["messages"] == 1
+
+
+def test_assistant_models_endpoint_returns_fallback_when_ollama_disabled(tmp_path) -> None:
+    settings = Settings(
+        ollama_enabled=False,
+        ollama_model="llama3.1:8b",
+        local_cache_path=tmp_path / "inbox_latest.json",
+    )
+    app = create_app(settings)
+    client = TestClient(app)
+
+    response = client.get("/v1/assistant/models")
+    assert response.status_code == 200
+    payload = response.json()
+
+    assert payload["reachable"] is False
+    assert payload["models"] == ["llama3.1:8b"]
+    assert payload["default_model"] == "llama3.1:8b"
