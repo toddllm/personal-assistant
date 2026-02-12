@@ -9,6 +9,12 @@ class Settings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 8790
+    log_level: str = "INFO"
+    log_json: bool = False
+    log_file_path: Path = Field(default_factory=lambda: Path("data/logs/tts-service.log"))
+    log_file_max_bytes: int = 10 * 1024 * 1024
+    log_file_backup_count: int = 7
+    access_log: bool = True
 
     provider: str = "qwen3_custom_voice"
     startup_load_model: bool = True

@@ -37,6 +37,22 @@ class TranscriptionWorker:
         device: str,
         compute_type: str,
         language: str,
+        beam_size: int = 1,
+        best_of: int = 1,
+        vad_filter: bool = True,
+        system_audio_vad_filter: bool | None = None,
+        no_speech_threshold: float = 0.6,
+        system_audio_no_speech_threshold: float | None = None,
+        min_signal_dbfs: float = -58.0,
+        fallback_on_empty: bool = True,
+        fallback_beam_size: int = 2,
+        fallback_best_of: int = 2,
+        fallback_vad_filter: bool = False,
+        fallback_no_speech_threshold: float = 1.0,
+        fallback_min_signal_dbfs: float = -55.0,
+        condition_on_previous_text: bool = False,
+        queue_size: int = 512,
+        archive_on_drop: bool = True,
         archiver: "AudioArchiver | None" = None,
         speaker_client: "SpeakerDiarizationClient | None" = None,
         mic_source_id: str = "desk-mic",
@@ -54,6 +70,27 @@ class TranscriptionWorker:
         self._device = device
         self._compute_type = compute_type
         self._language = self._normalize_language(language)
+        self._beam_size = int(max(1, min(beam_size, 5)))
+        self._best_of = int(max(1, min(best_of, 5)))
+        self._vad_filter = bool(vad_filter)
+        self._system_audio_vad_filter = (
+            self._vad_filter if system_audio_vad_filter is None else bool(system_audio_vad_filter)
+        )
+        self._no_speech_threshold = float(max(0.0, min(1.0, no_speech_threshold)))
+        self._system_audio_no_speech_threshold = (
+            self._no_speech_threshold
+            if system_audio_no_speech_threshold is None
+            else float(max(0.0, min(1.0, system_audio_no_speech_threshold)))
+        )
+        self._min_signal_dbfs = float(min_signal_dbfs)
+        self._fallback_on_empty = bool(fallback_on_empty)
+        self._fallback_beam_size = int(max(1, min(fallback_beam_size, 5)))
+        self._fallback_best_of = int(max(1, min(fallback_best_of, 5)))
+        self._fallback_vad_filter = bool(fallback_vad_filter)
+        self._fallback_no_speech_threshold = float(max(0.0, min(1.0, fallback_no_speech_threshold)))
+        self._fallback_min_signal_dbfs = float(fallback_min_signal_dbfs)
+        self._condition_on_previous_text = bool(condition_on_previous_text)
+        self._archive_on_drop = bool(archive_on_drop)
         self._archiver = archiver
         self._speaker_client = speaker_client
         self._mic_source_id = mic_source_id
@@ -64,7 +101,7 @@ class TranscriptionWorker:
         self._speaker_backfill_interval_seconds = float(max(3.0, speaker_backfill_interval_seconds))
         self._speaker_backfill_batch_size = int(max(4, min(200, speaker_backfill_batch_size)))
         self._speaker_backfill_since_seconds = int(max(60, speaker_backfill_since_seconds))
-        self._queue: Queue[AudioSegment] = Queue(maxsize=512)
+        self._queue: Queue[AudioSegment] = Queue(maxsize=max(64, int(queue_size)))
         self._speaker_queue: Queue[tuple[int, AudioSegment]] = Queue(maxsize=max(64, speaker_queue_size))
         self._thread: Thread | None = None
         self._speaker_thread: Thread | None = None
@@ -74,6 +111,17 @@ class TranscriptionWorker:
         self._speaker_backfill_running = False
         self._model = None
         self._model_load_failed = False
+        self._stats_lock = Lock()
+        self._segments_enqueued = 0
+        self._segments_dropped = 0
+        self._segments_processed = 0
+        self._segments_archived = 0
+        self._segments_archived_on_drop = 0
+        self._segments_text = 0
+        self._segments_empty = 0
+        self._segments_fallback_attempted = 0
+        self._segments_fallback_with_text = 0
+        self._queue_high_watermark = 0
         self._speaker_stats_lock = Lock()
         self._speaker_enqueued = 0
         self._speaker_dropped = 0
@@ -87,6 +135,8 @@ class TranscriptionWorker:
         self._speaker_backfill_missing_audio = 0
         self._speaker_backfill_errors = 0
         self._speaker_backfill_last_run_at: datetime | None = None
+        self._source_language_hints: dict[str, str | None] = {}
+        self._source_language_lock = Lock()
 
     def start(self) -> None:
         if self._running:
@@ -120,8 +170,32 @@ class TranscriptionWorker:
             raise RuntimeError("Transcription worker is not running.")
         try:
             self._queue.put_nowait(segment)
+            with self._stats_lock:
+                self._segments_enqueued += 1
+                queue_size = self._queue.qsize()
+                if queue_size > self._queue_high_watermark:
+                    self._queue_high_watermark = queue_size
         except Full:
-            logger.warning("Transcription queue full, dropping segment for source=%s", segment.source_id)
+            archived_on_drop = False
+            if self._archive_on_drop and self._archiver is not None:
+                try:
+                    self._archiver.save(segment)
+                    archived_on_drop = True
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Failed to archive dropped segment for source=%s started_at=%s",
+                        segment.source_id,
+                        segment.started_at,
+                    )
+            with self._stats_lock:
+                self._segments_dropped += 1
+                if archived_on_drop:
+                    self._segments_archived_on_drop += 1
+            logger.warning(
+                "Transcription queue full, dropping segment for source=%s (archived_on_drop=%s)",
+                segment.source_id,
+                archived_on_drop,
+            )
 
     def _run(self) -> None:
         while self._running:
@@ -132,6 +206,8 @@ class TranscriptionWorker:
             try:
                 if self._archiver is not None:
                     self._archiver.save(segment)
+                    with self._stats_lock:
+                        self._segments_archived += 1
                 if self._model is None and not self._model_load_failed:
                     try:
                         self._load_model()
@@ -142,6 +218,8 @@ class TranscriptionWorker:
                     continue
                 text = self._transcribe(segment)
                 if text:
+                    with self._stats_lock:
+                        self._segments_text += 1
                     speaker = self._owner_speaker_for_segment(segment)
                     if speaker is None and self._speaker_client is not None and not self._speaker_async_enrichment:
                         detection = self._detect_remote_speaker(segment)
@@ -161,9 +239,14 @@ class TranscriptionWorker:
                         and self._speaker_running
                     ):
                         self._enqueue_speaker_enrichment(record.id, segment)
+                else:
+                    with self._stats_lock:
+                        self._segments_empty += 1
             except Exception:  # noqa: BLE001
                 logger.exception("Transcription failed for source=%s", segment.source_id)
             finally:
+                with self._stats_lock:
+                    self._segments_processed += 1
                 self._queue.task_done()
 
     def _load_model(self) -> None:
@@ -179,6 +262,12 @@ class TranscriptionWorker:
             self._device,
             self._compute_type,
         )
+        if str(self._model_name).strip().lower().endswith(".en"):
+            logger.warning(
+                "Whisper model '%s' is English-only. Non-English speech may be mistranscribed. "
+                "Use a multilingual model (for example 'base' or 'small') with language=auto.",
+                self._model_name,
+            )
         self._model = WhisperModel(
             self._model_name,
             device=self._device,
@@ -191,16 +280,78 @@ class TranscriptionWorker:
             return ""
         # Convert PCM16 mono to float32 in [-1, 1] for faster-whisper.
         audio = np.frombuffer(segment.pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+        signal_dbfs = self._signal_dbfs(audio)
+        if signal_dbfs <= self._min_signal_dbfs:
+            return ""
+        language_hint = self.language_hint_for_source(segment.source_id)
+        language = language_hint if language_hint is not None else self._language
+        is_system_audio = segment.source_id.startswith("system-audio")
+        vad_filter = self._system_audio_vad_filter if is_system_audio else self._vad_filter
+        no_speech_threshold = (
+            self._system_audio_no_speech_threshold if is_system_audio else self._no_speech_threshold
+        )
+        text = self._transcribe_once(
+            audio=audio,
+            language=language,
+            vad_filter=vad_filter,
+            beam_size=self._beam_size,
+            best_of=self._best_of,
+            no_speech_threshold=no_speech_threshold,
+        )
+        if text:
+            return text
+        if not self._fallback_on_empty:
+            return ""
+        if signal_dbfs <= self._fallback_min_signal_dbfs:
+            return ""
+        with self._stats_lock:
+            self._segments_fallback_attempted += 1
+        fallback_text = self._transcribe_once(
+            audio=audio,
+            language=language,
+            vad_filter=self._fallback_vad_filter,
+            beam_size=self._fallback_beam_size,
+            best_of=self._fallback_best_of,
+            no_speech_threshold=self._fallback_no_speech_threshold,
+        )
+        if fallback_text:
+            with self._stats_lock:
+                self._segments_fallback_with_text += 1
+        return fallback_text
+
+    def _transcribe_once(
+        self,
+        *,
+        audio: np.ndarray,
+        language: str | None,
+        vad_filter: bool,
+        beam_size: int,
+        best_of: int,
+        no_speech_threshold: float,
+    ) -> str:
+        if self._model is None:
+            return ""
         parts, _ = self._model.transcribe(
             audio,
-            language=self._language,
-            vad_filter=True,
-            beam_size=1,
-            best_of=1,
-            condition_on_previous_text=False,
+            language=language,
+            task="transcribe",
+            vad_filter=vad_filter,
+            beam_size=beam_size,
+            best_of=best_of,
+            no_speech_threshold=no_speech_threshold,
+            condition_on_previous_text=self._condition_on_previous_text,
             without_timestamps=True,
         )
         return " ".join(part.text.strip() for part in parts if part.text.strip()).strip()
+
+    @staticmethod
+    def _signal_dbfs(audio: np.ndarray) -> float:
+        if audio.size == 0:
+            return -96.0
+        rms = float(np.sqrt(np.mean(audio * audio)))
+        if rms <= 1e-9:
+            return -96.0
+        return float(max(-96.0, 20.0 * np.log10(rms)))
 
     @staticmethod
     def _normalize_language(language: str | None) -> str | None:
@@ -208,6 +359,55 @@ class TranscriptionWorker:
         if not value or value in {"auto", "none", "null"}:
             return None
         return value
+
+    def set_source_language_hint(self, source_id: str, language_hint: str | None) -> str | None:
+        key = str(source_id or "").strip()
+        if not key:
+            return None
+        normalized = self._normalize_language(language_hint)
+        with self._source_language_lock:
+            if normalized is None:
+                self._source_language_hints.pop(key, None)
+            else:
+                self._source_language_hints[key] = normalized
+        return normalized
+
+    def language_hint_for_source(self, source_id: str) -> str | None:
+        key = str(source_id or "").strip()
+        if not key:
+            return None
+        with self._source_language_lock:
+            return self._source_language_hints.get(key)
+
+    def transcription_pipeline_status(self) -> dict[str, object]:
+        with self._stats_lock:
+            return {
+                "queue_size": self._queue.qsize(),
+                "queue_capacity": self._queue.maxsize,
+                "queue_high_watermark": self._queue_high_watermark,
+                "enqueued": self._segments_enqueued,
+                "dropped": self._segments_dropped,
+                "processed": self._segments_processed,
+                "archived": self._segments_archived,
+                "archived_on_drop": self._segments_archived_on_drop,
+                "with_text": self._segments_text,
+                "empty_text": self._segments_empty,
+                "fallback_attempted": self._segments_fallback_attempted,
+                "fallback_with_text": self._segments_fallback_with_text,
+                "model_name": self._model_name,
+                "language_default": self._language or "auto",
+                "beam_size": self._beam_size,
+                "best_of": self._best_of,
+                "vad_filter_default": self._vad_filter,
+                "vad_filter_system_audio": self._system_audio_vad_filter,
+                "no_speech_threshold_default": self._no_speech_threshold,
+                "no_speech_threshold_system_audio": self._system_audio_no_speech_threshold,
+                "fallback_enabled": self._fallback_on_empty,
+                "fallback_beam_size": self._fallback_beam_size,
+                "fallback_best_of": self._fallback_best_of,
+                "fallback_vad_filter": self._fallback_vad_filter,
+                "fallback_no_speech_threshold": self._fallback_no_speech_threshold,
+            }
 
     def _owner_speaker_for_segment(self, segment: AudioSegment) -> str | None:
         if self._mic_speaker_name and segment.source_id == self._mic_source_id:

@@ -225,12 +225,31 @@ button:hover {
   max-height: min(68vh, 920px);
 }
 
+.events-list {
+  max-height: min(72vh, 980px);
+}
+
+.google-events-list {
+  max-height: 260px;
+  margin-top: 8px;
+}
+
+.google-events-list .entry .meta {
+  margin-bottom: 4px;
+}
+
 .entry {
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 10px;
   background: #fff;
   animation: rise 220ms ease;
+}
+
+.focus-highlight {
+  outline: 2px solid #0f62fe;
+  outline-offset: 1px;
+  box-shadow: 0 0 0 4px rgba(15, 98, 254, 0.17);
 }
 
 .entry .meta {
@@ -244,6 +263,26 @@ button:hover {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.36;
+}
+
+.event-entry {
+  padding-bottom: 12px;
+}
+
+.event-transcript-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.event-transcript {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f7fbff;
+  padding: 8px;
 }
 
 .source-row {
@@ -343,10 +382,34 @@ button:hover {
 .source-row-actions {
   display: flex;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .source-row-actions .ghost-btn {
   padding: 6px 10px;
+}
+
+.transcript-details {
+  margin-top: 8px;
+}
+
+.transcript-details summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.transcript-details[open] summary {
+  margin-bottom: 6px;
+}
+
+.transcript-details pre {
+  margin: 0;
+  max-height: 320px;
+  overflow: auto;
 }
 
 .answer-block {
@@ -418,5 +481,11 @@ pre {
   .panel-header {
     flex-direction: column;
     align-items: flex-start;
+  }
+  .source-row {
+    flex-direction: column;
+  }
+  .source-row-actions {
+    justify-content: flex-start;
   }
 }

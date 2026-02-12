@@ -7,6 +7,10 @@ from pydantic import BaseModel, Field
 class SourceStartRequest(BaseModel):
     source_type: Literal["mic", "ffmpeg"] = Field(description="Audio source implementation.")
     source_id: str | None = Field(default=None, description="Optional explicit source ID.")
+    language_hint: str | None = Field(
+        default=None,
+        description="Optional language hint for ASR (for example: es, en, fr). Use auto/empty for detection.",
+    )
     device: str | int | None = Field(default=None, description="Mic device name or index.")
     ffmpeg_input: str | None = Field(
         default=None,
@@ -30,6 +34,14 @@ class SourceStatus(BaseModel):
     details: dict[str, str] = Field(default_factory=dict)
 
 
+class SourceLanguageHintRequest(BaseModel):
+    source_id: str
+    language_hint: str | None = Field(
+        default=None,
+        description="Language hint for ASR (for example: es, en). Use auto/empty to clear.",
+    )
+
+
 class SourceAudioLevel(BaseModel):
     source_id: str
     level_dbfs: float
@@ -40,6 +52,19 @@ class SourceAudioLevel(BaseModel):
     clipped: bool
 
 
+class TranscriptCalendarMatch(BaseModel):
+    event_id: str
+    calendar_id: str
+    title: str
+    started_at: datetime
+    ended_at: datetime
+    html_link: str | None = None
+    hangout_link: str | None = None
+    match_score: float
+    overlap_seconds: int = 0
+    distance_seconds: int = 0
+
+
 class TranscriptItem(BaseModel):
     id: int
     source_id: str
@@ -48,12 +73,32 @@ class TranscriptItem(BaseModel):
     ended_at: datetime
     text: str
     speaker: str | None = None
+    calendar_match: TranscriptCalendarMatch | None = None
 
 
 class TranscriptPage(BaseModel):
     items: list[TranscriptItem]
     next_before_id: int | None = None
     has_more: bool = False
+
+
+class EventTranscriptGroup(BaseModel):
+    event_id: str
+    calendar_id: str
+    title: str
+    started_at: datetime
+    ended_at: datetime
+    html_link: str | None = None
+    hangout_link: str | None = None
+    overlap_count: int = 0
+    transcripts: list[TranscriptItem] = Field(default_factory=list)
+
+
+class EventsPage(BaseModel):
+    calendar_id: str | None = None
+    synced_at: datetime | None = None
+    count: int = 0
+    events: list[EventTranscriptGroup] = Field(default_factory=list)
 
 
 class TranscriptPostprocessRequest(BaseModel):
@@ -64,6 +109,11 @@ class TranscriptPostprocessRequest(BaseModel):
     language: str | None = None
     model_name: str | None = None
     include_unchanged: bool = False
+    parallelism: int | None = Field(default=None, ge=1, le=8)
+    beam_size: int | None = Field(default=None, ge=1, le=5)
+    best_of: int | None = Field(default=None, ge=1, le=5)
+    vad_filter: bool | None = None
+    no_speech_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class TranscriptPostprocessItem(BaseModel):
@@ -88,7 +138,43 @@ class TranscriptPostprocessResult(BaseModel):
     failed: int = 0
     model_name: str
     language: str | None = None
+    elapsed_ms: int = 0
+    avg_ms_per_chunk: float | None = None
+    chunks_per_second: float | None = None
     items: list[TranscriptPostprocessItem] = Field(default_factory=list)
+
+
+class TranscriptTranslateRequest(BaseModel):
+    transcript_ids: list[int] = Field(default_factory=list, max_length=120)
+    source_language: str | None = None
+    target_language: str = "English"
+    model_name: str | None = None
+
+
+class TranscriptTranslateItem(BaseModel):
+    id: int
+    translated_text: str | None = None
+    cached: bool = False
+    error: str | None = None
+
+
+class TranscriptTranslateResult(BaseModel):
+    model_name: str
+    source_language: str | None = None
+    target_language: str = "English"
+    items: list[TranscriptTranslateItem] = Field(default_factory=list)
+
+
+class TranscriptTitleRequest(BaseModel):
+    transcript_ids: list[int] = Field(default_factory=list, max_length=600)
+    model_name: str | None = None
+    max_words: int = Field(default=8, ge=3, le=16)
+
+
+class TranscriptTitleResult(BaseModel):
+    title: str
+    provider: str
+    transcript_count: int = 0
 
 
 class TranscriptIngestRequest(BaseModel):
@@ -112,6 +198,7 @@ class PCMIngestRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
+    translate: bool = False
     source_id: str | None = None
     since_seconds: int | None = Field(default=3600, ge=1)
     limit: int | None = Field(default=None, ge=1, le=50)
@@ -138,3 +225,11 @@ class TTSSynthesizeRequest(BaseModel):
     tts_voice: str | None = None
     tts_language: str | None = None
     tts_instruct: str | None = None
+
+
+class GoogleCalendarSyncRequest(BaseModel):
+    calendar_id: str | None = None
+    lookback_hours: int = Field(default=24, ge=1, le=168)
+    lookahead_hours: int = Field(default=24, ge=1, le=168)
+    max_results: int | None = Field(default=None, ge=1, le=1000)
+    query: str | None = None

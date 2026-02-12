@@ -7,3 +7,7 @@ dist/
 build/
 *.egg-info/
 data/
+openclaw/
+
+# Local Google OAuth client secrets
+google/client_secret_*.apps.googleusercontent.com.json

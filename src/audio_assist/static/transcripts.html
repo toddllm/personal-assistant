@@ -25,12 +25,14 @@
         </div>
         <div class="hero-actions">
           <a class="ghost-btn" href="/">Back to Console</a>
+          <a class="ghost-btn" href="/events">Events</a>
           <a class="ghost-btn" href="/docs" target="_blank" rel="noreferrer">Open API Docs</a>
         </div>
       </header>
 
       <section class="panel fade delay-1">
         <h2>Transcript Manager</h2>
+        <p class="muted section-intro">Raw ASR transcript only. Translation overlays are not stored here.</p>
         <div class="grid">
           <label>
             Source
@@ -45,29 +47,66 @@
             <input id="page-size" type="number" min="20" max="1000" value="200" />
           </label>
           <label>
-            Compact Merge
-            <div class="toggle-row">
-              <label class="toggle">
-                <input id="compact" type="checkbox" />
-                <span>Merge neighboring chunks</span>
-              </label>
-            </div>
+            View
+            <select id="grouping-mode">
+              <option value="session" selected>Sessions (recommended)</option>
+              <option value="meeting">Meeting segments</option>
+              <option value="smart">Speaker/source turns</option>
+              <option value="raw">Raw chunks (every segment)</option>
+            </select>
           </label>
           <label>
-            View Mode
+            Meeting Gap (seconds)
+            <input id="meeting-gap-seconds" type="number" min="10" max="600" value="75" />
+          </label>
+          <label>
+            Max Meeting Length (minutes)
+            <input id="meeting-max-minutes" type="number" min="5" max="240" value="30" />
+          </label>
+          <label>
+            Tiny Segment Threshold (seconds)
+            <input id="tiny-max-seconds" type="number" min="3" max="120" value="12" />
+          </label>
+          <div>
             <div class="toggle-row">
               <label class="toggle">
-                <input id="sessionized" type="checkbox" />
-                <span>Session view (one item per source session)</span>
+                <input id="hide-tiny-segments" type="checkbox" checked />
+                <span>Hide short/noise segments in grouped views</span>
               </label>
             </div>
-          </label>
+          </div>
+        </div>
+
+        <div class="source-block">
+          <h3>Google Calendar Matching</h3>
+          <p class="muted section-intro">
+            Connect once, sync events, and session cards will map to your calendar meetings.
+          </p>
+          <div class="grid">
+            <label>
+              Lookback (hours)
+              <input id="google-sync-lookback-hours" type="number" min="1" max="168" value="24" />
+            </label>
+            <label>
+              Lookahead (hours)
+              <input id="google-sync-lookahead-hours" type="number" min="1" max="168" value="24" />
+            </label>
+          </div>
+          <div class="actions">
+            <button id="google-sync-connect" class="ghost-btn" type="button">Connect Google</button>
+            <button id="google-sync-now" class="ghost-btn" type="button">Sync Calendar</button>
+            <button id="google-sync-refresh" class="ghost-btn" type="button">Refresh Calendar Status</button>
+          </div>
+          <p id="google-sync-status" class="muted">Checking Google sync service status...</p>
+          <p id="google-sync-events-meta" class="muted">No calendar events loaded.</p>
+          <div id="google-sync-events" class="list google-events-list"></div>
         </div>
 
         <div class="actions">
           <button id="load-first" type="button">Load Latest</button>
           <button id="load-more" class="ghost-btn" type="button">Load Older</button>
           <button id="load-all" class="ghost-btn" type="button">Load All</button>
+          <button id="generate-titles" class="ghost-btn" type="button">Generate Titles</button>
           <button id="copy-loaded" class="ghost-btn" type="button">Copy Loaded</button>
           <button id="download-txt" class="ghost-btn" type="button">Download TXT</button>
           <button id="download-json" class="ghost-btn" type="button">Download JSON</button>
@@ -78,7 +117,7 @@
 
       <section class="panel fade delay-2">
         <div class="panel-header">
-          <h2>Loaded Transcript Entries</h2>
+          <h2>Loaded Transcript Timeline</h2>
           <p id="meta" class="muted">No entries loaded.</p>
         </div>
         <div id="list" class="list transcript-list"></div>
@@ -86,12 +125,22 @@
 
       <section class="panel fade delay-3">
         <h2>Plain Text View</h2>
-        <p class="muted">Chronological combined text for copy/paste into notes or docs.</p>
+        <p class="muted">Chronological transcript text for copy/paste. Configure timestamp/speaker format below.</p>
+        <div class="actions">
+          <label class="toggle">
+            <input id="plain-include-timestamps" type="checkbox" checked />
+            <span>Include timestamps</span>
+          </label>
+          <label class="toggle">
+            <input id="plain-include-speakers" type="checkbox" checked />
+            <span>Include source/speaker</span>
+          </label>
+        </div>
         <div class="actions">
           <button id="copy-plain" type="button">Copy Plain Text</button>
           <button id="paste-plain" class="ghost-btn" type="button">Paste from Clipboard</button>
         </div>
-        <textarea id="plain-text" rows="16" spellcheck="false"></textarea>
+        <textarea id="plain-text" rows="16" spellcheck="false" readonly></textarea>
       </section>
     </main>
 

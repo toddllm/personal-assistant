@@ -43,6 +43,7 @@ class MicrophoneSourceRunner(BaseSourceRunner):
         sample_rate: int,
         channels: int,
         segment_seconds: float,
+        overlap_seconds: float = 0.0,
         device: str | int | None = None,
     ):
         self._source_id = source_id
@@ -50,13 +51,25 @@ class MicrophoneSourceRunner(BaseSourceRunner):
         self._on_segment = on_segment
         self._sample_rate = sample_rate
         self._channels = channels
-        self._segment_seconds = segment_seconds
+        self._segment_seconds = max(0.5, float(segment_seconds))
+        overlap_value = max(0.0, float(overlap_seconds))
+        if overlap_value >= self._segment_seconds:
+            overlap_value = max(0.0, self._segment_seconds - 0.2)
+        self._overlap_seconds = overlap_value
+        self._segment_step_seconds = self._segment_seconds - self._overlap_seconds
+        if self._segment_step_seconds <= 0:
+            self._segment_step_seconds = self._segment_seconds
+            self._overlap_seconds = 0.0
         self._device = device
         self._stream = None
         self._running = False
         self._lock = Lock()
         self._buffer = bytearray()
-        self._segment_bytes = int(sample_rate * segment_seconds * channels * 2)
+        self._segment_bytes = int(sample_rate * self._segment_seconds * channels * 2)
+        self._segment_step_bytes = min(
+            self._segment_bytes,
+            max(2 * channels, int(sample_rate * self._segment_step_seconds * channels * 2)),
+        )
         self._stream_started_at: datetime | None = None
         self._segments_emitted = 0
 
@@ -105,10 +118,10 @@ class MicrophoneSourceRunner(BaseSourceRunner):
             return
         while len(self._buffer) >= self._segment_bytes:
             chunk = bytes(self._buffer[: self._segment_bytes])
-            del self._buffer[: self._segment_bytes]
+            del self._buffer[: self._segment_step_bytes]
 
             started_at = self._stream_started_at + timedelta(
-                seconds=self._segments_emitted * self._segment_seconds
+                seconds=self._segments_emitted * self._segment_step_seconds
             )
             ended_at = started_at + timedelta(seconds=self._segment_seconds)
             self._segments_emitted += 1
@@ -139,6 +152,7 @@ class FFmpegSourceRunner(BaseSourceRunner):
         channels: int,
         segment_seconds: float,
         ffmpeg_input: str,
+        overlap_seconds: float = 0.0,
         ffmpeg_input_format: str | None = None,
         ffmpeg_extra_args: list[str] | None = None,
     ):
@@ -147,11 +161,23 @@ class FFmpegSourceRunner(BaseSourceRunner):
         self._on_segment = on_segment
         self._sample_rate = sample_rate
         self._channels = channels
-        self._segment_seconds = segment_seconds
+        self._segment_seconds = max(0.5, float(segment_seconds))
+        overlap_value = max(0.0, float(overlap_seconds))
+        if overlap_value >= self._segment_seconds:
+            overlap_value = max(0.0, self._segment_seconds - 0.2)
+        self._overlap_seconds = overlap_value
+        self._segment_step_seconds = self._segment_seconds - self._overlap_seconds
+        if self._segment_step_seconds <= 0:
+            self._segment_step_seconds = self._segment_seconds
+            self._overlap_seconds = 0.0
         self._ffmpeg_input = ffmpeg_input
         self._ffmpeg_input_format = ffmpeg_input_format
         self._ffmpeg_extra_args = ffmpeg_extra_args or []
-        self._segment_bytes = int(sample_rate * segment_seconds * channels * 2)
+        self._segment_bytes = int(sample_rate * self._segment_seconds * channels * 2)
+        self._segment_step_bytes = min(
+            self._segment_bytes,
+            max(2 * channels, int(sample_rate * self._segment_step_seconds * channels * 2)),
+        )
         self._process: subprocess.Popen[bytes] | None = None
         self._thread: Thread | None = None
         self._stop_event = Event()
@@ -217,8 +243,8 @@ class FFmpegSourceRunner(BaseSourceRunner):
             buffer.extend(chunk)
             while len(buffer) >= self._segment_bytes:
                 seg = bytes(buffer[: self._segment_bytes])
-                del buffer[: self._segment_bytes]
-                started_at = start + timedelta(seconds=segment_index * self._segment_seconds)
+                del buffer[: self._segment_step_bytes]
+                started_at = start + timedelta(seconds=segment_index * self._segment_step_seconds)
                 ended_at = started_at + timedelta(seconds=self._segment_seconds)
                 segment_index += 1
                 try:
@@ -244,11 +270,13 @@ class SourceManager:
         sample_rate: int,
         channels: int,
         segment_seconds: float,
+        segment_overlap_seconds: float = 0.0,
     ):
         self._on_segment = on_segment
         self._sample_rate = sample_rate
         self._channels = channels
         self._segment_seconds = segment_seconds
+        self._segment_overlap_seconds = segment_overlap_seconds
         self._sources: dict[str, SourceRuntime] = {}
         self._lock = Lock()
 
@@ -262,6 +290,7 @@ class SourceManager:
             sample_rate=self._sample_rate,
             channels=self._channels,
             segment_seconds=self._segment_seconds,
+            overlap_seconds=self._segment_overlap_seconds,
             device=device,
         )
         runtime = SourceRuntime(source_id=source_id, session_id=session_id, source_type="mic", runner=runner)
@@ -288,6 +317,7 @@ class SourceManager:
             sample_rate=self._sample_rate,
             channels=self._channels,
             segment_seconds=self._segment_seconds,
+            overlap_seconds=self._segment_overlap_seconds,
             ffmpeg_input=ffmpeg_input,
             ffmpeg_input_format=ffmpeg_input_format,
             ffmpeg_extra_args=ffmpeg_extra_args,

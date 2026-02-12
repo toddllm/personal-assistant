@@ -3,13 +3,13 @@ from __future__ import annotations
 import uvicorn
 
 from audio_assist.logging_setup import configure_service_logging
-from tts_service.config import settings
-from tts_service.service import create_app
+from google_sync_service.config import settings
+from google_sync_service.service import create_app
 
 
 def main() -> None:
     configure_service_logging(
-        service_name="tts_service",
+        service_name="google_sync_service",
         level=settings.log_level,
         json_logs=settings.log_json,
         log_file_path=settings.log_file_path,

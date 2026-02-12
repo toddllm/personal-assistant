@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -6,6 +9,12 @@ class Settings(BaseSettings):
 
     host: str = "0.0.0.0"
     port: int = 8791
+    log_level: str = "INFO"
+    log_json: bool = False
+    log_file_path: Path = Field(default_factory=lambda: Path("data/logs/speaker-service.log"))
+    log_file_max_bytes: int = 10 * 1024 * 1024
+    log_file_backup_count: int = 7
+    access_log: bool = True
 
     window_seconds: float = 0.9
     min_window_seconds: float = 0.45
@@ -17,4 +26,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-
