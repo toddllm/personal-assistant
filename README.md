@@ -17,6 +17,7 @@ Use git submodules only for third-party or independently owned codebases.
 |---|---|---|---|---:|---|
 | Core capture | `audio-assist` | `src/audio_assist` | `audio-assist` | 8787 | `docs/services/audio-assist.md` |
 | Context ingestion | `google-sync-service` | `src/google_sync_service` | `google-sync-service` | 8792 | `docs/services/google-sync-service.md` |
+| Context ingestion | `email-service` | `src/email_service` | `email-service` | 8793 | `docs/services/email-service.md` |
 | Voice output | `tts-service` | `src/tts_service` | `tts-service` | 8790 | `docs/services/tts-service.md` |
 | Enrichment | `speaker-service` | `src/speaker_service` | `speaker-service` | 8791 | `docs/services/speaker-service.md` |
 
@@ -63,6 +64,25 @@ Connect once:
 google-sync-connect
 ```
 
+Important:
+- Gmail reads require Gmail API enabled in your Google Cloud project.
+- If Gmail API is disabled, `POST /v1/gmail/sync` will return `403 accessNotConfigured`.
+
+### email-service
+
+```bash
+source .venv/bin/activate
+email-service
+```
+
+Initial inbox refresh:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8793/v1/inbox/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"force_sync":true,"max_results":50,"label_ids":["INBOX"]}'
+```
+
 ### tts-service
 
 On local fallback mode:
@@ -100,12 +120,14 @@ All services support rotating file logs + access log toggle.
 Default log files:
 - `data/logs/audio-assist.log`
 - `data/logs/google-sync-service.log`
+- `data/logs/email-service.log`
 - `data/logs/tts-service.log`
 - `data/logs/speaker-service.log`
 
 Environment prefixes:
 - `AUDIO_ASSIST_*`
 - `GOOGLE_SYNC_*`
+- `EMAIL_SERVICE_*`
 - `TTS_SERVICE_*`
 - `SPEAKER_SERVICE_*`
 
@@ -148,6 +170,14 @@ Operational guide:
 - `POST /v1/gmail/sync`
 - `POST /v1/calendar/sync`
 - `GET /v1/calendar/events`
+
+`email-service`:
+- `GET /health`
+- `POST /v1/inbox/refresh`
+- `GET /v1/inbox/overview`
+- `GET /v1/inbox/focus`
+- `GET /v1/inbox/threads`
+- `GET /v1/inbox/messages`
 
 `tts-service`:
 - `GET /health`

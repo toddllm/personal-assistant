@@ -33,6 +33,7 @@ tts-service = "tts_service.main:main"
 speaker-service = "speaker_service.main:main"
 google-sync-service = "google_sync_service.main:main"
 google-sync-connect = "google_sync_service.cli:main"
+email-service = "email_service.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

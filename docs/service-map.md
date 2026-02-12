@@ -20,6 +20,13 @@ Current first-party services in this monorepo.
 - Purpose: read-only Gmail + Google Calendar sync/cache for assistant context.
 - Service doc: `docs/services/google-sync-service.md`
 
+### email-service
+- Package: `src/email_service`
+- Entrypoint: `email-service`
+- Port: `8793`
+- Purpose: local inbox prioritization/focus layer on top of `google-sync-service`.
+- Service doc: `docs/services/email-service.md`
+
 ## Voice and enrichment plane
 
 ### tts-service

@@ -38,5 +38,6 @@ Before important meetings/sessions:
 
 - `audio-assist`: `data/logs/audio-assist.log`
 - `google-sync-service`: `data/logs/google-sync-service.log`
+- `email-service`: `data/logs/email-service.log`
 - `tts-service`: `data/logs/tts-service.log`
 - `speaker-service`: `data/logs/speaker-service.log`

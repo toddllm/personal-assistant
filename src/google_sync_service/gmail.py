@@ -52,7 +52,7 @@ class GmailSyncManager:
         list_url = f"{GMAIL_BASE_URL}/{self._settings.user_id}/messages"
         with httpx.Client(timeout=self._settings.oauth_timeout_seconds) as http:
             list_response = http.get(list_url, headers=headers, params=list_params)
-            list_response.raise_for_status()
+            _raise_for_status_with_detail(list_response, context="Gmail list")
             list_payload = list_response.json()
             entries = list_payload.get("messages") or []
 
@@ -158,7 +158,7 @@ def _fetch_message_details(
         "metadataHeaders": ["From", "Subject", "Date"],
     }
     response = http.get(url, headers=headers, params=params)
-    response.raise_for_status()
+    _raise_for_status_with_detail(response, context="Gmail message details")
     payload = response.json()
 
     header_map: dict[str, str] = {}
@@ -193,6 +193,37 @@ def _canonical_sender(from_header: str | None) -> str | None:
     if match:
         return match.group(1).strip().lower()
     return from_header.strip().lower()
+
+
+def _raise_for_status_with_detail(response: httpx.Response, *, context: str) -> None:
+    if response.status_code < 400:
+        return
+
+    detail = _extract_error_detail(response)
+    if detail:
+        raise RuntimeError(f"{context} failed: {detail}")
+    response.raise_for_status()
+
+
+def _extract_error_detail(response: httpx.Response) -> str | None:
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        text = response.text.strip()
+        return text or None
+
+    if not isinstance(payload, dict):
+        return str(payload)
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if message:
+            return str(message)
+    detail = payload.get("detail")
+    if detail:
+        return str(detail)
+    return json.dumps(payload, ensure_ascii=True)
 
 
 __all__ = [
