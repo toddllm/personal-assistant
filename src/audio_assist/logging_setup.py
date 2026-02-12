@@ -56,11 +56,11 @@ def configure_service_logging(
     root_logger = logging.getLogger()
     root_logger.setLevel(resolved_level)
     root_logger.handlers.clear()
-    root_logger.addFilter(session_filter)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(resolved_level)
     console_handler.setFormatter(formatter)
+    console_handler.addFilter(session_filter)
     root_logger.addHandler(console_handler)
 
     if log_file_path is not None:
@@ -74,6 +74,7 @@ def configure_service_logging(
         )
         file_handler.setLevel(resolved_level)
         file_handler.setFormatter(formatter)
+        file_handler.addFilter(session_filter)
         root_logger.addHandler(file_handler)
 
     logging.getLogger(service_name).info(
