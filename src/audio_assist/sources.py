@@ -312,15 +312,21 @@ class SourceManager:
         self._sources: dict[str, SourceRuntime] = {}
         self._lock = Lock()
 
-    def start_mic(self, source_id: str | None = None, device: str | int | None = None) -> SourceRuntime:
+    def start_mic(
+        self,
+        source_id: str | None = None,
+        device: str | int | None = None,
+        channels: int | None = None,
+    ) -> SourceRuntime:
         source_id = source_id or f"mic-{uuid4().hex[:8]}"
         session_id = f"{source_id}-{uuid4().hex[:12]}"
+        runner_channels = self._channels if channels is None else max(1, int(channels))
         runner = MicrophoneSourceRunner(
             source_id=source_id,
             session_id=session_id,
             on_segment=self._on_segment,
             sample_rate=self._sample_rate,
-            channels=self._channels,
+            channels=runner_channels,
             segment_seconds=self._segment_seconds,
             overlap_seconds=self._segment_overlap_seconds,
             device=device,

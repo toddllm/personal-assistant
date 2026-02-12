@@ -675,7 +675,12 @@ def create_app(settings: Settings) -> FastAPI:
             errors.append(message)
             logger.warning(message)
 
-        def ensure_mic_source(source_id: str, device: str | int | None, role: str) -> None:
+        def ensure_mic_source(
+            source_id: str,
+            device: str | int | None,
+            role: str,
+            channels: int | None = None,
+        ) -> None:
             existing = source_manager.get(source_id)
             if existing is not None and existing.runner.is_running():
                 report.append(
@@ -696,7 +701,7 @@ def create_app(settings: Settings) -> FastAPI:
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed stopping stale mic source=%s before restart.", source_id)
             try:
-                runtime = source_manager.start_mic(source_id=source_id, device=device)
+                runtime = source_manager.start_mic(source_id=source_id, device=device, channels=channels)
                 persist_runtime_session(runtime)
                 report.append(
                     {
@@ -706,6 +711,7 @@ def create_app(settings: Settings) -> FastAPI:
                         "started": True,
                         "running": runtime.runner.is_running(),
                         "device": device,
+                        "channels": channels,
                     }
                 )
                 logger.info("Auto-started source=%s (mic, role=%s, device=%s)", source_id, role, device)
@@ -807,8 +813,14 @@ def create_app(settings: Settings) -> FastAPI:
                 explicit_device = coerce_device_identifier(settings.capture_autostart_system_audio_device)
                 discovered_device = discover_system_audio_device() if explicit_device is None else None
                 selected_device = explicit_device if explicit_device is not None else discovered_device
+                system_channels = max(1, min(int(settings.capture_autostart_system_audio_channels), 8))
                 if selected_device is not None:
-                    ensure_mic_source(system_source_id, selected_device, role="system-audio")
+                    ensure_mic_source(
+                        system_source_id,
+                        selected_device,
+                        role="system-audio",
+                        channels=system_channels,
+                    )
                 else:
                     ffmpeg_input = str(settings.capture_autostart_system_audio_ffmpeg_input or "").strip()
                     ffmpeg_input_format = (
