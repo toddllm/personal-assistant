@@ -15,6 +15,23 @@ else
   APP_CMD=("google-sync-service")
 fi
 
+health_ok() {
+  curl -fsS --max-time 1 "http://127.0.0.1:8792/health" >/dev/null 2>&1
+}
+
+wait_for_health() {
+  local attempts="${1:-16}"
+  local delay="${2:-0.25}"
+  local i
+  for ((i = 0; i < attempts; i++)); do
+    if health_ok; then
+      return 0
+    fi
+    sleep "$delay"
+  done
+  return 1
+}
+
 is_running() {
   local listener_pid=""
   if [[ ! -f "$PID_FILE" ]]; then
@@ -68,6 +85,11 @@ start_service() {
   done
   if is_running; then
     echo "google-sync-service started (pid $pid)."
+    if wait_for_health 24 0.25; then
+      echo "health: ok"
+    else
+      echo "health: warming"
+    fi
     echo "supervisor log: $SUPERVISOR_LOG"
     return 0
   fi
@@ -105,7 +127,11 @@ service_status() {
     local pid
     pid="$(cat "$PID_FILE")"
     echo "google-sync-service running (pid $pid)."
-    curl -sf "http://127.0.0.1:8792/health" >/dev/null 2>&1 && echo "health: ok" || echo "health: unreachable"
+    if wait_for_health 8 0.25; then
+      echo "health: ok"
+    else
+      echo "health: warming"
+    fi
     return 0
   fi
   echo "google-sync-service not running."

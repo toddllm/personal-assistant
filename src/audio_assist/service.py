@@ -691,6 +691,10 @@ def create_app(settings: Settings) -> FastAPI:
                 return
             if existing is not None:
                 close_stale_session(existing)
+                try:
+                    source_manager.stop(source_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed stopping stale mic source=%s before restart.", source_id)
             try:
                 runtime = source_manager.start_mic(source_id=source_id, device=device)
                 persist_runtime_session(runtime)
@@ -739,6 +743,10 @@ def create_app(settings: Settings) -> FastAPI:
                 return
             if existing is not None:
                 close_stale_session(existing)
+                try:
+                    source_manager.stop(source_id)
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed stopping stale ffmpeg source=%s before restart.", source_id)
             try:
                 runtime = source_manager.start_ffmpeg(
                     source_id=source_id,
@@ -1185,10 +1193,15 @@ def create_app(settings: Settings) -> FastAPI:
         recent_seconds: int = 180,
         level_stale_seconds: int = 25,
         active_level_dbfs: float = -55.0,
+        ensure_running: bool = True,
     ) -> dict[str, object]:
         safe_recent_seconds = int(max(30, min(recent_seconds, 3600)))
         safe_level_stale_seconds = int(max(3, min(level_stale_seconds, 180)))
         safe_active_level_dbfs = float(max(-80.0, min(active_level_dbfs, -8.0)))
+
+        auto_ensure_payload: dict[str, object] | None = None
+        if ensure_running and settings.capture_autostart_enabled:
+            auto_ensure_payload = ensure_capture_sources_running()
         now = datetime.now(tz=UTC)
 
         runtimes = source_manager.statuses()
@@ -1419,6 +1432,7 @@ def create_app(settings: Settings) -> FastAPI:
                     "mic_source_id": mic_source_id,
                     "system_audio_source_id": system_source_id,
                 },
+                "auto_ensure": auto_ensure_payload,
                 "transcripts_recent_total": total_recent_count,
                 "transcripts_recent_mic": mic_recent_count,
                 "transcripts_recent_system_audio": system_recent_count,

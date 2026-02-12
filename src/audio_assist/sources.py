@@ -72,6 +72,8 @@ class MicrophoneSourceRunner(BaseSourceRunner):
         )
         self._stream_started_at: datetime | None = None
         self._segments_emitted = 0
+        self._last_data_at: datetime | None = None
+        self._stall_timeout_seconds = max(15.0, self._segment_seconds * 6.0)
 
     def start(self) -> None:
         if self._running:
@@ -88,6 +90,7 @@ class MicrophoneSourceRunner(BaseSourceRunner):
                 pass
             with self._lock:
                 self._buffer.extend(bytes(indata))
+                self._last_data_at = datetime.now(tz=UTC)
                 self._drain_segments()
 
         self._stream = sd.RawInputStream(
@@ -99,7 +102,9 @@ class MicrophoneSourceRunner(BaseSourceRunner):
             blocksize=int(self._sample_rate * 0.25),
         )
         self._stream.start()
-        self._stream_started_at = datetime.now(tz=UTC)
+        now = datetime.now(tz=UTC)
+        self._stream_started_at = now
+        self._last_data_at = now
         self._segments_emitted = 0
         self._running = True
 
@@ -109,9 +114,23 @@ class MicrophoneSourceRunner(BaseSourceRunner):
             self._stream.stop()
             self._stream.close()
             self._stream = None
+        self._last_data_at = None
 
     def is_running(self) -> bool:
-        return self._running
+        if not self._running:
+            return False
+        if self._stream is None:
+            return False
+        try:
+            if hasattr(self._stream, "active") and not bool(self._stream.active):  # type: ignore[attr-defined]
+                return False
+        except Exception:
+            pass
+        if self._last_data_at is not None:
+            age_seconds = max(0.0, (datetime.now(tz=UTC) - self._last_data_at).total_seconds())
+            if age_seconds > self._stall_timeout_seconds:
+                return False
+        return True
 
     def _drain_segments(self) -> None:
         if self._stream_started_at is None:
@@ -182,6 +201,8 @@ class FFmpegSourceRunner(BaseSourceRunner):
         self._thread: Thread | None = None
         self._stop_event = Event()
         self._running = False
+        self._last_data_at: datetime | None = None
+        self._stall_timeout_seconds = max(15.0, self._segment_seconds * 6.0)
 
     def start(self) -> None:
         if self._running:
@@ -209,6 +230,7 @@ class FFmpegSourceRunner(BaseSourceRunner):
             bufsize=0,
         )
         self._stop_event.clear()
+        self._last_data_at = datetime.now(tz=UTC)
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
         self._running = True
@@ -226,9 +248,18 @@ class FFmpegSourceRunner(BaseSourceRunner):
             self._thread.join(timeout=2)
         self._thread = None
         self._process = None
+        self._last_data_at = None
 
     def is_running(self) -> bool:
-        return self._running
+        if not self._running:
+            return False
+        if self._process is not None and self._process.poll() is not None:
+            return False
+        if self._last_data_at is not None:
+            age_seconds = max(0.0, (datetime.now(tz=UTC) - self._last_data_at).total_seconds())
+            if age_seconds > self._stall_timeout_seconds:
+                return False
+        return True
 
     def _run(self) -> None:
         if self._process is None or self._process.stdout is None:
@@ -240,6 +271,7 @@ class FFmpegSourceRunner(BaseSourceRunner):
             chunk = self._process.stdout.read(4096)
             if not chunk:
                 break
+            self._last_data_at = datetime.now(tz=UTC)
             buffer.extend(chunk)
             while len(buffer) >= self._segment_bytes:
                 seg = bytes(buffer[: self._segment_bytes])
