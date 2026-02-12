@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audio Assist - Events</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <main class="layout">
+      <header class="panel hero fade">
+        <div>
+          <h1>Events + Transcripts</h1>
+          <p>Simple event view. Every synced calendar event appears, with overlapping transcripts attached below it.</p>
+        </div>
+        <div class="hero-actions">
+          <a class="ghost-btn" href="/">Back to Console</a>
+          <a class="ghost-btn" href="/transcripts">Full Transcripts</a>
+          <a class="ghost-btn" href="/docs" target="_blank" rel="noreferrer">Open API Docs</a>
+        </div>
+      </header>
+
+      <section class="panel fade delay-1">
+        <h2>Controls</h2>
+        <div class="grid">
+          <label>
+            Lookback (hours)
+            <input id="lookback-hours" type="number" min="1" max="720" value="168" />
+          </label>
+          <label>
+            Lookahead (hours)
+            <input id="lookahead-hours" type="number" min="1" max="720" value="168" />
+          </label>
+        </div>
+        <div class="actions">
+          <button id="connect-google" class="ghost-btn" type="button">Connect Google</button>
+          <button id="sync-calendar" class="ghost-btn" type="button">Sync Calendar</button>
+          <button id="ensure-capture" class="ghost-btn" type="button">Ensure Capture Running</button>
+          <button id="refresh-events" type="button">Refresh Events</button>
+        </div>
+        <p id="capture-status" class="muted">Checking capture status...</p>
+        <p id="capture-readiness" class="muted">Checking capture readiness...</p>
+        <p id="google-status" class="muted">Checking Google sync status...</p>
+        <p id="events-meta" class="muted">No events loaded yet.</p>
+      </section>
+
+      <section class="panel fade delay-2">
+        <h2>Calendar Events</h2>
+        <div id="events-list" class="list events-list"></div>
+      </section>
+    </main>
+    <script src="/static/events.js?v=20260212-2" defer></script>
+  </body>
+</html>

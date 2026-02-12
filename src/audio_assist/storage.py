@@ -235,6 +235,35 @@ class TranscriptStore:
             rows = self._conn.execute(query, params).fetchall()
         return [self._to_session_record(row) for row in rows]
 
+    def sessions_by_session_ids(self, session_ids: list[str]) -> list[SessionRecord]:
+        if not session_ids:
+            return []
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for raw in session_ids:
+            value = str(raw or "").strip()[:96]
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
+        if not deduped:
+            return []
+        placeholders = ",".join("?" for _ in deduped)
+        query = f"""
+            SELECT id, session_id, source_id, source_type, started_at, ended_at, text, speaker
+            FROM transcript_sessions
+            WHERE session_id IN ({placeholders})
+        """
+        with self._lock:
+            rows = self._conn.execute(query, deduped).fetchall()
+        by_session_id = {str(row["session_id"]): self._to_session_record(row) for row in rows}
+        ordered: list[SessionRecord] = []
+        for session_id in deduped:
+            row = by_session_id.get(session_id)
+            if row is not None:
+                ordered.append(row)
+        return ordered
+
     def page_sessions(
         self,
         limit: int = 200,
@@ -304,6 +333,34 @@ class TranscriptStore:
             rows = self._conn.execute(query, params).fetchall()
         return [self._to_record(row) for row in rows]
 
+    def recent_activity(
+        self,
+        *,
+        since_seconds: int = 300,
+        source_id: str | None = None,
+    ) -> tuple[int, datetime | None]:
+        safe_since = int(max(1, min(since_seconds, 24 * 3600)))
+        cutoff = datetime.now(tz=UTC) - timedelta(seconds=safe_since)
+        filters: list[str] = ["ended_at >= ?"]
+        params: list[object] = [cutoff.isoformat()]
+        if source_id:
+            filters.append("source_id = ?")
+            params.append(source_id)
+        where_clause = f"WHERE {' AND '.join(filters)}"
+        query = f"""
+            SELECT COUNT(*) AS count, MAX(ended_at) AS latest
+            FROM transcripts
+            {where_clause}
+        """
+        with self._lock:
+            row = self._conn.execute(query, params).fetchone()
+        if row is None:
+            return 0, None
+        count = int(row["count"] or 0)
+        latest_raw = str(row["latest"]).strip() if row["latest"] else ""
+        latest_dt = datetime.fromisoformat(latest_raw).astimezone(UTC) if latest_raw else None
+        return count, latest_dt
+
     def recent_unlabeled(
         self,
         limit: int = 100,
@@ -334,6 +391,39 @@ class TranscriptStore:
         with self._lock:
             rows = self._conn.execute(query, params).fetchall()
         return [self._to_record(row) for row in rows]
+
+    def by_ids(self, transcript_ids: list[int]) -> list[TranscriptRecord]:
+        if not transcript_ids:
+            return []
+        deduped: list[int] = []
+        seen: set[int] = set()
+        for value in transcript_ids:
+            try:
+                item_id = int(value)
+            except Exception:  # noqa: BLE001
+                continue
+            if item_id <= 0 or item_id in seen:
+                continue
+            seen.add(item_id)
+            deduped.append(item_id)
+        if not deduped:
+            return []
+
+        placeholders = ",".join("?" for _ in deduped)
+        query = f"""
+            SELECT id, source_id, session_id, started_at, ended_at, text, speaker
+            FROM transcripts
+            WHERE id IN ({placeholders})
+        """
+        with self._lock:
+            rows = self._conn.execute(query, deduped).fetchall()
+        by_id = {int(row["id"]): self._to_record(row) for row in rows}
+        ordered: list[TranscriptRecord] = []
+        for item_id in deduped:
+            record = by_id.get(item_id)
+            if record is not None:
+                ordered.append(record)
+        return ordered
 
     def recent_compact(
         self,
@@ -389,6 +479,42 @@ class TranscriptStore:
             records = self._compact_records(records, target_limit=safe_limit)
         next_before_id = oldest_raw_id if has_more else None
         return records, next_before_id, has_more
+
+    def overlap_window(
+        self,
+        *,
+        start_at: datetime,
+        end_at: datetime,
+        source_id: str | None = None,
+        limit: int = 5000,
+    ) -> list[TranscriptRecord]:
+        safe_limit = max(1, min(limit, 10000))
+        start_utc = start_at.astimezone(UTC)
+        end_utc = end_at.astimezone(UTC)
+        if end_utc <= start_utc:
+            return []
+
+        filters: list[str] = [
+            "started_at < ?",
+            "ended_at > ?",
+        ]
+        params: list[object] = [end_utc.isoformat(), start_utc.isoformat()]
+        if source_id:
+            filters.append("source_id = ?")
+            params.append(source_id)
+
+        where_clause = f"WHERE {' AND '.join(filters)}"
+        query = f"""
+            SELECT id, source_id, session_id, started_at, ended_at, text, speaker
+            FROM transcripts
+            {where_clause}
+            ORDER BY started_at ASC, id ASC
+            LIMIT ?
+        """
+        params.append(safe_limit)
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        return [self._to_record(row) for row in rows]
 
     def list_sources(self, since_seconds: int | None = None) -> list[str]:
         params: list[object] = []

@@ -1,22 +1,30 @@
 from __future__ import annotations
 
-import logging
-
 import uvicorn
 
 from audio_assist.config import settings
+from audio_assist.logging_setup import configure_service_logging
 from audio_assist.service import create_app
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    configure_service_logging(
+        service_name="audio_assist",
+        level=settings.log_level,
+        json_logs=settings.log_json,
+        log_file_path=settings.log_file_path,
+        log_file_max_bytes=settings.log_file_max_bytes,
+        log_file_backup_count=settings.log_file_backup_count,
     )
     app = create_app(settings)
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(
+        app,
+        host=settings.host,
+        port=settings.port,
+        access_log=settings.access_log,
+        log_config=None,
+    )
 
 
 if __name__ == "__main__":
     main()
-

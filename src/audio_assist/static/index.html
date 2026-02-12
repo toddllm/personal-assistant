@@ -25,6 +25,7 @@
         </div>
         <div class="hero-actions">
           <a class="ghost-btn" href="/transcripts">Full Transcripts</a>
+          <a class="ghost-btn" href="/events">Events</a>
           <a class="ghost-btn" href="/docs" target="_blank" rel="noreferrer">Open API Docs</a>
         </div>
       </header>
@@ -41,6 +42,18 @@
             <label>
               Source Preset
               <select id="source-preset"></select>
+            </label>
+            <label>
+              ASR Language Hint
+              <select id="asr-language-hint">
+                <option value="">Auto detect</option>
+                <option value="es">Spanish (es)</option>
+                <option value="en">English (en)</option>
+                <option value="fr">French (fr)</option>
+                <option value="pt">Portuguese (pt)</option>
+                <option value="it">Italian (it)</option>
+                <option value="de">German (de)</option>
+              </select>
             </label>
             <label>
               Auto Start
@@ -108,9 +121,31 @@
               Since (seconds)
               <input id="since-seconds" type="number" min="1" value="3600" />
             </label>
+            <label>
+              Live Translation
+              <div class="toggle-row">
+                <label class="toggle">
+                  <input id="live-translate" type="checkbox" />
+                  <span>Show English translation (raw kept)</span>
+                </label>
+              </div>
+            </label>
+            <label>
+              Source Language (translation)
+              <select id="translate-source-language">
+                <option value="">Auto detect</option>
+                <option value="es">Spanish (es)</option>
+                <option value="en">English (en)</option>
+                <option value="fr">French (fr)</option>
+                <option value="pt">Portuguese (pt)</option>
+                <option value="it">Italian (it)</option>
+                <option value="de">German (de)</option>
+              </select>
+            </label>
           </div>
           <div class="actions">
             <button id="refresh-now" class="ghost-btn" type="button">Refresh Transcripts</button>
+            <button id="apply-language-hint" class="ghost-btn" type="button">Apply ASR Hint to Source</button>
             <button id="stop-source" class="danger" type="button">Stop Selected Source</button>
             <label class="toggle">
               <input id="show-stopped-sources" type="checkbox" />
@@ -124,6 +159,7 @@
         </div>
 
         <p id="control-status" class="status muted">Ready.</p>
+        <p id="capture-readiness" class="muted">Checking capture readiness...</p>
         <div>
           <p class="muted">Running Sources</p>
           <div id="running-sources" class="list compact"></div>
@@ -157,6 +193,15 @@
             <input id="query-limit" type="number" min="1" max="50" value="8" />
           </label>
           <label>
+            Translate
+            <div class="toggle-row">
+              <label class="toggle">
+                <input id="query-translate" type="checkbox" />
+                <span>Translate answer to English (optional)</span>
+              </label>
+            </div>
+          </label>
+          <label>
             TTS Voice
             <div class="inline">
               <select id="tts-voice"></select>
@@ -185,6 +230,7 @@
         <p id="ollama-status" class="muted">Loading local Ollama models...</p>
         <p id="tts-status" class="muted">Loading TTS voice options...</p>
         <p id="speaker-status" class="muted">Loading speaker detection status...</p>
+        <p id="transcriber-status" class="muted">Loading transcription pipeline status...</p>
         <div class="actions">
           <button id="ask-ollama" type="button">Ask from Transcript Context</button>
         </div>
@@ -201,6 +247,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js" defer></script>
+    <script src="/static/app.js?v=20260212-1" defer></script>
   </body>
 </html>

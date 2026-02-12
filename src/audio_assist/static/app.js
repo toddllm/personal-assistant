@@ -31,11 +31,15 @@ const el = {
   cycleDevices: document.getElementById("cycle-devices"),
   micScanStatus: document.getElementById("mic-scan-status"),
   micScanList: document.getElementById("mic-scan-list"),
+  asrLanguageHint: document.getElementById("asr-language-hint"),
   autoStartSources: document.getElementById("auto-start-sources"),
   showStoppedSources: document.getElementById("show-stopped-sources"),
+  liveTranslate: document.getElementById("live-translate"),
+  translateSourceLanguage: document.getElementById("translate-source-language"),
   runningSources: document.getElementById("running-sources"),
   verbose: document.getElementById("verbose"),
   controlStatus: document.getElementById("control-status"),
+  captureReadiness: document.getElementById("capture-readiness"),
   transcriptMeta: document.getElementById("transcript-meta"),
   transcriptList: document.getElementById("transcript-list"),
   question: document.getElementById("question"),
@@ -44,9 +48,11 @@ const el = {
   ttsVoice: document.getElementById("tts-voice"),
   ttsStatus: document.getElementById("tts-status"),
   speakerStatus: document.getElementById("speaker-status"),
+  transcriberStatus: document.getElementById("transcriber-status"),
   speakAnswer: document.getElementById("speak-answer"),
   streamVoice: document.getElementById("stream-voice"),
   queryLimit: document.getElementById("query-limit"),
+  queryTranslate: document.getElementById("query-translate"),
   answer: document.getElementById("answer"),
   answerProvider: document.getElementById("answer-provider"),
   answerAudio: document.getElementById("answer-audio"),
@@ -56,6 +62,7 @@ const el = {
   refreshTtsVoices: document.getElementById("refresh-tts-voices"),
   refreshSources: document.getElementById("refresh-sources"),
   startManualSource: document.getElementById("start-manual-source"),
+  applyLanguageHint: document.getElementById("apply-language-hint"),
   stopSource: document.getElementById("stop-source"),
   refreshNow: document.getElementById("refresh-now"),
   askOllama: document.getElementById("ask-ollama"),
@@ -72,7 +79,20 @@ const state = {
   streamQueue: [],
   streamPlaying: false,
   pollTicks: 0,
+  liveTranslations: {},
+  liveTranslationInFlight: false,
+  liveTranslationConfigKey: "",
 };
+
+window.addEventListener("error", (event) => {
+  const message = event && event.message ? String(event.message) : "Unknown frontend error";
+  setStatus(`UI error: ${message}`, true);
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event && event.reason ? String(event.reason) : "Unknown async error";
+  setStatus(`UI async error: ${reason}`, true);
+});
 
 function sourceFilterValue() {
   const value = (el.sourceFilter.value || "").trim();
@@ -125,6 +145,36 @@ function selectedSourcePreset() {
 function selectedManualSourceType() {
   const value = (el.manualSourceType.value || "").trim().toLowerCase();
   return value === "ffmpeg" ? "ffmpeg" : "mic";
+}
+
+function selectedAsrLanguageHint() {
+  const value = (el.asrLanguageHint && el.asrLanguageHint.value ? el.asrLanguageHint.value : "").trim();
+  return value || null;
+}
+
+function liveTranslateEnabled() {
+  return Boolean(el.liveTranslate && el.liveTranslate.checked);
+}
+
+function selectedTranslateSourceLanguage() {
+  const value = (el.translateSourceLanguage && el.translateSourceLanguage.value
+    ? el.translateSourceLanguage.value
+    : ""
+  ).trim();
+  return value || null;
+}
+
+function resetLiveTranslationCache() {
+  state.liveTranslations = {};
+  state.liveTranslationInFlight = false;
+}
+
+function withAsrLanguageHint(payload) {
+  const languageHint = selectedAsrLanguageHint();
+  if (!languageHint) {
+    return { ...payload, language_hint: null };
+  }
+  return { ...payload, language_hint: languageHint };
 }
 
 function escapeHtml(input) {
@@ -267,8 +317,54 @@ function setStatus(message, isError = false) {
   el.controlStatus.style.color = isError ? "#bf2f39" : "";
 }
 
+function readinessColor(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (normalized === "ready") {
+    return "#17653a";
+  }
+  if (normalized === "degraded") {
+    return "#9a6b00";
+  }
+  return "#bf2f39";
+}
+
+function formatReadinessLabel(status) {
+  const normalized = String(status || "").trim().toLowerCase();
+  if (!normalized) {
+    return "UNKNOWN";
+  }
+  return normalized.toUpperCase();
+}
+
+function renderCaptureReadiness(payload) {
+  if (!el.captureReadiness) {
+    return;
+  }
+  const label = formatReadinessLabel(payload && payload.status);
+  const summary = String(payload && payload.summary ? payload.summary : "No readiness summary.");
+  const issues = Array.isArray(payload && payload.issues) ? payload.issues : [];
+  const firstIssue = issues.length > 0 ? String(issues[0].message || "").trim() : "";
+  const issueSuffix = firstIssue ? ` | ${firstIssue}` : "";
+  el.captureReadiness.textContent = `Capture Readiness: ${label} | ${summary}${issueSuffix}`;
+  el.captureReadiness.style.color = readinessColor(payload && payload.status);
+}
+
+async function refreshCaptureReadiness() {
+  if (!el.captureReadiness) {
+    return;
+  }
+  try {
+    const payload = await request("/v1/capture/readiness");
+    renderCaptureReadiness(payload);
+  } catch (error) {
+    el.captureReadiness.textContent = `Capture readiness check failed: ${error.message}`;
+    el.captureReadiness.style.color = "#bf2f39";
+  }
+}
+
 function renderTranscripts(items) {
   const verbose = el.verbose.checked;
+  const showLiveTranslation = liveTranslateEnabled();
   if (!items.length) {
     el.transcriptList.innerHTML =
       '<div class="entry"><p class="text muted">No transcript entries yet. Add a source and speak/play audio.</p></div>';
@@ -283,11 +379,16 @@ function renderTranscripts(items) {
       const sessionPart = item.session_id ? ` | session ${item.session_id}` : ` | chunk #${item.id}`;
       const meta = `${item.source_id}${speakerPart} | ${started} - ${ended}${sessionPart}`;
       const text = escapeHtml(item.text);
+      const translated = showLiveTranslation ? state.liveTranslations[item.id] : null;
+      const translatedBlock = translated
+        ? `<p class="text muted"><strong>EN:</strong> ${escapeHtml(translated)}</p>`
+        : "";
       if (verbose) {
         return `
           <article class="entry">
             <div class="meta">${escapeHtml(meta)}</div>
             <p class="text">${text}</p>
+            ${translatedBlock}
           </article>
         `;
       }
@@ -297,6 +398,7 @@ function renderTranscripts(items) {
             `${item.source_id}${speaker ? ` | speaker ${speaker}` : ""} | ${started}`
           )}</div>
           <p class="text">${text}</p>
+          ${translatedBlock}
         </article>
       `;
     })
@@ -336,6 +438,8 @@ function renderRunningSources(items) {
       const started = item.started_at ? new Date(item.started_at).toLocaleTimeString() : "n/a";
       const status = item.running ? "running" : "stopped";
       const sourceId = String(item.source_id || "");
+      const hint = item && item.details ? String(item.details.language_hint || "").trim() : "";
+      const hintMeta = hint ? ` | asr:${hint}` : "";
       const level = state.sourceLevels[sourceId] || null;
       const hasLevel = Boolean(level);
       const levelDb = hasLevel ? Number(level.level_dbfs) : Number.NaN;
@@ -351,7 +455,7 @@ function renderRunningSources(items) {
       return `
       <article class="entry source-row">
         <div class="source-main">
-          <div class="meta">${escapeHtml(`${sourceId} | ${item.source_type} | ${status}`)}</div>
+          <div class="meta">${escapeHtml(`${sourceId} | ${item.source_type} | ${status}${hintMeta}`)}</div>
           <p class="text">Started: ${escapeHtml(started)}</p>
           <div class="level-meta">${escapeHtml(levelSummary)}</div>
           <div class="level-meter" title="${escapeHtml(levelSummary)}">
@@ -758,7 +862,7 @@ async function addSourceFromPreset() {
     setStatus("Choose a source preset first.", true);
     return;
   }
-  await startSource(preset.payload);
+  await startSource(withAsrLanguageHint(preset.payload));
 }
 
 async function autoStartCommonSources() {
@@ -775,7 +879,7 @@ async function autoStartCommonSources() {
     if (sourceId && runningSet.has(sourceId)) {
       continue;
     }
-    const result = await startSource(preset.payload, true);
+    const result = await startSource(withAsrLanguageHint(preset.payload), true);
     if (result) {
       started += 1;
       runningSet.add(String(result.source_id || ""));
@@ -1027,6 +1131,36 @@ async function refreshSpeakerStatus() {
   }
 }
 
+async function refreshTranscriberStatus() {
+  if (!el.transcriberStatus) {
+    return;
+  }
+  try {
+    const payload = await request("/v1/transcriber/status");
+    const queueSize = Number(payload.queue_size || 0);
+    const queueCapacity = Number(payload.queue_capacity || 0);
+    const queueHigh = Number(payload.queue_high_watermark || 0);
+    const processed = Number(payload.processed || 0);
+    const withText = Number(payload.with_text || 0);
+    const emptyText = Number(payload.empty_text || 0);
+    const fallbackAttempted = Number(payload.fallback_attempted || 0);
+    const fallbackWithText = Number(payload.fallback_with_text || 0);
+    const dropped = Number(payload.dropped || 0);
+    const archivedOnDrop = Number(payload.archived_on_drop || 0);
+    const vadSystem = Boolean(payload.vad_filter_system_audio);
+    const msg =
+      `Transcription queue ${queueSize}/${queueCapacity} (high ${queueHigh})` +
+      ` • text ${withText}/${processed}` +
+      ` • empty ${emptyText}` +
+      `${fallbackAttempted > 0 ? ` • fallback ${fallbackWithText}/${fallbackAttempted}` : ""}` +
+      `${dropped > 0 ? ` • dropped ${dropped} (archived ${archivedOnDrop})` : ""}` +
+      ` • system-audio-vad ${vadSystem ? "on" : "off"}`;
+    el.transcriberStatus.textContent = msg;
+  } catch (error) {
+    el.transcriberStatus.textContent = `Transcriber status check failed: ${error.message}`;
+  }
+}
+
 async function startManualSource() {
   const sourceId = (el.sourceId.value || "").trim();
   if (!sourceId) {
@@ -1046,6 +1180,7 @@ async function startManualSource() {
       source_id: sourceId,
       ffmpeg_input: ffmpegInput,
       ffmpeg_input_format: ffmpegFormat || null,
+      language_hint: selectedAsrLanguageHint(),
     });
     return;
   }
@@ -1060,6 +1195,7 @@ async function startManualSource() {
     source_type: "mic",
     source_id: sourceId,
     device,
+    language_hint: selectedAsrLanguageHint(),
   });
 }
 
@@ -1094,6 +1230,91 @@ async function stopSource() {
   await stopSourceById(sourceId);
 }
 
+async function applyLanguageHintToSelectedSource() {
+  const sourceId = sourceFilterValue();
+  if (!sourceId) {
+    setStatus("Select a source in Transcript View before applying an ASR hint.", true);
+    return;
+  }
+  const payload = {
+    source_id: sourceId,
+    language_hint: selectedAsrLanguageHint(),
+  };
+  try {
+    await request("/v1/sources/language", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    setStatus(
+      payload.language_hint
+        ? `Applied ASR language hint "${payload.language_hint}" to ${sourceId}.`
+        : `Cleared ASR language hint for ${sourceId}.`
+    );
+    await refreshRunningSources();
+  } catch (error) {
+    setStatus(`Could not apply ASR language hint: ${error.message}`, true);
+  }
+}
+
+async function ensureLiveTranslations(items) {
+  if (!liveTranslateEnabled()) {
+    return false;
+  }
+  if (state.liveTranslationInFlight) {
+    return false;
+  }
+  const sourceLanguage = selectedTranslateSourceLanguage();
+  const configKey = `${sourceLanguage || "auto"}`;
+  if (configKey !== state.liveTranslationConfigKey) {
+    resetLiveTranslationCache();
+    state.liveTranslationConfigKey = configKey;
+  }
+  const missingIds = items
+    .map((item) => Number(item.id))
+    .filter((id) => Number.isFinite(id) && !(id in state.liveTranslations))
+    .slice(0, 24);
+  if (!missingIds.length) {
+    return false;
+  }
+
+  state.liveTranslationInFlight = true;
+  try {
+    const payload = {
+      transcript_ids: missingIds,
+      source_language: sourceLanguage,
+      target_language: "English",
+      model_name: null,
+    };
+    const result = await request("/v1/transcripts/translate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    let changed = false;
+    const translatedItems = Array.isArray(result.items) ? result.items : [];
+    translatedItems.forEach((item) => {
+      const id = Number(item.id);
+      if (!Number.isFinite(id)) {
+        return;
+      }
+      const translated = String(item.translated_text || "").trim();
+      if (translated) {
+        state.liveTranslations[id] = translated;
+        changed = true;
+      } else if (!(id in state.liveTranslations)) {
+        state.liveTranslations[id] = "";
+      }
+    });
+    return changed;
+  } catch (error) {
+    setStatus(`Live translation failed: ${error.message}`, true);
+    return false;
+  } finally {
+    state.liveTranslationInFlight = false;
+  }
+}
+
 async function refreshTranscripts() {
   const params = new URLSearchParams({
     since_seconds: String(sinceSecondsValue()),
@@ -1106,18 +1327,21 @@ async function refreshTranscripts() {
   }
   try {
     const items = await request(`/v1/transcripts/recent?${params.toString()}`);
-    const key = JSON.stringify(items.map((item) => item.id));
-    if (key !== state.lastRenderKey || el.verbose.checked) {
+    const translationChanged = await ensureLiveTranslations(items);
+    const key = JSON.stringify(items.map((item) => [item.id, item.text, item.speaker || ""]));
+    if (key !== state.lastRenderKey || el.verbose.checked || translationChanged) {
       renderTranscripts(items);
       state.lastRenderKey = key;
     }
     if (items.length === 0 && source) {
       el.transcriptMeta.textContent = `No chunks for source "${source}" in the last ${sinceSecondsValue()}s • updated ${new Date().toLocaleTimeString()} • try "All sources".`;
     } else {
-      el.transcriptMeta.textContent = `Showing ${items.length} chunks • updated ${new Date().toLocaleTimeString()}`;
+      const translatedNote = liveTranslateEnabled() ? " • live EN translation on" : "";
+      el.transcriptMeta.textContent = `Showing ${items.length} chunks • updated ${new Date().toLocaleTimeString()}${translatedNote}`;
     }
   } catch (error) {
     el.transcriptMeta.textContent = `Transcript refresh failed: ${error.message}`;
+    setStatus(`Transcript refresh failed: ${error.message}`, true);
   }
 }
 
@@ -1141,6 +1365,7 @@ async function askOllama() {
   try {
     const payload = {
       question,
+      translate: Boolean(el.queryTranslate && el.queryTranslate.checked),
       source_id: sourceFilterValue(),
       since_seconds: sinceSecondsValue(),
       limit: effectiveLimit,
@@ -1195,10 +1420,16 @@ function startPolling() {
   }
   refreshTranscripts();
   refreshRunningSources();
+  refreshTranscriberStatus();
+  refreshCaptureReadiness();
   state.pollHandle = setInterval(() => {
     state.pollTicks += 1;
     refreshTranscripts();
     refreshRunningSources();
+    if (state.pollTicks % 4 === 0) {
+      refreshTranscriberStatus();
+      refreshCaptureReadiness();
+    }
     if (state.pollTicks % 8 === 0) {
       refreshSpeakerStatus();
     }
@@ -1216,9 +1447,21 @@ function wireEvents() {
   el.stopSource.addEventListener("click", stopSource);
   el.addSource.addEventListener("click", addSourceFromPreset);
   el.refreshNow.addEventListener("click", refreshTranscripts);
+  el.applyLanguageHint.addEventListener("click", applyLanguageHintToSelectedSource);
   el.askOllama.addEventListener("click", askOllama);
   el.verbose.addEventListener("change", refreshTranscripts);
-  el.sourceFilter.addEventListener("change", refreshTranscripts);
+  el.sourceFilter.addEventListener("change", () => {
+    resetLiveTranslationCache();
+    refreshTranscripts();
+  });
+  el.liveTranslate.addEventListener("change", () => {
+    resetLiveTranslationCache();
+    refreshTranscripts();
+  });
+  el.translateSourceLanguage.addEventListener("change", () => {
+    resetLiveTranslationCache();
+    refreshTranscripts();
+  });
   el.showStoppedSources.addEventListener("change", () => renderRunningSources(visibleSourcesForList()));
   el.manualSourceType.addEventListener("change", syncManualSourceFields);
 
@@ -1249,6 +1492,8 @@ async function init() {
   await refreshOllamaModels();
   await refreshTtsVoices();
   await refreshSpeakerStatus();
+  await refreshTranscriberStatus();
+  await refreshCaptureReadiness();
   startPolling();
 }
 
