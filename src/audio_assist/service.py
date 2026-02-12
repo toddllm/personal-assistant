@@ -121,20 +121,23 @@ COMMON_SYSTEM_AUDIO_KEYWORDS = (
 
 def _system_audio_fallback_priority(name: str) -> int:
     lowered = str(name or "").lower()
-    if "cluely" in lowered:
-        return 110
-    if "krisp" in lowered:
-        return 105
-    if "loopback" in lowered:
-        return 102
+    # BlackHole is the standard macOS virtual loopback used by Multi-Output Devices.
+    # Prefer it over app-specific virtual devices (Cluely, Krisp) which may not
+    # receive routed system audio.
     if "blackhole" in lowered:
-        return 100
+        return 115
+    if "loopback" in lowered:
+        return 112
     if "soundflower" in lowered or "vb-audio" in lowered or "cable" in lowered:
-        return 98
+        return 108
+    if "cluely" in lowered:
+        return 95
+    if "krisp" in lowered:
+        return 90
     if "stereo mix" in lowered or "aggregate" in lowered or "multi-output" in lowered:
-        return 92
+        return 85
     if "virtual" in lowered:
-        return 88
+        return 80
     if "zoomaudio" in lowered:
         return 35
     if "teams" in lowered:
