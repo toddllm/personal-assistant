@@ -1531,8 +1531,121 @@ function wireEvents() {
   });
 }
 
+// --- Meeting detection & transcript export ---
+
+async function refreshMeetingStatus() {
+  const el_meeting = document.getElementById("meeting-status");
+  const el_confidence = document.getElementById("capture-confidence-indicator");
+  if (!el_meeting) return;
+
+  try {
+    const [meetResp, confResp] = await Promise.all([
+      fetch("/v1/meeting/status"),
+      fetch("/v1/capture/confidence"),
+    ]);
+    const meetData = await meetResp.json();
+    const confData = await confResp.json();
+
+    const detector = meetData.detector || {};
+    const orch = meetData.orchestrator || {};
+
+    if (detector.active) {
+      el_meeting.innerHTML =
+        '<span style="color:#4ade80;font-weight:600">Meeting Active</span> ' +
+        `<span class="muted">${detector.provider || ""} &mdash; ${detector.title || ""}</span>` +
+        ` <span class="muted">(orchestrator: ${orch.state || "?"})</span>`;
+    } else {
+      el_meeting.innerHTML =
+        '<span class="muted">No active meeting detected</span>' +
+        ` <span class="muted">(orchestrator: ${orch.state || "idle"})</span>`;
+    }
+
+    if (el_confidence && confData) {
+      const score = confData.score || 0;
+      const label = confData.label || "?";
+      const color =
+        label === "high" ? "#4ade80" : label === "medium" ? "#fbbf24" : "#f87171";
+      const reasons = (confData.reasons || []).join("; ");
+      el_confidence.innerHTML =
+        `Capture Confidence: <span style="color:${color};font-weight:600">${score}/100 (${label})</span>` +
+        (reasons ? ` <span class="muted">&mdash; ${reasons}</span>` : "");
+    }
+  } catch {
+    el_meeting.textContent = "Meeting status unavailable.";
+  }
+}
+
+async function exportTranscript(action) {
+  const sourceFilter = el.sourceFilter ? el.sourceFilter.value : "";
+  const sinceSeconds = el.sinceSeconds ? parseInt(el.sinceSeconds.value, 10) || 3600 : 3600;
+
+  try {
+    const resp = await fetch("/v1/transcripts/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source_id: sourceFilter || null,
+        since_seconds: sinceSeconds,
+        format: "text",
+        include_speaker: true,
+        include_timestamps: true,
+      }),
+    });
+    const data = await resp.json();
+    const content = data.content || "";
+
+    if (!content) {
+      el.controlStatus.textContent = "No transcript content to export.";
+      return;
+    }
+
+    if (action === "copy") {
+      await navigator.clipboard.writeText(content);
+      el.controlStatus.textContent =
+        `Copied ${data.transcript_count} transcript chunks to clipboard.`;
+    } else {
+      const blob = new Blob([content], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const now = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+      a.download = `transcript-${now}.txt`;
+      a.click();
+      URL.revokeObjectURL(url);
+      el.controlStatus.textContent =
+        `Downloaded ${data.transcript_count} transcript chunks.`;
+    }
+  } catch (err) {
+    el.controlStatus.textContent = `Export failed: ${err.message}`;
+  }
+}
+
+async function detectMeetingNow() {
+  try {
+    const resp = await fetch("/v1/meeting/detect", { method: "POST" });
+    const data = await resp.json();
+    el.controlStatus.textContent = data.active
+      ? `Meeting detected: ${data.provider} - ${data.title}`
+      : "No active meeting detected.";
+    await refreshMeetingStatus();
+  } catch (err) {
+    el.controlStatus.textContent = `Meeting detect failed: ${err.message}`;
+  }
+}
+
+function wireExportEvents() {
+  const exportCopy = document.getElementById("export-copy");
+  const exportDownload = document.getElementById("export-download");
+  const detectMeeting = document.getElementById("detect-meeting");
+
+  if (exportCopy) exportCopy.addEventListener("click", () => exportTranscript("copy"));
+  if (exportDownload) exportDownload.addEventListener("click", () => exportTranscript("download"));
+  if (detectMeeting) detectMeeting.addEventListener("click", detectMeetingNow);
+}
+
 async function init() {
   wireEvents();
+  wireExportEvents();
   syncManualSourceFields();
   updateSourceFilterOptions();
   renderMicScanResults([]);
@@ -1544,7 +1657,11 @@ async function init() {
   await refreshSpeakerStatus();
   await refreshTranscriberStatus();
   await refreshCaptureReadiness();
+  await refreshMeetingStatus();
   startPolling();
+
+  // Refresh meeting status periodically
+  setInterval(refreshMeetingStatus, 15000);
 }
 
 init();

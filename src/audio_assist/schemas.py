@@ -33,6 +33,7 @@ class SourceStartRequest(BaseModel):
 class SourceStatus(BaseModel):
     source_id: str
     source_type: str
+    source_role: str = "fallback"
     running: bool
     started_at: datetime | None = None
     details: dict[str, str] = Field(default_factory=dict)
@@ -229,6 +230,25 @@ class TTSSynthesizeRequest(BaseModel):
     tts_voice: str | None = None
     tts_language: str | None = None
     tts_instruct: str | None = None
+
+
+class TranscriptExportRequest(BaseModel):
+    source_id: str | None = None
+    since_seconds: int = Field(default=3600, ge=1)
+    limit: int = Field(default=5000, ge=1, le=50000)
+    format: Literal["text", "json", "markdown"] = "text"
+    include_speaker: bool = True
+    include_timestamps: bool = True
+    include_source: bool = False
+
+
+class TranscriptExportResult(BaseModel):
+    content: str
+    format: str
+    transcript_count: int = 0
+    time_range_start: datetime | None = None
+    time_range_end: datetime | None = None
+    sources: list[str] = Field(default_factory=list)
 
 
 class GoogleCalendarSyncRequest(BaseModel):

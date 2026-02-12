@@ -26,6 +26,10 @@ from audio_assist.diarization import SpeakerDiarizationClient
 from audio_assist.levels import AudioLevelTracker
 from audio_assist.postprocess import TranscriptPostProcessor
 from audio_assist.qa import QAEngine, QAResult
+from audio_assist.meeting_detector import MeetingDetector
+from audio_assist.noise_suppression import NoiseSuppressor
+from audio_assist.orchestrator import PreflightResult, SessionOrchestrator
+from audio_assist.session_context import set_session_id
 from audio_assist.schemas import (
     EventTranscriptGroup,
     EventsPage,
@@ -39,6 +43,8 @@ from audio_assist.schemas import (
     SourceStatus,
     TTSSynthesizeRequest,
     TranscriptCalendarMatch,
+    TranscriptExportRequest,
+    TranscriptExportResult,
     TranscriptPage,
     TranscriptIngestRequest,
     TranscriptItem,
@@ -465,8 +471,28 @@ def create_app(settings: Settings) -> FastAPI:
             time.sleep(0.3)
         logger.warning("google-sync-service did not become ready within %.1fs.", timeout_seconds)
 
+    noise_suppressor = NoiseSuppressor(
+        enabled=settings.noise_suppression_enabled,
+        mic_source_prefix=settings.mic_source_id,
+        prop_decrease=settings.noise_suppression_prop_decrease,
+        stationary=settings.noise_suppression_stationary,
+    )
+    meeting_detector = MeetingDetector()
+
     def handle_segment(segment: AudioSegment) -> None:
         level_tracker.ingest(segment)
+        if noise_suppressor.should_suppress(segment.source_id):
+            suppressed_pcm = noise_suppressor.suppress(
+                segment.pcm_s16le, segment.sample_rate, segment.source_id,
+            )
+            segment = AudioSegment(
+                source_id=segment.source_id,
+                session_id=segment.session_id,
+                started_at=segment.started_at,
+                ended_at=segment.ended_at,
+                pcm_s16le=suppressed_pcm,
+                sample_rate=segment.sample_rate,
+            )
         transcriber.enqueue(segment)
 
     def schema_calendar_match(match: CalendarSessionMatch | None) -> TranscriptCalendarMatch | None:
@@ -840,7 +866,9 @@ def create_app(settings: Settings) -> FastAPI:
                 except Exception:  # noqa: BLE001
                     logger.exception("Failed stopping stale mic source=%s before restart.", source_id)
             try:
-                runtime = source_manager.start_mic(source_id=source_id, device=device, channels=channels)
+                runtime = source_manager.start_mic(
+                    source_id=source_id, device=device, channels=channels, source_role=role,
+                )
                 persist_runtime_session(runtime)
                 capture_retry_after_seconds.pop(source_id, None)
                 report.append(
@@ -1057,6 +1085,64 @@ def create_app(settings: Settings) -> FastAPI:
         else None
     )
 
+    def _capture_preflight() -> PreflightResult:
+        """Run preflight checks for the orchestrator before recording a meeting."""
+        checks: dict[str, bool] = {}
+        reasons: list[str] = []
+
+        runtimes = source_manager.statuses()
+        running = [r for r in runtimes if r.runner.is_running()]
+        checks["sources_running"] = len(running) > 0
+        if not checks["sources_running"]:
+            reasons.append("No capture sources are running.")
+
+        mic_running = any(r.source_id == settings.mic_source_id for r in running)
+        checks["mic_running"] = mic_running
+        if not mic_running:
+            reasons.append(f"Mic source '{settings.mic_source_id}' is not running.")
+
+        pipeline = transcriber.transcription_pipeline_status()
+        queue_ratio = 0.0
+        capacity = int(pipeline.get("queue_capacity") or 1)
+        if capacity > 0:
+            queue_ratio = int(pipeline.get("queue_size") or 0) / capacity
+        checks["queue_healthy"] = queue_ratio < 0.8
+        if not checks["queue_healthy"]:
+            reasons.append(f"Transcription queue pressure is high ({queue_ratio:.0%}).")
+
+        passed = all(checks.values())
+        return PreflightResult(passed=passed, checks=checks, reasons=reasons)
+
+    def _on_meeting_session_start(session) -> None:  # noqa: ANN001
+        """Called by orchestrator when a meeting session begins."""
+        set_session_id(session.session_id)
+        logger.info(
+            "Meeting session started: id=%s provider=%s title=%s",
+            session.session_id, session.provider, session.title,
+        )
+        # Ensure capture sources are running
+        ensure_capture_sources_running()
+
+    def _on_meeting_session_end(session) -> None:  # noqa: ANN001
+        """Called by orchestrator when a meeting session ends."""
+        logger.info(
+            "Meeting session ended: id=%s provider=%s title=%s duration=%.0fs",
+            session.session_id, session.provider, session.title,
+            (session.ended_at - session.started_at).total_seconds() if session.ended_at else 0,
+        )
+        set_session_id(None)
+
+    session_orchestrator = SessionOrchestrator(
+        meeting_detector=meeting_detector,
+        poll_interval_seconds=settings.orchestrator_poll_interval_seconds,
+        preparing_timeout_seconds=settings.orchestrator_preparing_timeout_seconds,
+        cooldown_seconds=settings.orchestrator_cooldown_seconds,
+        min_active_polls_to_record=settings.orchestrator_min_active_polls,
+        on_session_start=_on_meeting_session_start,
+        on_session_end=_on_meeting_session_end,
+        preflight_fn=_capture_preflight,
+    )
+
     @app.on_event("startup")
     def startup() -> None:
         nonlocal capture_watchdog_thread
@@ -1078,10 +1164,12 @@ def create_app(settings: Settings) -> FastAPI:
                 "Capture watchdog started (interval=%.1fs).",
                 max(5.0, float(settings.capture_watchdog_interval_seconds)),
             )
+        session_orchestrator.start()
         logger.info("audio-assist started.")
 
     @app.on_event("shutdown")
     def shutdown() -> None:
+        session_orchestrator.stop()
         capture_watchdog_stop.set()
         if capture_watchdog_thread is not None and capture_watchdog_thread.is_alive():
             capture_watchdog_thread.join(timeout=2.5)
@@ -1347,6 +1435,7 @@ def create_app(settings: Settings) -> FastAPI:
                 SourceStatus(
                     source_id=runtime.source_id,
                     source_type=runtime.source_type,
+                    source_role=runtime.source_role,
                     running=runtime.runner.is_running(),
                     started_at=runtime.started_at,
                     details=details,
@@ -1835,6 +1924,7 @@ def create_app(settings: Settings) -> FastAPI:
         return SourceStatus(
             source_id=runtime.source_id,
             source_type=runtime.source_type,
+            source_role=runtime.source_role,
             running=runtime.runner.is_running(),
             started_at=runtime.started_at,
             details={"language_hint": applied_hint} if applied_hint else {},
@@ -1849,6 +1939,7 @@ def create_app(settings: Settings) -> FastAPI:
         return SourceStatus(
             source_id=runtime.source_id,
             source_type=runtime.source_type,
+            source_role=runtime.source_role,
             running=runtime.runner.is_running(),
             started_at=runtime.started_at,
             details={"language_hint": applied_hint} if applied_hint else {},
@@ -2182,5 +2273,276 @@ def create_app(settings: Settings) -> FastAPI:
             tts_provider=tts_provider,
             tts_error=tts_error,
         )
+
+    # --- Meeting detection & orchestrator endpoints ---
+
+    @app.get("/v1/meeting/status")
+    def meeting_status() -> dict[str, object]:
+        return {
+            "detector": meeting_detector.status(),
+            "orchestrator": session_orchestrator.status(),
+        }
+
+    @app.post("/v1/meeting/detect")
+    def meeting_detect() -> dict[str, object]:
+        info = meeting_detector.detect()
+        return {
+            "active": info.active,
+            "provider": info.provider,
+            "title": info.title,
+            "started_at": info.started_at,
+            "confidence": info.confidence,
+            "details": info.details,
+        }
+
+    # --- Noise suppression status ---
+
+    @app.get("/v1/noise-suppression/status")
+    def noise_suppression_status() -> dict[str, object]:
+        return noise_suppressor.status()
+
+    # --- Transcript export ---
+
+    @app.post("/v1/transcripts/export", response_model=TranscriptExportResult)
+    def export_transcripts(req: TranscriptExportRequest) -> TranscriptExportResult:
+        records = store.recent(
+            limit=req.limit,
+            source_id=req.source_id,
+            since_seconds=req.since_seconds,
+        )
+        if not records:
+            return TranscriptExportResult(
+                content="",
+                format=req.format,
+                transcript_count=0,
+            )
+
+        records.sort(key=lambda r: (r.started_at, r.id))
+        sources = sorted(set(r.source_id for r in records))
+        time_start = records[0].started_at if records else None
+        time_end = records[-1].ended_at if records else None
+
+        if req.format == "json":
+            import json
+
+            items = []
+            for r in records:
+                item: dict[str, object] = {
+                    "id": r.id,
+                    "started_at": r.started_at.isoformat(),
+                    "ended_at": r.ended_at.isoformat(),
+                    "text": r.text,
+                }
+                if req.include_speaker and r.speaker:
+                    item["speaker"] = r.speaker
+                if req.include_source:
+                    item["source_id"] = r.source_id
+                items.append(item)
+            content = json.dumps(items, indent=2, ensure_ascii=False)
+        elif req.format == "markdown":
+            lines: list[str] = []
+            lines.append("# Meeting Transcript\n")
+            if time_start and time_end:
+                lines.append(
+                    f"**{time_start.strftime('%Y-%m-%d %H:%M')} - "
+                    f"{time_end.strftime('%H:%M UTC')}**\n"
+                )
+            lines.append("")
+            current_speaker = None
+            for r in records:
+                speaker = r.speaker or "Unknown"
+                if req.include_speaker and speaker != current_speaker:
+                    lines.append(f"\n### {speaker}\n")
+                    current_speaker = speaker
+                ts = r.started_at.strftime("%H:%M:%S") if req.include_timestamps else ""
+                prefix = f"[{ts}] " if ts else ""
+                lines.append(f"{prefix}{r.text}")
+            content = "\n".join(lines)
+        else:
+            lines = []
+            current_speaker = None
+            for r in records:
+                parts: list[str] = []
+                if req.include_timestamps:
+                    parts.append(f"[{r.started_at.strftime('%H:%M:%S')}]")
+                if req.include_speaker and r.speaker:
+                    if r.speaker != current_speaker:
+                        parts.append(f"{r.speaker}:")
+                        current_speaker = r.speaker
+                if req.include_source:
+                    parts.append(f"({r.source_id})")
+                parts.append(r.text)
+                lines.append(" ".join(parts))
+            content = "\n".join(lines)
+
+        return TranscriptExportResult(
+            content=content,
+            format=req.format,
+            transcript_count=len(records),
+            time_range_start=time_start,
+            time_range_end=time_end,
+            sources=sources,
+        )
+
+    # --- Capture confidence indicator ---
+
+    @app.get("/v1/capture/confidence")
+    def capture_confidence() -> dict[str, object]:
+        """Meeting-aware capture confidence indicator."""
+        meeting = meeting_detector.last_state
+        orch_status = session_orchestrator.status()
+        readiness = capture_readiness()
+
+        # Build confidence score 0-100
+        score = 0
+        reasons: list[str] = []
+
+        # Source health (40 points)
+        status_str = str(readiness.get("status", ""))
+        if status_str == "ready":
+            score += 40
+        elif status_str == "degraded":
+            score += 25
+            reasons.append("Capture is degraded - check system audio routing.")
+        else:
+            reasons.append("Capture is down - critical issues detected.")
+
+        # Mic activity (25 points)
+        signals = readiness.get("signals") or {}
+        if signals.get("mic_signal_active"):
+            score += 25
+        else:
+            reasons.append("No active mic signal detected.")
+
+        # Transcription pipeline (20 points)
+        transcriber_info = signals.get("transcriber") or {}
+        queue_ratio = float(transcriber_info.get("queue_ratio") or 0)
+        if queue_ratio < 0.5:
+            score += 20
+        elif queue_ratio < 0.8:
+            score += 10
+            reasons.append("Transcription queue is filling up.")
+        else:
+            reasons.append("Transcription queue is near capacity.")
+
+        # System audio (15 points)
+        system_count = int(signals.get("transcripts_recent_system_audio") or 0)
+        if system_count > 0:
+            score += 15
+        else:
+            reasons.append("No system audio transcripts - remote voices may not be captured.")
+
+        # Meeting awareness bonus
+        meeting_context = None
+        if meeting.active:
+            meeting_context = {
+                "active": True,
+                "provider": meeting.provider,
+                "title": meeting.title,
+                "orchestrator_state": orch_status.get("state"),
+            }
+
+        label = "high"
+        if score < 40:
+            label = "low"
+        elif score < 70:
+            label = "medium"
+
+        return {
+            "score": score,
+            "label": label,
+            "reasons": reasons,
+            "meeting": meeting_context,
+            "orchestrator_state": orch_status.get("state"),
+        }
+
+    @app.get("/v1/diagnostics/audio-routing")
+    def audio_routing_diagnostics() -> dict[str, object]:
+        """Check macOS audio device configuration for system audio routing."""
+        import sounddevice as sd
+
+        issues: list[str] = []
+        recommendations: list[str] = []
+
+        # List all available audio devices
+        try:
+            devices = sd.query_devices()
+        except Exception:  # noqa: BLE001
+            return {
+                "status": "error",
+                "message": "Could not query audio devices.",
+                "issues": ["sounddevice.query_devices() failed"],
+                "recommendations": ["Check that PortAudio is installed."],
+            }
+
+        input_devices = []
+        virtual_devices = []
+        virtual_keywords = ["blackhole", "cluely", "loopback", "soundflower", "virtual"]
+
+        for i, dev in enumerate(devices):
+            if dev["max_input_channels"] > 0:
+                name = dev["name"]
+                entry = {"index": i, "name": name, "channels": dev["max_input_channels"]}
+                input_devices.append(entry)
+                if any(kw in name.lower() for kw in virtual_keywords):
+                    virtual_devices.append(entry)
+
+        # Check if system-audio source is running and active
+        system_source = None
+        system_level = None
+        for runtime in source_manager.statuses():
+            if "system" in runtime.source_id.lower():
+                system_source = {
+                    "source_id": runtime.source_id,
+                    "running": runtime.runner.is_running(),
+                    "source_role": runtime.source_role,
+                }
+                for lvl in level_tracker.snapshot():
+                    if lvl.source_id == runtime.source_id:
+                        system_level = {
+                            "level_dbfs": lvl.level_dbfs,
+                            "updated_at": lvl.updated_at.isoformat() if lvl.updated_at else None,
+                        }
+                        break
+
+        # Analyze routing health
+        has_virtual_device = len(virtual_devices) > 0
+        system_is_running = system_source and system_source.get("running")
+        system_has_signal = system_level and (system_level.get("level_dbfs") or -96) > -80
+
+        if not has_virtual_device:
+            issues.append("No virtual audio device found (BlackHole, Cluely, Loopback).")
+            recommendations.append(
+                "Install BlackHole (brew install blackhole-2ch) or similar virtual audio device."
+            )
+        if not system_is_running:
+            issues.append("System audio source is not running.")
+            recommendations.append("Start system-audio capture from the console or API.")
+        elif not system_has_signal:
+            issues.append("System audio source is running but capturing silence.")
+            recommendations.append(
+                "Route macOS audio through the virtual device: "
+                "System Settings > Sound > Output > select a Multi-Output Device "
+                "that includes both your speakers and BlackHole/Cluely."
+            )
+            recommendations.append(
+                "Create a Multi-Output Device in Audio MIDI Setup: "
+                "open /Applications/Utilities/Audio\\ MIDI\\ Setup.app, "
+                "click '+' > Create Multi-Output Device, check your speakers and BlackHole."
+            )
+
+        status = "healthy"
+        if issues:
+            status = "degraded" if system_is_running else "down"
+
+        return {
+            "status": status,
+            "virtual_devices": virtual_devices,
+            "input_device_count": len(input_devices),
+            "system_source": system_source,
+            "system_level": system_level,
+            "issues": issues,
+            "recommendations": recommendations,
+        }
 
     return app

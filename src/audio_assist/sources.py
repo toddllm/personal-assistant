@@ -20,6 +20,7 @@ class SourceRuntime:
     session_id: str
     source_type: str
     runner: "BaseSourceRunner"
+    source_role: str = "fallback"
     started_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
 
@@ -317,6 +318,7 @@ class SourceManager:
         source_id: str | None = None,
         device: str | int | None = None,
         channels: int | None = None,
+        source_role: str = "mic",
     ) -> SourceRuntime:
         source_id = source_id or f"mic-{uuid4().hex[:8]}"
         session_id = f"{source_id}-{uuid4().hex[:12]}"
@@ -331,7 +333,10 @@ class SourceManager:
             overlap_seconds=self._segment_overlap_seconds,
             device=device,
         )
-        runtime = SourceRuntime(source_id=source_id, session_id=session_id, source_type="mic", runner=runner)
+        runtime = SourceRuntime(
+            source_id=source_id, session_id=session_id, source_type="mic",
+            runner=runner, source_role=source_role,
+        )
         with self._lock:
             if source_id in self._sources and self._sources[source_id].runner.is_running():
                 raise ValueError(f"Source '{source_id}' is already running.")
@@ -345,6 +350,7 @@ class SourceManager:
         source_id: str | None = None,
         ffmpeg_input_format: str | None = None,
         ffmpeg_extra_args: list[str] | None = None,
+        source_role: str = "system",
     ) -> SourceRuntime:
         source_id = source_id or f"ffmpeg-{uuid4().hex[:8]}"
         session_id = f"{source_id}-{uuid4().hex[:12]}"
@@ -365,6 +371,7 @@ class SourceManager:
             session_id=session_id,
             source_type="ffmpeg",
             runner=runner,
+            source_role=source_role,
         )
         with self._lock:
             if source_id in self._sources and self._sources[source_id].runner.is_running():

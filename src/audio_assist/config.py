@@ -100,6 +100,16 @@ class Settings(BaseSettings):
     speaker_backfill_batch_size: int = 24
     speaker_backfill_since_seconds: int = 4 * 3600
 
+    orchestrator_enabled: bool = True
+    orchestrator_poll_interval_seconds: float = 8.0
+    orchestrator_preparing_timeout_seconds: float = 15.0
+    orchestrator_cooldown_seconds: float = 30.0
+    orchestrator_min_active_polls: int = 2
+
+    noise_suppression_enabled: bool = True
+    noise_suppression_prop_decrease: float = 0.85
+    noise_suppression_stationary: bool = True
+
     calendar_match_enabled: bool = False
     google_sync_service_url: str = "http://127.0.0.1:8792"
     calendar_match_timeout_seconds: float = 2.5

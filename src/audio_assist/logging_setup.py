@@ -7,13 +7,17 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from audio_assist.session_context import SessionContextFilter
+
 
 class JsonLogFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
+        session_id = getattr(record, "session_id", "-")
         payload: dict[str, Any] = {
             "ts": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
             "logger": record.name,
+            "session_id": session_id,
             "message": record.getMessage(),
         }
         if record.exc_info:
@@ -43,11 +47,16 @@ def configure_service_logging(
     if json_logs:
         formatter = JsonLogFormatter()
     else:
-        formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s [%(session_id)s] %(message)s",
+        )
+
+    session_filter = SessionContextFilter()
 
     root_logger = logging.getLogger()
     root_logger.setLevel(resolved_level)
     root_logger.handlers.clear()
+    root_logger.addFilter(session_filter)
 
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(resolved_level)
