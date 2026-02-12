@@ -36,6 +36,7 @@ class GmailMessage(BaseModel):
     message_id: str
     thread_id: str
     snippet: str
+    body_text: str | None = None
     from_header: str | None = None
     subject: str | None = None
     date_header: str | None = None

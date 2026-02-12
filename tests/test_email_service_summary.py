@@ -25,7 +25,8 @@ def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
             "from_header": "The Boss <boss@example.com>",
             "subject": "URGENT: need this now",
             "snippet": "Can you send this tonight?",
-            "label_ids": ["INBOX", "UNREAD"],
+            "body_text": "Can you send this tonight? Please respond before 9pm.",
+            "label_ids": ["INBOX", "UNREAD", "CATEGORY_PERSONAL"],
             "received_at": "2026-02-12T02:30:00Z",
         },
         {
@@ -34,6 +35,7 @@ def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
             "from_header": "Me <me@example.com>",
             "subject": "Re: URGENT: need this now",
             "snippet": "Working on it",
+            "body_text": "Working on it and will send by 8pm.",
             "label_ids": ["INBOX"],
             "received_at": "2026-02-12T02:40:00Z",
         },
@@ -43,7 +45,8 @@ def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
             "from_header": "newsletter@example.com",
             "subject": "Weekly update",
             "snippet": "new content this week",
-            "label_ids": ["INBOX", "UNREAD"],
+            "body_text": "This is promotional content.",
+            "label_ids": ["INBOX", "UNREAD", "CATEGORY_PROMOTIONS"],
             "received_at": "2026-02-10T02:00:00Z",
         },
     ]
@@ -62,6 +65,7 @@ def test_summarize_gmail_messages_builds_focus_and_threads() -> None:
 
     assert snapshot.focus[0].message_id == "m-1"
     assert snapshot.focus[0].priority_score > snapshot.focus[1].priority_score
+    assert snapshot.focus[0].body_text == "Can you send this tonight? Please respond before 9pm."
 
     top_thread = snapshot.threads[0]
     assert top_thread.thread_id == "t-1"

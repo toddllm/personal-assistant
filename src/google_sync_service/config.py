@@ -38,9 +38,9 @@ class Settings(BaseSettings):
     calendar_cache_path: Path = Field(default_factory=lambda: Path("data/google_sync/calendar_latest.json"))
 
     user_id: str = "me"
-    default_sync_max_results: int = 25
-    sync_max_results_cap: int = 100
-    default_label_ids: str = "INBOX"
+    default_sync_max_results: int = 120
+    sync_max_results_cap: int = 500
+    default_label_ids: str = "INBOX,CATEGORY_PERSONAL"
     default_calendar_id: str = "primary"
     default_calendar_sync_max_results: int = 250
     calendar_sync_max_results_cap: int = 1000

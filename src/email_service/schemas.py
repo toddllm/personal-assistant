@@ -38,6 +38,7 @@ class EmailMessage(BaseModel):
     sender_email: str | None = None
     subject: str | None = None
     snippet: str
+    body_text: str | None = None
     label_ids: list[str] = Field(default_factory=list)
     received_at: datetime
     unread: bool = False

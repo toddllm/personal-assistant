@@ -72,8 +72,21 @@ start_service() {
     return 0
   fi
 
+  local client_secret_path="${GOOGLE_SYNC_CLIENT_SECRET_PATH:-}"
+  if [[ -z "$client_secret_path" ]]; then
+    local discovered=""
+    discovered="$(ls -t "$ROOT_DIR"/google/client_secret_*apps.googleusercontent.com.json 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$discovered" ]]; then
+      client_secret_path="$discovered"
+    fi
+  fi
+
   echo "Starting google-sync-service..."
-  nohup "${APP_CMD[@]}" >>"$SUPERVISOR_LOG" 2>&1 &
+  if [[ -n "$client_secret_path" ]]; then
+    GOOGLE_SYNC_CLIENT_SECRET_PATH="$client_secret_path" nohup "${APP_CMD[@]}" >>"$SUPERVISOR_LOG" 2>&1 &
+  else
+    nohup "${APP_CMD[@]}" >>"$SUPERVISOR_LOG" 2>&1 &
+  fi
   local pid=$!
   echo "$pid" >"$PID_FILE"
   for _ in {1..24}; do

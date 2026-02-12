@@ -146,6 +146,24 @@ _INDEX_HTML = """<!doctype html>
     }
     .subject { font-weight: 700; margin-bottom: 4px; }
     .snippet { color: var(--muted); font-size: 0.95rem; }
+    .full-block { margin-top: 8px; }
+    .full-block summary {
+      cursor: pointer;
+      color: var(--ink);
+      font-size: 0.86rem;
+      font-weight: 600;
+    }
+    .full-text {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px dashed var(--line);
+      background: #fbfdf9;
+      white-space: pre-wrap;
+      color: var(--ink);
+      max-height: 240px;
+      overflow: auto;
+    }
     textarea {
       width: 100%;
       min-height: 96px;
@@ -247,6 +265,15 @@ _INDEX_HTML = """<!doctype html>
       catch (_) { return ts || ''; }
     }
 
+    function esc(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
     function setSummary(snapshot) {
       document.getElementById('mCount').textContent = snapshot.message_count ?? '-';
       document.getElementById('uCount').textContent = snapshot.unread_count ?? '-';
@@ -260,13 +287,19 @@ _INDEX_HTML = """<!doctype html>
         return;
       }
       focusList.innerHTML = items.map((m) => {
-        const sender = m.sender_email || m.from_header || 'unknown';
-        const subj = m.subject || '(no subject)';
+        const sender = esc(m.sender_email || m.from_header || 'unknown');
+        const subj = esc(m.subject || '(no subject)');
+        const snippet = esc(m.snippet || '');
+        const fullText = String(m.body_text || '').trim();
+        const fullHtml = fullText
+          ? `<details class=\"full-block\"><summary>Full text</summary><div class=\"full-text\">${esc(fullText)}</div></details>`
+          : '';
         return `
           <div class=\"focus-item\">
             <div class=\"meta\">${sender} • ${fmtTs(m.received_at)} • p${m.priority_score}</div>
             <div class=\"subject\">${subj}</div>
-            <div class=\"snippet\">${m.snippet || ''}</div>
+            <div class=\"snippet\">${snippet}</div>
+            ${fullHtml}
           </div>
         `;
       }).join('');
@@ -302,7 +335,11 @@ _INDEX_HTML = """<!doctype html>
       const r = await fetch('/v1/inbox/refresh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ force_sync: true, max_results: 50, label_ids: ['INBOX'] }),
+        body: JSON.stringify({
+          force_sync: true,
+          max_results: 120,
+          label_ids: ['INBOX', 'CATEGORY_PERSONAL'],
+        }),
       });
       if (!r.ok) {
         const err = await r.json().catch(() => ({}));
@@ -450,6 +487,7 @@ def summarize_gmail_messages(
         sender_email = _canonical_sender(from_header)
         subject = _clean_string(raw.get("subject"))
         snippet = _clean_string(raw.get("snippet")) or ""
+        body_text = _clean_string(raw.get("body_text") or raw.get("bodyText")) or ""
         received_at = _parse_datetime(raw.get("received_at"), fallback=current)
 
         raw_labels = raw.get("label_ids") or raw.get("labelIds") or []
@@ -457,12 +495,13 @@ def summarize_gmail_messages(
         label_set = {label.upper() for label in label_ids}
         unread = "UNREAD" in label_set
 
-        needs_reply = _needs_reply(unread=unread, subject=subject, snippet=snippet)
+        needs_reply = _needs_reply(unread=unread, subject=subject, snippet=snippet, body_text=body_text)
         priority_score = _priority_score(
             unread=unread,
             sender_email=sender_email,
             subject=subject,
             snippet=snippet,
+            body_text=body_text,
             label_set=label_set,
             received_at=received_at,
             now=current,
@@ -478,6 +517,7 @@ def summarize_gmail_messages(
             sender_email=sender_email,
             subject=subject,
             snippet=snippet,
+            body_text=(body_text or None),
             label_ids=label_ids,
             received_at=received_at,
             unread=unread,
@@ -841,6 +881,23 @@ class EmailInboxManager:
         except Exception:  # noqa: BLE001
             return False
 
+    def _discover_google_sync_client_secret_path(self) -> str | None:
+        repo_root = Path(__file__).resolve().parents[2]
+        candidate_dir = repo_root / "google"
+        if not candidate_dir.exists():
+            return None
+        try:
+            candidates = sorted(
+                candidate_dir.glob("client_secret_*apps.googleusercontent.com.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if not candidates:
+            return None
+        return str(candidates[0])
+
     def _maybe_start_google_sync_service(self) -> None:
         if not self._settings.google_sync_autostart:
             return
@@ -853,6 +910,10 @@ class EmailInboxManager:
             cmd = ["google-sync-service"]
 
         env = os.environ.copy()
+        if not env.get("GOOGLE_SYNC_CLIENT_SECRET_PATH"):
+            discovered_path = self._discover_google_sync_client_secret_path()
+            if discovered_path:
+                env["GOOGLE_SYNC_CLIENT_SECRET_PATH"] = discovered_path
         cwd = str(self._settings.google_sync_autostart_cwd) if self._settings.google_sync_autostart_cwd else None
         started_process: subprocess.Popen[bytes] | None = None
         try:
@@ -1052,10 +1113,10 @@ def _canonical_sender(from_header: str | None) -> str | None:
     return from_header.strip().lower() or None
 
 
-def _needs_reply(*, unread: bool, subject: str | None, snippet: str) -> bool:
+def _needs_reply(*, unread: bool, subject: str | None, snippet: str, body_text: str = "") -> bool:
     if not unread:
         return False
-    combined = " ".join(part for part in [subject or "", snippet] if part).lower()
+    combined = " ".join(part for part in [subject or "", snippet, body_text] if part).lower()
     if "?" in combined:
         return True
     return any(term in combined for term in REPLY_HINT_TERMS)
@@ -1067,6 +1128,7 @@ def _priority_score(
     sender_email: str | None,
     subject: str | None,
     snippet: str,
+    body_text: str,
     label_set: set[str],
     received_at: datetime,
     now: datetime,
@@ -1083,12 +1145,21 @@ def _priority_score(
     if sender_email and sender_email in important_senders:
         score += 4
 
-    text = " ".join(part for part in [subject or "", snippet] if part).lower()
+    text = " ".join(part for part in [subject or "", snippet, body_text] if part).lower()
     if any(term in text for term in urgent_terms):
         score += 3
 
     if "IMPORTANT" in label_set:
         score += 2
+    if "CATEGORY_PERSONAL" in label_set:
+        score += 3
+    if {
+        "CATEGORY_PROMOTIONS",
+        "CATEGORY_SOCIAL",
+        "CATEGORY_UPDATES",
+        "CATEGORY_FORUMS",
+    }.intersection(label_set):
+        score -= 2
 
     age_seconds = max(0.0, (now - received_at).total_seconds())
     if age_seconds <= 6 * 3600:
@@ -1098,7 +1169,7 @@ def _priority_score(
     elif age_seconds <= 72 * 3600:
         score += 1
 
-    return score
+    return max(0, score)
 
 
 def _select_context_messages(
@@ -1124,6 +1195,10 @@ def _render_context_lines(messages: list[EmailMessage]) -> str:
         snippet = (item.snippet or "").replace("\n", " ").strip()
         if len(snippet) > 260:
             snippet = f"{snippet[:257]}..."
+        body_text = (item.body_text or "").replace("\n", " ").strip()
+        if len(body_text) > 1200:
+            body_text = f"{body_text[:1197]}..."
+        body_context = body_text or snippet
         lines.append(
             " | ".join(
                 [
@@ -1134,6 +1209,7 @@ def _render_context_lines(messages: list[EmailMessage]) -> str:
                     f"sender={sender}",
                     f"subject={subject}",
                     f"snippet={snippet}",
+                    f"body={body_context}",
                 ]
             )
         )

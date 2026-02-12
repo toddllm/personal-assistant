@@ -20,9 +20,9 @@ class Settings(BaseSettings):
     access_log: bool = True
 
     google_sync_service_url: str = "http://127.0.0.1:8792"
-    google_sync_timeout_seconds: float = 20.0
-    google_sync_default_max_results: int = 50
-    google_sync_default_label_ids: str = "INBOX"
+    google_sync_timeout_seconds: float = 120.0
+    google_sync_default_max_results: int = 120
+    google_sync_default_label_ids: str = "INBOX,CATEGORY_PERSONAL"
     google_sync_autostart: bool = True
     google_sync_autostart_command: str = "google-sync-service"
     google_sync_autostart_timeout_seconds: float = 10.0

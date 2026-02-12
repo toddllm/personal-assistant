@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+import html as html_lib
 import json
 import logging
 import os
@@ -33,9 +35,9 @@ class GmailSyncManager:
 
     def sync(self, request: GmailSyncRequest) -> GmailSyncResponse:
         access_token = self._auth_manager.get_access_token()
-        max_results = request.max_results or self._settings.default_sync_max_results
+        max_results = int(request.max_results or self._settings.default_sync_max_results)
         max_results = max(1, min(max_results, self._settings.sync_max_results_cap))
-        label_ids = request.label_ids or self._settings.default_label_ids_list
+        label_ids = [value for value in (request.label_ids or self._settings.default_label_ids_list) if value]
 
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -153,20 +155,25 @@ def _fetch_message_details(
     message_id: str,
 ) -> GmailMessage:
     url = f"{GMAIL_BASE_URL}/{user_id}/messages/{message_id}"
-    params = {
-        "format": "metadata",
-        "metadataHeaders": ["From", "Subject", "Date"],
-    }
+    params = {"format": "full"}
     response = http.get(url, headers=headers, params=params)
     _raise_for_status_with_detail(response, context="Gmail message details")
     payload = response.json()
 
+    payload_root = payload.get("payload") if isinstance(payload, dict) else {}
+    if not isinstance(payload_root, dict):
+        payload_root = {}
+
     header_map: dict[str, str] = {}
-    for item in (payload.get("payload") or {}).get("headers") or []:
+    for item in payload_root.get("headers") or []:
         name = str(item.get("name") or "").strip().lower()
         value = str(item.get("value") or "").strip()
         if name:
             header_map[name] = value
+
+    body_text = _extract_message_body_text(payload_root)
+    if not body_text:
+        body_text = str(payload.get("snippet") or "").strip() or None
 
     internal_date_ms = int(payload.get("internalDate") or 0)
     if internal_date_ms > 0:
@@ -178,6 +185,7 @@ def _fetch_message_details(
         message_id=str(payload.get("id") or message_id),
         thread_id=str(payload.get("threadId") or ""),
         snippet=str(payload.get("snippet") or ""),
+        body_text=body_text,
         from_header=header_map.get("from"),
         subject=header_map.get("subject"),
         date_header=header_map.get("date"),
@@ -193,6 +201,84 @@ def _canonical_sender(from_header: str | None) -> str | None:
     if match:
         return match.group(1).strip().lower()
     return from_header.strip().lower()
+
+
+def _extract_message_body_text(payload_root: dict[str, object]) -> str | None:
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+
+    for mime_type, encoded_data in _iter_body_parts(payload_root):
+        decoded = _decode_base64url_text(encoded_data)
+        if not decoded:
+            continue
+        lowered = mime_type.lower()
+        if lowered.startswith("text/plain"):
+            plain_parts.append(decoded)
+        elif lowered.startswith("text/html"):
+            html_parts.append(decoded)
+
+    joined_plain = "\n\n".join(part.strip() for part in plain_parts if part.strip()).strip()
+    if joined_plain:
+        return _normalize_body_text(joined_plain)
+
+    joined_html = "\n\n".join(part.strip() for part in html_parts if part.strip()).strip()
+    if joined_html:
+        return _normalize_body_text(_html_to_text(joined_html))
+
+    return None
+
+
+def _iter_body_parts(node: object) -> list[tuple[str, str]]:
+    if not isinstance(node, dict):
+        return []
+
+    out: list[tuple[str, str]] = []
+    mime_type = str(node.get("mimeType") or "").strip()
+    body = node.get("body")
+    if isinstance(body, dict):
+        data = body.get("data")
+        if isinstance(data, str) and data.strip():
+            out.append((mime_type, data.strip()))
+
+    parts = node.get("parts")
+    if isinstance(parts, list):
+        for child in parts:
+            out.extend(_iter_body_parts(child))
+    return out
+
+
+def _decode_base64url_text(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    padding = "=" * (-len(raw) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((raw + padding).encode("ascii"))
+    except Exception:  # noqa: BLE001
+        return ""
+    return decoded.decode("utf-8", errors="replace")
+
+
+def _html_to_text(html_value: str) -> str:
+    content = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html_value)
+    content = re.sub(r"(?i)<br\\s*/?>", "\n", content)
+    content = re.sub(r"(?i)</p\\s*>", "\n\n", content)
+    content = re.sub(r"(?i)</div\\s*>", "\n", content)
+    content = re.sub(r"(?s)<[^>]+>", " ", content)
+    content = html_lib.unescape(content)
+    return content
+
+
+def _normalize_body_text(value: str) -> str | None:
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if not text:
+        return None
+    max_chars = 16000
+    if len(text) > max_chars:
+        return f"{text[:max_chars]}..."
+    return text
 
 
 def _raise_for_status_with_detail(response: httpx.Response, *, context: str) -> None:
