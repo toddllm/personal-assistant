@@ -16,16 +16,42 @@ else
 fi
 
 is_running() {
+  local command=""
+  local listener_pid=""
   if [[ ! -f "$PID_FILE" ]]; then
+    listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$listener_pid" ]]; then
+      command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
+      if [[ "$command" == *"audio-assist"* ]]; then
+        echo "$listener_pid" >"$PID_FILE"
+        return 0
+      fi
+    fi
     return 1
   fi
   local pid
   pid="$(cat "$PID_FILE" 2>/dev/null || true)"
   if [[ -z "$pid" ]]; then
+    listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$listener_pid" ]]; then
+      command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
+      if [[ "$command" == *"audio-assist"* ]]; then
+        echo "$listener_pid" >"$PID_FILE"
+        return 0
+      fi
+    fi
     return 1
   fi
   if kill -0 "$pid" >/dev/null 2>&1; then
     return 0
+  fi
+  listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$listener_pid" ]]; then
+    command="$(ps -p "$listener_pid" -o command= 2>/dev/null || true)"
+    if [[ "$command" == *"audio-assist"* ]]; then
+      echo "$listener_pid" >"$PID_FILE"
+      return 0
+    fi
   fi
   return 1
 }
@@ -39,8 +65,14 @@ start_service() {
   nohup "${APP_CMD[@]}" >>"$SUPERVISOR_LOG" 2>&1 &
   local pid=$!
   echo "$pid" >"$PID_FILE"
-  sleep 1
-  if kill -0 "$pid" >/dev/null 2>&1; then
+  for _ in {1..24}; do
+    if is_running; then
+      pid="$(cat "$PID_FILE" 2>/dev/null || echo "$pid")"
+      break
+    fi
+    sleep 0.25
+  done
+  if is_running; then
     echo "audio-assist started (pid $pid)."
     echo "supervisor log: $SUPERVISOR_LOG"
     return 0
