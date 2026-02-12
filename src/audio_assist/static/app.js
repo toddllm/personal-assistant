@@ -584,6 +584,7 @@ function createSourcePresets(devices) {
         source_type: "mic",
         source_id: sourceId,
         device: Number(device.index),
+        channels: 2,
       },
     });
   });

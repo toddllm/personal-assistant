@@ -15,6 +15,14 @@ else
   APP_CMD=("audio-assist")
 fi
 
+listener_pid() {
+  lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true
+}
+
+list_audio_assist_pids() {
+  ps -axo pid=,command= | awk '$0 !~ /audio-assist-service.sh/ && ($0 ~ /[.]venv\/bin\/audio-assist/ || $0 ~ /(^| )audio-assist( |$)/) {print $1}' | tr '\n' ' '
+}
+
 health_ok() {
   curl -fsS --max-time 1 "http://127.0.0.1:8787/health" >/dev/null 2>&1
 }
@@ -33,40 +41,28 @@ wait_for_health() {
 }
 
 is_running() {
-  local listener_pid=""
-  if [[ ! -f "$PID_FILE" ]]; then
-    listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$listener_pid" ]]; then
-      echo "$listener_pid" >"$PID_FILE"
-      return 0
-    fi
-    return 1
-  fi
   local pid
-  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  pid="$(listener_pid)"
   if [[ -z "$pid" ]]; then
-    listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$listener_pid" ]]; then
-      echo "$listener_pid" >"$PID_FILE"
-      return 0
-    fi
     return 1
   fi
-  if kill -0 "$pid" >/dev/null 2>&1; then
-    return 0
-  fi
-  listener_pid="$(lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$listener_pid" ]]; then
-    echo "$listener_pid" >"$PID_FILE"
-    return 0
-  fi
-  return 1
+  echo "$pid" >"$PID_FILE"
+  return 0
 }
 
 start_service() {
   if is_running; then
     echo "audio-assist already running (pid $(cat "$PID_FILE"))."
     return 0
+  fi
+  local stale_pids
+  stale_pids="$(list_audio_assist_pids)"
+  if [[ -n "${stale_pids// }" ]]; then
+    echo "Cleaning up stale audio-assist process(es): ${stale_pids}" 
+    for pid in $stale_pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+    sleep 0.3
   fi
   echo "Starting audio-assist..."
   nohup "${APP_CMD[@]}" >>"$SUPERVISOR_LOG" 2>&1 &
@@ -95,25 +91,46 @@ start_service() {
 }
 
 stop_service() {
-  if ! is_running; then
+  local target_pids=""
+  if is_running; then
+    target_pids="$(cat "$PID_FILE" 2>/dev/null || true)"
+  fi
+  local discovered_pids
+  discovered_pids="$(list_audio_assist_pids)"
+  for pid in $discovered_pids; do
+    case " $target_pids " in
+      *" $pid "*) ;;
+      *) target_pids="$target_pids $pid" ;;
+    esac
+  done
+  if [[ -z "${target_pids// }" ]]; then
     echo "audio-assist is not running."
     rm -f "$PID_FILE"
     return 0
   fi
-  local pid
-  pid="$(cat "$PID_FILE")"
-  echo "Stopping audio-assist (pid $pid)..."
-  kill "$pid" >/dev/null 2>&1 || true
+  echo "Stopping audio-assist (pid(s):${target_pids})..."
+  for pid in $target_pids; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
   for _ in {1..20}; do
-    if ! kill -0 "$pid" >/dev/null 2>&1; then
+    local still_running=0
+    for pid in $target_pids; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        still_running=1
+        break
+      fi
+    done
+    if [[ "$still_running" -eq 0 ]]; then
       rm -f "$PID_FILE"
       echo "audio-assist stopped."
       return 0
     fi
     sleep 0.25
   done
-  echo "Force killing audio-assist (pid $pid)..."
-  kill -9 "$pid" >/dev/null 2>&1 || true
+  echo "Force killing audio-assist (pid(s):${target_pids})..."
+  for pid in $target_pids; do
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  done
   rm -f "$PID_FILE"
   echo "audio-assist stopped."
 }

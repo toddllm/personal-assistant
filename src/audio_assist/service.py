@@ -113,6 +113,29 @@ COMMON_SYSTEM_AUDIO_KEYWORDS = (
 )
 
 
+def _system_audio_fallback_priority(name: str) -> int:
+    lowered = str(name or "").lower()
+    if "cluely" in lowered:
+        return 110
+    if "krisp" in lowered:
+        return 105
+    if "loopback" in lowered:
+        return 102
+    if "blackhole" in lowered:
+        return 100
+    if "soundflower" in lowered or "vb-audio" in lowered or "cable" in lowered:
+        return 98
+    if "stereo mix" in lowered or "aggregate" in lowered or "multi-output" in lowered:
+        return 92
+    if "virtual" in lowered:
+        return 88
+    if "zoomaudio" in lowered:
+        return 35
+    if "teams" in lowered:
+        return 32
+    return 10
+
+
 def _dbfs_from_pcm16(raw_pcm: bytes) -> tuple[float, float]:
     samples = np.frombuffer(raw_pcm, dtype=np.int16)
     if samples.size == 0:
@@ -230,6 +253,57 @@ def _probe_input_level(
             "silent": True,
             "error": str(exc),
         }
+
+
+def _probe_input_level_with_timeout(
+    sd: object,
+    *,
+    device_index: int,
+    device_name: str,
+    max_input_channels: int,
+    sample_rate: int,
+    channels: int,
+    duration_ms: int,
+    timeout_seconds: float,
+) -> dict[str, object]:
+    result: dict[str, object] | None = None
+
+    def run_probe() -> None:
+        nonlocal result
+        result = _probe_input_level(
+            sd,
+            device_index=device_index,
+            device_name=device_name,
+            max_input_channels=max_input_channels,
+            sample_rate=sample_rate,
+            channels=channels,
+            duration_ms=duration_ms,
+        )
+
+    thread = Thread(target=run_probe, daemon=True)
+    thread.start()
+    thread.join(timeout=max(0.15, float(timeout_seconds)))
+    if thread.is_alive():
+        return {
+            "index": device_index,
+            "name": device_name,
+            "max_input_channels": max_input_channels,
+            "level_dbfs": -96.0,
+            "peak_dbfs": -96.0,
+            "silent": True,
+            "error": f"probe timed out after {timeout_seconds:.2f}s",
+        }
+    if result is None:
+        return {
+            "index": device_index,
+            "name": device_name,
+            "max_input_channels": max_input_channels,
+            "level_dbfs": -96.0,
+            "peak_dbfs": -96.0,
+            "silent": True,
+            "error": "probe failed without result",
+        }
+    return result
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -516,6 +590,7 @@ def create_app(settings: Settings) -> FastAPI:
     )
     capture_watchdog_stop = Event()
     capture_watchdog_thread: Thread | None = None
+    capture_retry_after_seconds: dict[str, float] = {}
 
     def coerce_device_identifier(value: object) -> str | int | None:
         if value is None:
@@ -559,6 +634,7 @@ def create_app(settings: Settings) -> FastAPI:
                     "index": idx,
                     "name": name,
                     "score": score,
+                    "priority": _system_audio_fallback_priority(name),
                     "max_input_channels": max_input_channels,
                 }
             )
@@ -568,20 +644,29 @@ def create_app(settings: Settings) -> FastAPI:
         # Prefer whichever virtual loopback path currently has real signal.
         # This avoids sticky mis-selection when multiple virtual devices exist.
         probe_duration_ms = 300
+        probe_timeout_seconds = 1.2
         activity_floor_dbfs = -78.0
         active_candidates: list[dict[str, object]] = []
         for candidate in candidates:
             idx = int(candidate["index"])
             name = str(candidate["name"])
             max_input_channels = int(candidate["max_input_channels"])
-            probe = _probe_input_level(
+            system_probe_channels = max(
+                1,
+                min(
+                    max_input_channels,
+                    max(int(settings.channels), int(settings.capture_autostart_system_audio_channels)),
+                ),
+            )
+            probe = _probe_input_level_with_timeout(
                 sd,
                 device_index=idx,
                 device_name=name,
                 max_input_channels=max_input_channels,
                 sample_rate=settings.sample_rate,
-                channels=settings.channels,
+                channels=system_probe_channels,
                 duration_ms=probe_duration_ms,
+                timeout_seconds=probe_timeout_seconds,
             )
             level_dbfs = float(probe.get("level_dbfs") or -96.0)
             error = str(probe.get("error") or "").strip()
@@ -616,8 +701,9 @@ def create_app(settings: Settings) -> FastAPI:
         candidates.sort(
             key=lambda item: (
                 int(item.get("score") or 0),
+                int(item.get("priority") or 0),
                 int(item.get("max_input_channels") or 0),
-                -int(item.get("index") or 0),
+                int(item.get("index") or 0),
             ),
             reverse=True,
         )
@@ -628,6 +714,42 @@ def create_app(settings: Settings) -> FastAPI:
             selected["name"],
         )
         return int(selected["index"])
+
+    def discover_mic_device() -> int | None:
+        try:
+            import sounddevice as sd
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            devices = sd.query_devices()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return None
+
+        candidates: list[tuple[int, str, int]] = []
+        for idx, raw in enumerate(devices):
+            max_input_channels = int(raw.get("max_input_channels", 0))
+            if max_input_channels <= 0:
+                continue
+            name = str(raw.get("name", "")).strip()
+            lowered = name.lower()
+            # Prefer physical microphone paths, avoid virtual loopback/system-audio devices.
+            if any(keyword in lowered for keyword in COMMON_SYSTEM_AUDIO_KEYWORDS):
+                continue
+            score = 0
+            if "macbook" in lowered:
+                score += 6
+            if "microphone" in lowered:
+                score += 5
+            if "built-in" in lowered or "internal" in lowered:
+                score += 4
+            candidates.append((idx, name, score))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda row: (row[2], -row[0]), reverse=True)
+        selected_idx, selected_name, _ = candidates[0]
+        logger.info("Auto-selected mic device index=%s name=%s", selected_idx, selected_name)
+        return int(selected_idx)
 
     def close_stale_session(runtime: SourceRuntime | None) -> None:
         if runtime is None:
@@ -670,6 +792,8 @@ def create_app(settings: Settings) -> FastAPI:
 
         report: list[dict[str, object]] = []
         errors: list[str] = []
+        now_monotonic = time.monotonic()
+        retry_cooldown_seconds = max(10.0, float(settings.capture_autostart_retry_cooldown_seconds))
 
         def mark_error(message: str) -> None:
             errors.append(message)
@@ -681,6 +805,21 @@ def create_app(settings: Settings) -> FastAPI:
             role: str,
             channels: int | None = None,
         ) -> None:
+            retry_after = float(capture_retry_after_seconds.get(source_id, 0.0))
+            if retry_after > now_monotonic:
+                wait_seconds = max(0.0, retry_after - now_monotonic)
+                report.append(
+                    {
+                        "source_id": source_id,
+                        "source_type": "mic",
+                        "role": role,
+                        "started": False,
+                        "running": False,
+                        "reason": "retry-cooldown",
+                        "retry_in_seconds": round(wait_seconds, 1),
+                    }
+                )
+                return
             existing = source_manager.get(source_id)
             if existing is not None and existing.runner.is_running():
                 report.append(
@@ -703,6 +842,7 @@ def create_app(settings: Settings) -> FastAPI:
             try:
                 runtime = source_manager.start_mic(source_id=source_id, device=device, channels=channels)
                 persist_runtime_session(runtime)
+                capture_retry_after_seconds.pop(source_id, None)
                 report.append(
                     {
                         "source_id": source_id,
@@ -717,6 +857,7 @@ def create_app(settings: Settings) -> FastAPI:
                 logger.info("Auto-started source=%s (mic, role=%s, device=%s)", source_id, role, device)
             except Exception as exc:  # noqa: BLE001
                 mark_error(f"Failed to auto-start mic source '{source_id}' ({role}): {exc}")
+                capture_retry_after_seconds[source_id] = now_monotonic + retry_cooldown_seconds
                 report.append(
                     {
                         "source_id": source_id,
@@ -734,6 +875,21 @@ def create_app(settings: Settings) -> FastAPI:
             ffmpeg_input_format: str | None,
             role: str,
         ) -> None:
+            retry_after = float(capture_retry_after_seconds.get(source_id, 0.0))
+            if retry_after > now_monotonic:
+                wait_seconds = max(0.0, retry_after - now_monotonic)
+                report.append(
+                    {
+                        "source_id": source_id,
+                        "source_type": "ffmpeg",
+                        "role": role,
+                        "started": False,
+                        "running": False,
+                        "reason": "retry-cooldown",
+                        "retry_in_seconds": round(wait_seconds, 1),
+                    }
+                )
+                return
             existing = source_manager.get(source_id)
             if existing is not None and existing.runner.is_running():
                 report.append(
@@ -760,6 +916,7 @@ def create_app(settings: Settings) -> FastAPI:
                     ffmpeg_input_format=ffmpeg_input_format,
                 )
                 persist_runtime_session(runtime)
+                capture_retry_after_seconds.pop(source_id, None)
                 report.append(
                     {
                         "source_id": source_id,
@@ -779,6 +936,7 @@ def create_app(settings: Settings) -> FastAPI:
                 )
             except Exception as exc:  # noqa: BLE001
                 mark_error(f"Failed to auto-start ffmpeg source '{source_id}' ({role}): {exc}")
+                capture_retry_after_seconds[source_id] = now_monotonic + retry_cooldown_seconds
                 report.append(
                     {
                         "source_id": source_id,
@@ -792,7 +950,8 @@ def create_app(settings: Settings) -> FastAPI:
 
         if settings.capture_autostart_mic_enabled:
             mic_source_id = str(settings.capture_autostart_mic_source_id or settings.mic_source_id).strip() or "desk-mic"
-            mic_device = coerce_device_identifier(settings.capture_autostart_mic_device)
+            explicit_mic_device = coerce_device_identifier(settings.capture_autostart_mic_device)
+            mic_device = explicit_mic_device if explicit_mic_device is not None else discover_mic_device()
             ensure_mic_source(mic_source_id, mic_device, role="desk-mic")
 
         if settings.capture_autostart_system_audio_enabled:
@@ -1205,7 +1364,7 @@ def create_app(settings: Settings) -> FastAPI:
         recent_seconds: int = 180,
         level_stale_seconds: int = 25,
         active_level_dbfs: float = -55.0,
-        ensure_running: bool = True,
+        ensure_running: bool = False,
     ) -> dict[str, object]:
         safe_recent_seconds = int(max(30, min(recent_seconds, 3600)))
         safe_level_stale_seconds = int(max(3, min(level_stale_seconds, 180)))
@@ -1568,15 +1727,20 @@ def create_app(settings: Settings) -> FastAPI:
                 continue
 
             name = str(dev.get("name", f"device-{idx}"))
+            lowered = name.lower()
+            probe_channels = settings.channels
+            if any(keyword in lowered for keyword in COMMON_SYSTEM_AUDIO_KEYWORDS):
+                probe_channels = max(settings.channels, settings.capture_autostart_system_audio_channels)
             results.append(
-                _probe_input_level(
+                _probe_input_level_with_timeout(
                     sd,
                     device_index=idx,
                     device_name=name,
                     max_input_channels=max_input,
                     sample_rate=settings.sample_rate,
-                    channels=settings.channels,
+                    channels=probe_channels,
                     duration_ms=duration_ms,
+                    timeout_seconds=max(0.8, (duration_ms / 1000.0) + 0.6),
                 )
             )
 
@@ -1599,14 +1763,19 @@ def create_app(settings: Settings) -> FastAPI:
         if max_input <= 0:
             raise HTTPException(status_code=400, detail=f"Device index={device_index} is not an input device")
         name = str(dev.get("name", f"device-{device_index}"))
-        return _probe_input_level(
+        lowered = name.lower()
+        probe_channels = settings.channels
+        if any(keyword in lowered for keyword in COMMON_SYSTEM_AUDIO_KEYWORDS):
+            probe_channels = max(settings.channels, settings.capture_autostart_system_audio_channels)
+        return _probe_input_level_with_timeout(
             sd,
             device_index=device_index,
             device_name=name,
             max_input_channels=max_input,
             sample_rate=settings.sample_rate,
-            channels=settings.channels,
+            channels=probe_channels,
             duration_ms=duration_ms,
+            timeout_seconds=max(0.8, (duration_ms / 1000.0) + 0.6),
         )
 
     @app.get("/v1/tts/status")
@@ -1643,7 +1812,7 @@ def create_app(settings: Settings) -> FastAPI:
                 if existing is not None and not existing.runner.is_running():
                     close_stale_session(existing)
             if req.source_type == "mic":
-                runtime = source_manager.start_mic(source_id=req.source_id, device=req.device)
+                runtime = source_manager.start_mic(source_id=req.source_id, device=req.device, channels=req.channels)
             elif req.source_type == "ffmpeg":
                 if not req.ffmpeg_input:
                     raise HTTPException(status_code=400, detail="ffmpeg_input is required.")

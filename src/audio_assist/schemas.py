@@ -12,6 +12,10 @@ class SourceStartRequest(BaseModel):
         description="Optional language hint for ASR (for example: es, en, fr). Use auto/empty for detection.",
     )
     device: str | int | None = Field(default=None, description="Mic device name or index.")
+    channels: int | None = Field(
+        default=None,
+        description="Optional capture channel override for mic sources (for example 2 for stereo loopback).",
+    )
     ffmpeg_input: str | None = Field(
         default=None,
         description="ffmpeg -i value (file path, URL, or device expression).",
