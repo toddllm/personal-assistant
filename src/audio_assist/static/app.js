@@ -464,6 +464,7 @@ function renderRunningSources(items) {
       const started = item.started_at ? new Date(item.started_at).toLocaleTimeString() : "n/a";
       const status = item.running ? "running" : "stopped";
       const sourceId = String(item.source_id || "");
+      const sourceType = sourceId.startsWith("system-audio") ? "system-audio" : String(item.source_type || "unknown");
       const hint = item && item.details ? String(item.details.language_hint || "").trim() : "";
       const hintMeta = hint ? ` | asr:${hint}` : "";
       const level = state.sourceLevels[sourceId] || null;
@@ -479,9 +480,9 @@ function renderRunningSources(items) {
         ? `${formatDb(levelDb)} | peak ${formatDb(peakDb)} | ${formatAge(ageSeconds)}`
         : "Waiting for first audio segment...";
       return `
-      <article class="entry source-row">
+        <article class="entry source-row">
         <div class="source-main">
-          <div class="meta">${escapeHtml(`${sourceId} | ${item.source_type} | ${status}${hintMeta}`)}</div>
+          <div class="meta">${escapeHtml(`${sourceId} | ${sourceType} | ${status}${hintMeta}`)}</div>
           <p class="text">Started: ${escapeHtml(started)}</p>
           <div class="level-meta">${escapeHtml(levelSummary)}</div>
           <div class="level-meter" title="${escapeHtml(levelSummary)}">

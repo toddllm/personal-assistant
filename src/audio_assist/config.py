@@ -33,12 +33,14 @@ class Settings(BaseSettings):
     whisper_no_speech_threshold: float = 1.0
     whisper_system_audio_no_speech_threshold: float = 1.0
     whisper_min_signal_dbfs: float = -70.0
+    whisper_system_audio_min_signal_dbfs: float = -96.0
     whisper_fallback_on_empty: bool = True
     whisper_fallback_beam_size: int = 2
     whisper_fallback_best_of: int = 2
     whisper_fallback_vad_filter: bool = False
     whisper_fallback_no_speech_threshold: float = 1.0
     whisper_fallback_min_signal_dbfs: float = -70.0
+    whisper_system_audio_fallback_min_signal_dbfs: float = -96.0
     transcription_queue_size: int = 1024
     transcription_drop_archive_fallback: bool = True
     whisper_postprocess_model: str = "large-v3"

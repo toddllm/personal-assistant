@@ -44,12 +44,14 @@ class TranscriptionWorker:
         no_speech_threshold: float = 0.6,
         system_audio_no_speech_threshold: float | None = None,
         min_signal_dbfs: float = -58.0,
+        system_audio_min_signal_dbfs: float | None = None,
         fallback_on_empty: bool = True,
         fallback_beam_size: int = 2,
         fallback_best_of: int = 2,
         fallback_vad_filter: bool = False,
         fallback_no_speech_threshold: float = 1.0,
         fallback_min_signal_dbfs: float = -55.0,
+        system_audio_fallback_min_signal_dbfs: float | None = None,
         condition_on_previous_text: bool = False,
         queue_size: int = 512,
         archive_on_drop: bool = True,
@@ -83,12 +85,22 @@ class TranscriptionWorker:
             else float(max(0.0, min(1.0, system_audio_no_speech_threshold)))
         )
         self._min_signal_dbfs = float(min_signal_dbfs)
+        self._system_audio_min_signal_dbfs = (
+            self._min_signal_dbfs
+            if system_audio_min_signal_dbfs is None
+            else float(system_audio_min_signal_dbfs)
+        )
         self._fallback_on_empty = bool(fallback_on_empty)
         self._fallback_beam_size = int(max(1, min(fallback_beam_size, 5)))
         self._fallback_best_of = int(max(1, min(fallback_best_of, 5)))
         self._fallback_vad_filter = bool(fallback_vad_filter)
         self._fallback_no_speech_threshold = float(max(0.0, min(1.0, fallback_no_speech_threshold)))
         self._fallback_min_signal_dbfs = float(fallback_min_signal_dbfs)
+        self._system_audio_fallback_min_signal_dbfs = (
+            self._fallback_min_signal_dbfs
+            if system_audio_fallback_min_signal_dbfs is None
+            else float(system_audio_fallback_min_signal_dbfs)
+        )
         self._condition_on_previous_text = bool(condition_on_previous_text)
         self._archive_on_drop = bool(archive_on_drop)
         self._archiver = archiver
@@ -280,12 +292,13 @@ class TranscriptionWorker:
             return ""
         # Convert PCM16 mono to float32 in [-1, 1] for faster-whisper.
         audio = np.frombuffer(segment.pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+        is_system_audio = segment.source_id.startswith("system-audio")
         signal_dbfs = self._signal_dbfs(audio)
-        if signal_dbfs <= self._min_signal_dbfs:
+        min_signal_threshold = self._system_audio_min_signal_dbfs if is_system_audio else self._min_signal_dbfs
+        if signal_dbfs <= min_signal_threshold:
             return ""
         language_hint = self.language_hint_for_source(segment.source_id)
         language = language_hint if language_hint is not None else self._language
-        is_system_audio = segment.source_id.startswith("system-audio")
         vad_filter = self._system_audio_vad_filter if is_system_audio else self._vad_filter
         no_speech_threshold = (
             self._system_audio_no_speech_threshold if is_system_audio else self._no_speech_threshold
@@ -302,7 +315,10 @@ class TranscriptionWorker:
             return text
         if not self._fallback_on_empty:
             return ""
-        if signal_dbfs <= self._fallback_min_signal_dbfs:
+        fallback_min_signal_threshold = (
+            self._system_audio_fallback_min_signal_dbfs if is_system_audio else self._fallback_min_signal_dbfs
+        )
+        if signal_dbfs <= fallback_min_signal_threshold:
             return ""
         with self._stats_lock:
             self._segments_fallback_attempted += 1
@@ -402,11 +418,15 @@ class TranscriptionWorker:
                 "vad_filter_system_audio": self._system_audio_vad_filter,
                 "no_speech_threshold_default": self._no_speech_threshold,
                 "no_speech_threshold_system_audio": self._system_audio_no_speech_threshold,
+                "min_signal_dbfs_default": self._min_signal_dbfs,
+                "min_signal_dbfs_system_audio": self._system_audio_min_signal_dbfs,
                 "fallback_enabled": self._fallback_on_empty,
                 "fallback_beam_size": self._fallback_beam_size,
                 "fallback_best_of": self._fallback_best_of,
                 "fallback_vad_filter": self._fallback_vad_filter,
                 "fallback_no_speech_threshold": self._fallback_no_speech_threshold,
+                "fallback_min_signal_dbfs_default": self._fallback_min_signal_dbfs,
+                "fallback_min_signal_dbfs_system_audio": self._system_audio_fallback_min_signal_dbfs,
             }
 
     def _owner_speaker_for_segment(self, segment: AudioSegment) -> str | None:
