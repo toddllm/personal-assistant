@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PID_FILE="$ROOT_DIR/data/run/audio-assist.pid"
 SUPERVISOR_LOG="$ROOT_DIR/data/logs/audio-assist-supervisor.log"
 APP_LOG="$ROOT_DIR/data/logs/audio-assist.log"
+LAUNCHD_LABEL="com.tdeshane.audioassist"
 
 mkdir -p "$ROOT_DIR/data/run" "$ROOT_DIR/data/logs"
 
@@ -90,7 +91,16 @@ start_service() {
   return 1
 }
 
+remove_launchd_job() {
+  if launchctl list "$LAUNCHD_LABEL" >/dev/null 2>&1; then
+    echo "Removing launchd job $LAUNCHD_LABEL (prevents auto-restart)..."
+    launchctl remove "$LAUNCHD_LABEL" 2>/dev/null || true
+    sleep 0.5
+  fi
+}
+
 stop_service() {
+  remove_launchd_job
   local target_pids=""
   if is_running; then
     target_pids="$(cat "$PID_FILE" 2>/dev/null || true)"

@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     capture_autostart_mic_source_id: str = "desk-mic"
     capture_autostart_mic_device: str | int | None = "MacBook Pro Microphone"
     capture_autostart_retry_cooldown_seconds: float = 90.0
-    capture_autostart_system_audio_enabled: bool = True
+    capture_autostart_system_audio_enabled: bool = False
     capture_autostart_system_audio_source_id: str = "system-audio"
     capture_autostart_system_audio_device: str | int | None = "BlackHole 2ch"
     capture_autostart_system_audio_channels: int = 2
