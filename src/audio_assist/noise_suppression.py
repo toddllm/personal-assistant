@@ -60,16 +60,11 @@ class NoiseSuppressor:
         return self._enabled
 
     def should_suppress(self, source_id: str) -> bool:
-        """Only apply noise suppression to mic sources, not system-audio."""
+        """Only apply noise suppression to desk-mic sources, not system-audio or bose-mic."""
         if not self._enabled:
             return False
-        # Apply to mic sources only
         lowered = source_id.lower()
-        return (
-            lowered.startswith(self._mic_source_prefix)
-            or "mic" in lowered
-            or "microphone" in lowered
-        )
+        return lowered.startswith(self._mic_source_prefix)
 
     def suppress(
         self,

@@ -26,6 +26,7 @@ from audio_assist.diarization import SpeakerDiarizationClient
 from audio_assist.levels import AudioLevelTracker
 from audio_assist.postprocess import TranscriptPostProcessor
 from audio_assist.qa import QAEngine, QAResult
+from audio_assist.echo_cancellation import EchoCanceller
 from audio_assist.meeting_detector import MeetingDetector
 from audio_assist.noise_suppression import NoiseSuppressor
 from audio_assist.orchestrator import PreflightResult, SessionOrchestrator
@@ -337,6 +338,7 @@ def create_app(settings: Settings) -> FastAPI:
         model_name=settings.whisper_model,
         device=settings.whisper_device,
         compute_type=settings.whisper_compute_type,
+        backend=settings.whisper_backend,
         language=settings.whisper_language,
         beam_size=settings.whisper_beam_size,
         best_of=settings.whisper_best_of,
@@ -480,10 +482,48 @@ def create_app(settings: Settings) -> FastAPI:
         prop_decrease=settings.noise_suppression_prop_decrease,
         stationary=settings.noise_suppression_stationary,
     )
+    echo_canceller = EchoCanceller(
+        enabled=settings.aec_enabled,
+        mic_source_prefix=settings.mic_source_id,
+        filter_length=settings.aec_filter_length,
+        step_size=settings.aec_step_size,
+        fixed_delay_ms=settings.aec_fixed_delay_ms,
+        reference_buffer_seconds=settings.aec_reference_buffer_seconds,
+    )
     meeting_detector = MeetingDetector()
 
     def handle_segment(segment: AudioSegment) -> None:
         level_tracker.ingest(segment)
+        # Buffer system-audio as AEC reference
+        echo_canceller.ingest_reference(
+            source_id=segment.source_id,
+            pcm_s16le=segment.pcm_s16le,
+            sample_rate=segment.sample_rate,
+            channels=(
+                settings.capture_autostart_system_audio_channels
+                if segment.source_id.lower().startswith("system-audio")
+                else settings.channels
+            ),
+            started_at=segment.started_at,
+            ended_at=segment.ended_at,
+        )
+        # Apply AEC to mic segments before noise suppression
+        if echo_canceller.should_cancel(segment.source_id):
+            cancelled_pcm = echo_canceller.cancel(
+                mic_pcm=segment.pcm_s16le,
+                sample_rate=segment.sample_rate,
+                started_at=segment.started_at,
+                ended_at=segment.ended_at,
+            )
+            segment = AudioSegment(
+                source_id=segment.source_id,
+                session_id=segment.session_id,
+                started_at=segment.started_at,
+                ended_at=segment.ended_at,
+                pcm_s16le=cancelled_pcm,
+                sample_rate=segment.sample_rate,
+                channels=segment.channels,
+            )
         if noise_suppressor.should_suppress(segment.source_id):
             suppressed_pcm = noise_suppressor.suppress(
                 segment.pcm_s16le, segment.sample_rate, segment.source_id,
@@ -495,6 +535,7 @@ def create_app(settings: Settings) -> FastAPI:
                 ended_at=segment.ended_at,
                 pcm_s16le=suppressed_pcm,
                 sample_rate=segment.sample_rate,
+                channels=segment.channels,
             )
         transcriber.enqueue(segment)
 
@@ -1034,6 +1075,80 @@ def create_app(settings: Settings) -> FastAPI:
                                 "reason": "no-system-audio-device-found",
                             }
                         )
+
+        if settings.capture_autostart_app_audio_enabled:
+            app_source_id = str(settings.capture_autostart_app_audio_source_id or "app-audio").strip() or "app-audio"
+            existing_ids = {str(item.get("source_id", "")) for item in report}
+            if app_source_id in existing_ids:
+                mark_error("App-audio auto-start skipped because source_id collides with an existing source.")
+                report.append(
+                    {
+                        "source_id": app_source_id,
+                        "source_type": "mic",
+                        "role": "app-audio",
+                        "started": False,
+                        "running": False,
+                        "error": "source-id-collision",
+                    }
+                )
+            else:
+                app_device = coerce_device_identifier(settings.capture_autostart_app_audio_device)
+                app_channels = max(1, min(int(settings.capture_autostart_app_audio_channels), 8))
+                if app_device is not None:
+                    ensure_mic_source(
+                        app_source_id,
+                        app_device,
+                        role="app-audio",
+                        channels=app_channels,
+                    )
+                else:
+                    report.append(
+                        {
+                            "source_id": app_source_id,
+                            "source_type": "mic",
+                            "role": "app-audio",
+                            "started": False,
+                            "running": False,
+                            "reason": "no-app-audio-device-configured",
+                        }
+                    )
+
+        if settings.capture_autostart_bose_mic_enabled:
+            bose_source_id = str(settings.capture_autostart_bose_mic_source_id or "bose-mic").strip() or "bose-mic"
+            existing_ids = {str(item.get("source_id", "")) for item in report}
+            if bose_source_id in existing_ids:
+                mark_error("Bose-mic auto-start skipped because source_id collides with an existing source.")
+                report.append(
+                    {
+                        "source_id": bose_source_id,
+                        "source_type": "mic",
+                        "role": "bose-mic",
+                        "started": False,
+                        "running": False,
+                        "error": "source-id-collision",
+                    }
+                )
+            else:
+                bose_device = coerce_device_identifier(settings.capture_autostart_bose_mic_device)
+                bose_channels = max(1, min(int(settings.capture_autostart_bose_mic_channels), 8))
+                if bose_device is not None:
+                    ensure_mic_source(
+                        bose_source_id,
+                        bose_device,
+                        role="bose-mic",
+                        channels=bose_channels,
+                    )
+                else:
+                    report.append(
+                        {
+                            "source_id": bose_source_id,
+                            "source_type": "mic",
+                            "role": "bose-mic",
+                            "started": False,
+                            "running": False,
+                            "reason": "no-bose-mic-device-configured",
+                        }
+                    )
 
         running_count = len([item for item in source_manager.statuses() if item.runner.is_running()])
         started_count = len([item for item in report if bool(item.get("started"))])
@@ -2303,6 +2418,103 @@ def create_app(settings: Settings) -> FastAPI:
     @app.get("/v1/noise-suppression/status")
     def noise_suppression_status() -> dict[str, object]:
         return noise_suppressor.status()
+
+    # --- Echo cancellation status ---
+
+    @app.get("/v1/echo-cancellation/status")
+    def echo_cancellation_status() -> dict[str, object]:
+        return echo_canceller.status()
+
+    # --- Volume control ---
+    # Multi-Output Device disables macOS volume slider. This endpoint
+    # works around that by briefly switching to the real output device,
+    # setting volume, then switching back.
+
+    def _get_real_output_device() -> str | None:
+        """Find the real (non-virtual) output device in the system."""
+        try:
+            result = subprocess.run(
+                ["SwitchAudioSource", "-a", "-t", "output"],
+                capture_output=True, text=True, timeout=3,
+            )
+            virtual = {"blackhole", "multi-output device", "cluely", "zoomaudiodevice",
+                        "microsoft teams audio"}
+            for line in result.stdout.strip().splitlines():
+                name = line.strip()
+                if name and name.lower() not in virtual:
+                    return name
+        except Exception:
+            pass
+        return None
+
+    @app.get("/v1/volume")
+    def get_volume() -> dict[str, object]:
+        current_output = None
+        try:
+            r = subprocess.run(
+                ["SwitchAudioSource", "-c", "-t", "output"],
+                capture_output=True, text=True, timeout=3,
+            )
+            current_output = r.stdout.strip()
+        except Exception:
+            pass
+        real_device = _get_real_output_device()
+        if not real_device:
+            return {"volume": None, "device": current_output, "error": "no real output device found"}
+        try:
+            subprocess.run(
+                ["SwitchAudioSource", "-s", real_device, "-t", "output"],
+                capture_output=True, timeout=2,
+            )
+            r = subprocess.run(
+                ["osascript", "-e", "output volume of (get volume settings)"],
+                capture_output=True, text=True, timeout=2,
+            )
+            vol = int(r.stdout.strip())
+        except Exception:
+            vol = None
+        finally:
+            if current_output:
+                subprocess.run(
+                    ["SwitchAudioSource", "-s", current_output, "-t", "output"],
+                    capture_output=True, timeout=2,
+                )
+        return {"volume": vol, "device": real_device}
+
+    @app.post("/v1/volume")
+    def set_volume(body: dict) -> dict[str, object]:
+        target = body.get("volume")
+        if target is None or not isinstance(target, (int, float)):
+            raise HTTPException(400, "provide 'volume' as integer 0-100")
+        target = max(0, min(100, int(target)))
+        current_output = None
+        try:
+            r = subprocess.run(
+                ["SwitchAudioSource", "-c", "-t", "output"],
+                capture_output=True, text=True, timeout=3,
+            )
+            current_output = r.stdout.strip()
+        except Exception:
+            pass
+        real_device = _get_real_output_device()
+        if not real_device:
+            raise HTTPException(500, "no real output device found")
+        try:
+            subprocess.run(
+                ["SwitchAudioSource", "-s", real_device, "-t", "output"],
+                capture_output=True, timeout=2,
+            )
+            subprocess.run(
+                ["osascript", "-e", f"set volume output volume {target}"],
+                capture_output=True, timeout=2,
+            )
+        finally:
+            if current_output:
+                subprocess.run(
+                    ["SwitchAudioSource", "-s", current_output, "-t", "output"],
+                    capture_output=True, timeout=2,
+                )
+        return {"volume": target, "device": real_device}
 
     # --- Transcript export ---
 

@@ -16,6 +16,16 @@ else
   APP_CMD=("audio-assist")
 fi
 
+# Audio forwarding daemon (app audio)
+FORWARD_PID_FILE="$ROOT_DIR/data/run/audio-forward.pid"
+FORWARD_LOG="$ROOT_DIR/data/logs/audio-forward.log"
+FORWARD_CMD=("$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/audio-forward.py")
+
+# Mic forwarding daemon (physical mic -> CaptureMic 2ch)
+MIC_FWD_PID_FILE="$ROOT_DIR/data/run/mic-forward.pid"
+MIC_FWD_LOG="$ROOT_DIR/data/logs/mic-forward.log"
+MIC_FWD_BIN="$ROOT_DIR/driver/build/mic-forward"
+
 listener_pid() {
   lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true
 }
@@ -51,6 +61,88 @@ is_running() {
   return 0
 }
 
+forward_is_running() {
+  [[ -f "$FORWARD_PID_FILE" ]] && kill -0 "$(cat "$FORWARD_PID_FILE")" 2>/dev/null
+}
+
+start_forward() {
+  if forward_is_running; then
+    echo "audio-forward already running (pid $(cat "$FORWARD_PID_FILE"))."
+    return 0
+  fi
+  echo "Starting audio-forward..."
+  nohup "${FORWARD_CMD[@]}" >>"$FORWARD_LOG" 2>&1 &
+  echo $! >"$FORWARD_PID_FILE"
+  echo "audio-forward started (pid $!)."
+}
+
+stop_forward() {
+  if ! forward_is_running; then
+    rm -f "$FORWARD_PID_FILE"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$FORWARD_PID_FILE")"
+  echo "Stopping audio-forward (pid $pid)..."
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$FORWARD_PID_FILE"
+      echo "audio-forward stopped."
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$FORWARD_PID_FILE"
+  echo "audio-forward stopped (forced)."
+}
+
+mic_fwd_is_running() {
+  [[ -f "$MIC_FWD_PID_FILE" ]] && kill -0 "$(cat "$MIC_FWD_PID_FILE")" 2>/dev/null
+}
+
+start_mic_forward() {
+  if mic_fwd_is_running; then
+    echo "mic-forward already running (pid $(cat "$MIC_FWD_PID_FILE"))."
+    return 0
+  fi
+  if [[ ! -x "$MIC_FWD_BIN" ]]; then
+    echo "Building mic-forward..."
+    make -C "$ROOT_DIR/driver" -f Makefile.mic-forward mic-forward
+    if [[ ! -x "$MIC_FWD_BIN" ]]; then
+      echo "mic-forward build failed."
+      return 1
+    fi
+  fi
+  echo "Starting mic-forward..."
+  nohup "$MIC_FWD_BIN" >>"$MIC_FWD_LOG" 2>&1 &
+  echo $! >"$MIC_FWD_PID_FILE"
+  echo "mic-forward started (pid $!)."
+}
+
+stop_mic_forward() {
+  if ! mic_fwd_is_running; then
+    rm -f "$MIC_FWD_PID_FILE"
+    return 0
+  fi
+  local pid
+  pid="$(cat "$MIC_FWD_PID_FILE")"
+  echo "Stopping mic-forward (pid $pid)..."
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..20}; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      rm -f "$MIC_FWD_PID_FILE"
+      echo "mic-forward stopped."
+      return 0
+    fi
+    sleep 0.25
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  rm -f "$MIC_FWD_PID_FILE"
+  echo "mic-forward stopped (forced)."
+}
+
 start_service() {
   if is_running; then
     echo "audio-assist already running (pid $(cat "$PID_FILE"))."
@@ -84,6 +176,8 @@ start_service() {
       echo "health: warming"
     fi
     echo "supervisor log: $SUPERVISOR_LOG"
+    start_forward
+    start_mic_forward
     return 0
   fi
   echo "audio-assist failed to start. Check $SUPERVISOR_LOG"
@@ -100,6 +194,8 @@ remove_launchd_job() {
 }
 
 stop_service() {
+  stop_mic_forward
+  stop_forward
   remove_launchd_job
   local target_pids=""
   if is_running; then
@@ -155,9 +251,29 @@ service_status() {
     else
       echo "health: warming"
     fi
+    if forward_is_running; then
+      echo "audio-forward running (pid $(cat "$FORWARD_PID_FILE"))."
+    else
+      echo "audio-forward not running."
+    fi
+    if mic_fwd_is_running; then
+      echo "mic-forward running (pid $(cat "$MIC_FWD_PID_FILE"))."
+    else
+      echo "mic-forward not running."
+    fi
     return 0
   fi
   echo "audio-assist not running."
+  if forward_is_running; then
+    echo "audio-forward running (pid $(cat "$FORWARD_PID_FILE"))."
+  else
+    echo "audio-forward not running."
+  fi
+  if mic_fwd_is_running; then
+    echo "mic-forward running (pid $(cat "$MIC_FWD_PID_FILE"))."
+  else
+    echo "mic-forward not running."
+  fi
   return 1
 }
 

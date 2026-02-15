@@ -26,10 +26,12 @@ class TestShouldSuppress:
         assert ns.should_suppress("desk-mic") is True
         assert ns.should_suppress("desk-mic-manual") is True
 
-    def test_suppresses_generic_mic_source(self):
+    def test_does_not_suppress_other_mic_sources(self):
+        """Only desk-mic prefix gets suppression; bose-mic and others are skipped."""
         ns = NoiseSuppressor(enabled=True)
-        assert ns.should_suppress("usb-mic") is True
-        assert ns.should_suppress("microphone-1") is True
+        assert ns.should_suppress("bose-mic") is False
+        assert ns.should_suppress("usb-mic") is False
+        assert ns.should_suppress("microphone-1") is False
 
     def test_does_not_suppress_system_audio(self):
         ns = NoiseSuppressor(enabled=True)
@@ -43,7 +45,7 @@ class TestShouldSuppress:
     def test_custom_prefix(self):
         ns = NoiseSuppressor(enabled=True, mic_source_prefix="custom-")
         assert ns.should_suppress("custom-mic") is True
-        assert ns.should_suppress("desk-mic") is True  # still matches "mic" keyword
+        assert ns.should_suppress("desk-mic") is False  # only prefix match, no keyword fallback
 
 
 class TestSuppress:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -7,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
 from typing import Callable
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 from audio_assist.transcriber import AudioSegment
 
@@ -155,11 +158,16 @@ class MicrophoneSourceRunner(BaseSourceRunner):
                         ended_at=ended_at,
                         pcm_s16le=chunk,
                         sample_rate=self._sample_rate,
+                        channels=self._channels,
                     )
                 )
             except Exception:  # noqa: BLE001
                 # Do not crash the audio callback thread on transient queue issues.
-                pass
+                logger.warning(
+                    "handle_segment failed for source=%s, dropping segment",
+                    self._source_id,
+                    exc_info=True,
+                )
 
 
 class FFmpegSourceRunner(BaseSourceRunner):
@@ -289,10 +297,15 @@ class FFmpegSourceRunner(BaseSourceRunner):
                             ended_at=ended_at,
                             pcm_s16le=seg,
                             sample_rate=self._sample_rate,
+                            channels=self._channels,
                         )
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "handle_segment failed for source=%s, dropping segment",
+                        self._source_id,
+                        exc_info=True,
+                    )
         self._running = False
 
 

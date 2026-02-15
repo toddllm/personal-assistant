@@ -26,6 +26,14 @@ dev = [
 tts = [
   "qwen-tts>=0.1.0",
 ]
+speaker = [
+  "speechbrain>=1.0.0",
+  "torchaudio>=2.0.0",
+]
+screen-capture = [
+  "mss>=10.0.0,<11.0.0",
+  "Pillow>=10.0.0,<12.0.0",
+]
 
 [project.scripts]
 audio-assist = "audio_assist.main:main"
@@ -34,6 +42,8 @@ speaker-service = "speaker_service.main:main"
 google-sync-service = "google_sync_service.main:main"
 google-sync-connect = "google_sync_service.cli:main"
 email-service = "email_service.main:main"
+speaker-enroll = "audio_assist.enroll:main"
+screen-capture-service = "screen_capture.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

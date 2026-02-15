@@ -27,6 +27,7 @@ class AudioSegment:
     pcm_s16le: bytes
     sample_rate: int
     session_id: str | None = None
+    channels: int = 1
 
 
 class TranscriptionWorker:
@@ -37,6 +38,7 @@ class TranscriptionWorker:
         device: str,
         compute_type: str,
         language: str,
+        backend: str = "faster-whisper",
         beam_size: int = 1,
         best_of: int = 1,
         vad_filter: bool = True,
@@ -68,6 +70,7 @@ class TranscriptionWorker:
         speaker_backfill_since_seconds: int = 4 * 3600,
     ):
         self._store = store
+        self._backend = backend.strip().lower() if backend else "faster-whisper"
         self._model_name = model_name
         self._device = device
         self._compute_type = compute_type
@@ -259,9 +262,67 @@ class TranscriptionWorker:
             finally:
                 with self._stats_lock:
                     self._segments_processed += 1
+                    if self._segments_processed % 50 == 0:
+                        logger.info(
+                            "Transcription pipeline: queue=%d/%d processed=%d text=%d empty=%d dropped=%d model=%s",
+                            self._queue.qsize(),
+                            self._queue.maxsize,
+                            self._segments_processed,
+                            self._segments_text,
+                            self._segments_empty,
+                            self._segments_dropped,
+                            "loaded" if self._model is not None else (
+                                "failed" if self._model_load_failed else "pending"
+                            ),
+                        )
                 self._queue.task_done()
 
     def _load_model(self) -> None:
+        if str(self._model_name).strip().lower().endswith(".en"):
+            logger.warning(
+                "Whisper model '%s' is English-only. Non-English speech may be mistranscribed. "
+                "Use a multilingual model (for example 'base' or 'small') with language=auto.",
+                self._model_name,
+            )
+        if self._backend == "mlx":
+            self._load_model_mlx()
+        else:
+            self._load_model_faster_whisper()
+
+    def _load_model_mlx(self) -> None:
+        try:
+            import mlx_whisper  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-whisper is not installed. Install with: pip install mlx-whisper"
+            ) from exc
+        # mlx-whisper model name mapping
+        model_name = self._model_name
+        mlx_model_map = {
+            "large-v3": "mlx-community/whisper-large-v3-mlx",
+            "large-v2": "mlx-community/whisper-large-v2-mlx",
+            "medium": "mlx-community/whisper-medium-mlx",
+            "small": "mlx-community/whisper-small-mlx",
+            "base": "mlx-community/whisper-base-mlx",
+            "tiny": "mlx-community/whisper-tiny-mlx",
+        }
+        self._mlx_model_path = mlx_model_map.get(model_name, model_name)
+        logger.info(
+            "Loading whisper model=%s backend=mlx (Metal GPU) mlx_path=%s",
+            self._model_name,
+            self._mlx_model_path,
+        )
+        # Warm up the model with a short silent audio to trigger download/load
+        import mlx_whisper
+        mlx_whisper.transcribe(
+            np.zeros(16000, dtype=np.float32),
+            path_or_hf_repo=self._mlx_model_path,
+            language="en",
+        )
+        self._model = "mlx"  # sentinel; mlx-whisper is stateless
+        logger.info("Whisper model loaded (mlx, Metal GPU).")
+
+    def _load_model_faster_whisper(self) -> None:
         try:
             from faster_whisper import WhisperModel
         except Exception as exc:  # noqa: BLE001
@@ -269,29 +330,30 @@ class TranscriptionWorker:
                 "faster-whisper is not installed correctly. Install dependencies before running."
             ) from exc
         logger.info(
-            "Loading whisper model=%s device=%s compute_type=%s",
+            "Loading whisper model=%s device=%s compute_type=%s backend=faster-whisper",
             self._model_name,
             self._device,
             self._compute_type,
         )
-        if str(self._model_name).strip().lower().endswith(".en"):
-            logger.warning(
-                "Whisper model '%s' is English-only. Non-English speech may be mistranscribed. "
-                "Use a multilingual model (for example 'base' or 'small') with language=auto.",
-                self._model_name,
-            )
         self._model = WhisperModel(
             self._model_name,
             device=self._device,
             compute_type=self._compute_type,
         )
-        logger.info("Whisper model loaded.")
+        logger.info("Whisper model loaded (faster-whisper, CPU).")
 
     def _transcribe(self, segment: AudioSegment) -> str:
         if self._model is None:
             return ""
-        # Convert PCM16 mono to float32 in [-1, 1] for faster-whisper.
-        audio = np.frombuffer(segment.pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+        # Convert PCM16 to float32 in [-1, 1], downmixing stereo to mono if needed.
+        raw = np.frombuffer(segment.pcm_s16le, dtype=np.int16).astype(np.float32) / 32768.0
+        if segment.channels >= 2:
+            usable = raw.size - (raw.size % segment.channels)
+            if usable == 0:
+                return ""
+            audio = raw[:usable].reshape(-1, segment.channels).mean(axis=1)
+        else:
+            audio = raw
         is_system_audio = segment.source_id.startswith("system-audio")
         signal_dbfs = self._signal_dbfs(audio)
         min_signal_threshold = self._system_audio_min_signal_dbfs if is_system_audio else self._min_signal_dbfs
@@ -347,6 +409,49 @@ class TranscriptionWorker:
     ) -> str:
         if self._model is None:
             return ""
+        if self._backend == "mlx":
+            return self._transcribe_once_mlx(
+                audio=audio, language=language, beam_size=beam_size, best_of=best_of,
+                no_speech_threshold=no_speech_threshold,
+            )
+        return self._transcribe_once_faster_whisper(
+            audio=audio, language=language, vad_filter=vad_filter, beam_size=beam_size,
+            best_of=best_of, no_speech_threshold=no_speech_threshold,
+        )
+
+    def _transcribe_once_mlx(
+        self,
+        *,
+        audio: np.ndarray,
+        language: str | None,
+        beam_size: int,
+        best_of: int,
+        no_speech_threshold: float,
+    ) -> str:
+        import mlx_whisper
+        kwargs: dict = {
+            "path_or_hf_repo": self._mlx_model_path,
+            "task": "transcribe",
+            "no_speech_threshold": no_speech_threshold,
+            "condition_on_previous_text": self._condition_on_previous_text,
+            "without_timestamps": True,
+        }
+        # mlx-whisper does not support beam search; skip beam_size and best_of
+        if language:
+            kwargs["language"] = language
+        result = mlx_whisper.transcribe(audio, **kwargs)
+        return (result.get("text") or "").strip()
+
+    def _transcribe_once_faster_whisper(
+        self,
+        *,
+        audio: np.ndarray,
+        language: str | None,
+        vad_filter: bool,
+        beam_size: int,
+        best_of: int,
+        no_speech_threshold: float,
+    ) -> str:
         parts, _ = self._model.transcribe(
             audio,
             language=language,
