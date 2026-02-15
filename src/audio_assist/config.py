@@ -22,18 +22,19 @@ class Settings(BaseSettings):
     segment_overlap_seconds: float = 0.6
     max_query_results: int = 8
 
-    whisper_model: str = "base"
+    whisper_backend: str = "mlx"
+    whisper_model: str = "medium"
     whisper_compute_type: str = "int8"
     whisper_device: str = "cpu"
-    whisper_language: str = "auto"
+    whisper_language: str = "en"
     whisper_beam_size: int = 1
     whisper_best_of: int = 1
     whisper_vad_filter: bool = True
-    whisper_system_audio_vad_filter: bool = False
+    whisper_system_audio_vad_filter: bool = True
     whisper_no_speech_threshold: float = 1.0
     whisper_system_audio_no_speech_threshold: float = 1.0
     whisper_min_signal_dbfs: float = -70.0
-    whisper_system_audio_min_signal_dbfs: float = -96.0
+    whisper_system_audio_min_signal_dbfs: float = -50.0
     whisper_fallback_on_empty: bool = True
     whisper_fallback_beam_size: int = 2
     whisper_fallback_best_of: int = 2
@@ -77,7 +78,7 @@ class Settings(BaseSettings):
     capture_autostart_enabled: bool = True
     capture_autostart_mic_enabled: bool = True
     capture_autostart_mic_source_id: str = "desk-mic"
-    capture_autostart_mic_device: str | int | None = None
+    capture_autostart_mic_device: str | int | None = "MacBook Pro Microphone"
     capture_autostart_retry_cooldown_seconds: float = 90.0
     capture_autostart_system_audio_enabled: bool = True
     capture_autostart_system_audio_source_id: str = "system-audio"
@@ -85,6 +86,10 @@ class Settings(BaseSettings):
     capture_autostart_system_audio_channels: int = 2
     capture_autostart_system_audio_ffmpeg_input: str | None = None
     capture_autostart_system_audio_ffmpeg_input_format: str | None = None
+    capture_autostart_app_audio_enabled: bool = True
+    capture_autostart_app_audio_source_id: str = "app-audio"
+    capture_autostart_app_audio_device: str | int | None = "CaptureAudio 2ch"
+    capture_autostart_app_audio_channels: int = 2
     capture_watchdog_enabled: bool = True
     capture_watchdog_interval_seconds: float = 20.0
 
@@ -100,6 +105,12 @@ class Settings(BaseSettings):
     speaker_backfill_batch_size: int = 24
     speaker_backfill_since_seconds: int = 4 * 3600
 
+    # Speaker verification (voice enrollment)
+    speaker_verification_enabled: bool = False
+    speaker_embedding_model: str = "speechbrain/spkrec-ecapa-voxceleb"
+    speaker_similarity_threshold: float = 0.25
+    owner_speaker_profile_id: int | None = None
+
     orchestrator_enabled: bool = True
     orchestrator_poll_interval_seconds: float = 8.0
     orchestrator_preparing_timeout_seconds: float = 15.0
@@ -109,6 +120,12 @@ class Settings(BaseSettings):
     noise_suppression_enabled: bool = True
     noise_suppression_prop_decrease: float = 0.85
     noise_suppression_stationary: bool = True
+
+    aec_enabled: bool = False
+    aec_filter_length: int = 2048
+    aec_step_size: float = 0.1
+    aec_fixed_delay_ms: float = 0.0
+    aec_reference_buffer_seconds: float = 15.0
 
     calendar_match_enabled: bool = False
     google_sync_service_url: str = "http://127.0.0.1:8792"
@@ -121,6 +138,16 @@ class Settings(BaseSettings):
     google_sync_autostart_timeout_seconds: float = 12.0
     google_sync_autostart_cwd: Path | None = None
     google_sync_client_secret_path: Path | None = None
+
+    # Screen capture service
+    screen_capture_enabled: bool = False
+    screen_capture_interval_seconds: int = 15
+    screen_capture_quality: int = 50
+    screen_capture_scale: float = 0.5
+    screen_capture_format: str = "webp"
+    screen_capture_dir: Path = Field(default_factory=lambda: Path("data/screen_captures"))
+    screen_capture_service_url: str = "http://127.0.0.1:8794"
+    screen_capture_max_frames_per_session: int = 1000
 
 
 settings = Settings()
