@@ -14,10 +14,24 @@ Architecture (Zoom mode — Conference bridge):
   Leg 2: Twilio calls Vapi inbound number, joins same Conference
   Conference handles echo cancellation between the two legs.
 
+Architecture (Zoom SDK mode — native, low-latency):
+
+    Zoom Meeting
+        ↕  (native SDK audio)
+    OrbStack VM (zoom-bot.orb.local:8795)
+        ├─ Deepgram STT  (WebSocket)
+        ├─ Groq LLM      (HTTPS)
+        └─ ElevenLabs TTS (HTTPS)
+
+  No PSTN hops — direct audio via Zoom Meeting SDK.
+
 For direct calls: Vapi calls the number directly with the AI assistant.
 
 Usage:
-  # AI joins a Zoom meeting (max 3 minutes)
+  # AI joins a Zoom meeting via native SDK (low latency)
+  scripts/ai-call.py --zoom-sdk --meeting-id "81474349298" --passcode "560109"
+
+  # AI joins a Zoom meeting via conference bridge (higher latency)
   scripts/ai-call.py --zoom-number "+16465588656" --meeting-id "81474349298" --passcode "560109"
 
   # AI calls a phone number directly
@@ -29,6 +43,12 @@ Usage:
   # Check call status
   scripts/ai-call.py --status CA1234567890abcdef
 
+  # Leave a Zoom SDK meeting
+  scripts/ai-call.py --zoom-sdk --leave
+
+  # Check Zoom SDK bot status
+  scripts/ai-call.py --zoom-sdk --bot-status
+
 Credentials loaded from env vars or ~/mark-sebast/apps/phone-agent/.env
 """
 
@@ -39,6 +59,7 @@ import os
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -329,6 +350,93 @@ def check_status(call_sid: str, creds: dict):
 
 
 # ---------------------------------------------------------------------------
+# Zoom SDK (native, low-latency via OrbStack VM)
+# ---------------------------------------------------------------------------
+
+ZOOM_BOT_URL = "http://zoom-bot.orb.local:8795"
+
+
+def _zoom_sdk_request(method: str, endpoint: str, payload: dict | None = None):
+    """Make a request to the zoom-bot service in OrbStack VM."""
+    url = f"{ZOOM_BOT_URL}{endpoint}"
+    headers = {"Content-Type": "application/json"}
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        # Read the error response body for details
+        try:
+            err_body = json.loads(exc.read())
+            return {"state": "error", "error": err_body.get("detail", str(exc))}
+        except Exception:
+            return {"state": "error", "error": str(exc)}
+    except urllib.error.URLError as exc:
+        if "Connection refused" in str(exc) or "Name or service not known" in str(exc):
+            print(f"Error: Cannot reach zoom-bot at {ZOOM_BOT_URL}")
+            print("  Is the VM running?  scripts/zoom-bot-service.sh status")
+            sys.exit(1)
+        raise
+    except Exception as exc:
+        if "RemoteDisconnected" in type(exc).__name__ or "RemoteDisconnected" in str(exc):
+            return {"state": "error", "error": "Bot process crashed or timed out. Check: scripts/zoom-bot-service.sh logs"}
+        raise
+
+
+def zoom_sdk_join(meeting_id: str, passcode: str, system_prompt: str, max_duration: int):
+    """Join a Zoom meeting via native SDK (low-latency path)."""
+    meeting_id_clean = meeting_id.replace(" ", "").replace("-", "")
+    print(f"Joining meeting {meeting_id_clean} via Zoom SDK (max {max_duration}s)...")
+    print(f"  Bot service: {ZOOM_BOT_URL}")
+
+    result = _zoom_sdk_request("POST", "/join", {
+        "meeting_id": meeting_id_clean,
+        "passcode": passcode or "",
+        "prompt": system_prompt,
+        "max_duration": max_duration,
+    })
+
+    state = result.get("state", "unknown")
+    print(f"  State: {state}")
+    if result.get("error"):
+        error = result["error"]
+        print(f"  Error: {error}")
+        if "JWTTOKENWRONG" in error:
+            print()
+            print("  The JWT was rejected by Zoom. This usually means the Meeting SDK")
+            print("  feature is not enabled on your Zoom app. To fix:")
+            print("    1. Go to https://marketplace.zoom.us → your app → Features → Embed")
+            print("    2. Enable the 'Meeting SDK' toggle")
+            print("    3. Save and try again")
+    else:
+        print(f"\nAI assistant joined meeting {meeting_id_clean}")
+        print(f"  Leave:  scripts/ai-call.py --zoom-sdk --leave")
+        print(f"  Status: scripts/ai-call.py --zoom-sdk --bot-status")
+
+
+def zoom_sdk_leave():
+    """Leave the current Zoom SDK meeting."""
+    print("Leaving Zoom SDK meeting...")
+    result = _zoom_sdk_request("POST", "/leave")
+    print(f"  State: {result.get('state', 'unknown')}")
+
+
+def zoom_sdk_status():
+    """Check the zoom-bot service status."""
+    result = _zoom_sdk_request("GET", "/status")
+    print(f"State:     {result.get('state', 'unknown')}")
+    print(f"Meeting:   {result.get('meeting_id', '-')}")
+    uptime = result.get("uptime_seconds")
+    if uptime is not None:
+        print(f"Uptime:    {uptime}s")
+    if result.get("error"):
+        print(f"Error:     {result['error']}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -339,16 +447,41 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--phone", help="Phone number to call directly (E.164)")
-    parser.add_argument("--zoom-number", help="Zoom dial-in number")
+    parser.add_argument("--zoom-number", help="Zoom dial-in number (conference bridge path)")
+    parser.add_argument("--zoom-sdk", action="store_true",
+                        help="Use native Zoom SDK (low-latency, via OrbStack VM)")
     parser.add_argument("--meeting-id", help="Zoom meeting ID")
     parser.add_argument("--passcode", help="Zoom meeting passcode")
     parser.add_argument("--prompt", help="Custom system prompt for the AI")
     parser.add_argument("--max-duration", type=int, default=180,
                         help="Max call duration in seconds (default: 180)")
     parser.add_argument("--from-number", help="Override Twilio caller ID (E.164)")
-    parser.add_argument("--status", help="Check call status by SID", metavar="CALL_SID")
+    parser.add_argument("--status", help="Check Twilio call status by SID", metavar="CALL_SID")
+    parser.add_argument("--leave", action="store_true",
+                        help="Leave the current Zoom SDK meeting")
+    parser.add_argument("--bot-status", action="store_true",
+                        help="Check zoom-bot service status")
 
     args = parser.parse_args()
+
+    # Zoom SDK commands
+    if args.zoom_sdk:
+        if args.leave:
+            zoom_sdk_leave()
+            return
+        if args.bot_status:
+            zoom_sdk_status()
+            return
+        if not args.meeting_id:
+            print("Error: --meeting-id required with --zoom-sdk")
+            sys.exit(1)
+        zoom_sdk_join(
+            args.meeting_id,
+            args.passcode or "",
+            args.prompt or DEFAULT_PROMPT,
+            args.max_duration,
+        )
+        return
 
     if not args.phone and not args.zoom_number and not args.status:
         parser.print_help()
