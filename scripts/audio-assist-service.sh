@@ -16,10 +16,11 @@ else
   APP_CMD=("audio-assist")
 fi
 
-# Audio forwarding daemon (app audio)
+# Audio forwarding daemon (app audio) — C binary for low-latency AUHAL
 FORWARD_PID_FILE="$ROOT_DIR/data/run/audio-forward.pid"
 FORWARD_LOG="$ROOT_DIR/data/logs/audio-forward.log"
-FORWARD_CMD=("$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/audio-forward.py")
+FORWARD_BINARY="$ROOT_DIR/driver/build/audio-forward"
+FORWARD_CMD=("$FORWARD_BINARY")
 
 # Mic forwarding daemon (physical mic -> CaptureMic 2ch)
 # Uses the Python multi-mic mixer for Tauri app integration:
@@ -69,13 +70,28 @@ is_running() {
 }
 
 forward_is_running() {
-  [[ -f "$FORWARD_PID_FILE" ]] && kill -0 "$(cat "$FORWARD_PID_FILE")" 2>/dev/null
+  if [[ -f "$FORWARD_PID_FILE" ]] && kill -0 "$(cat "$FORWARD_PID_FILE")" 2>/dev/null; then
+    return 0
+  fi
+  # Also check for C binary running without PID file
+  local pid
+  pid="$(pgrep -f 'driver/build/audio-forward' 2>/dev/null | head -1 || true)"
+  if [[ -n "$pid" ]]; then
+    echo "$pid" > "$FORWARD_PID_FILE"
+    return 0
+  fi
+  return 1
 }
 
 start_forward() {
   if forward_is_running; then
     echo "audio-forward already running (pid $(cat "$FORWARD_PID_FILE"))."
     return 0
+  fi
+  # Auto-build if C binary missing or source changed
+  if [[ ! -x "$FORWARD_BINARY" ]] || [[ "$ROOT_DIR/driver/audio-forward.c" -nt "$FORWARD_BINARY" ]]; then
+    echo "Building audio-forward..."
+    make -C "$ROOT_DIR/driver" -f Makefile.audio-forward 2>&1
   fi
   echo "Starting audio-forward..."
   nohup "${FORWARD_CMD[@]}" >>"$FORWARD_LOG" 2>&1 &
@@ -84,6 +100,8 @@ start_forward() {
 }
 
 stop_forward() {
+  # Kill any leftover Python audio-forward
+  pkill -f 'audio-forward.py' 2>/dev/null || true
   if ! forward_is_running; then
     rm -f "$FORWARD_PID_FILE"
     return 0

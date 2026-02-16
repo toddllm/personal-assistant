@@ -109,8 +109,10 @@ check_port "discord-bot" 8796
 check_port "voice-chat" 8797
 
 # Check daemons (no port, use process name)
-if pgrep -f "audio-forward.py" >/dev/null 2>&1; then
-  ok "audio-forward daemon running"
+if pgrep -f "driver/build/audio-forward" >/dev/null 2>&1; then
+  ok "audio-forward daemon running (C)"
+elif pgrep -f "audio-forward.py" >/dev/null 2>&1; then
+  warn "audio-forward daemon running (Python — high latency, use C version)"
 else
   warn "audio-forward daemon NOT running"
 fi
