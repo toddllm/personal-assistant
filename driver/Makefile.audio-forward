@@ -1,0 +1,21 @@
+# audio-forward — Low-latency C daemon that forwards CaptureAudio 2ch
+# to all physical output devices via AUHAL AudioUnits.
+# Replaces the Python scripts/audio-forward.py for lower latency.
+
+BUILD_DIR = build
+
+.PHONY: audio-forward clean
+
+audio-forward: $(BUILD_DIR)/audio-forward
+
+$(BUILD_DIR)/audio-forward: audio-forward.c
+	@mkdir -p $(BUILD_DIR)
+	clang -std=gnu11 -Os -Wall \
+	    -framework CoreAudio \
+	    -framework AudioToolbox \
+	    -framework CoreFoundation \
+	    -o $@ $<
+	@echo "==> Built: $@"
+
+clean:
+	rm -f $(BUILD_DIR)/audio-forward

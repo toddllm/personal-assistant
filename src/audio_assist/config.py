@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     capture_autostart_app_audio_source_id: str = "app-audio"
     capture_autostart_app_audio_device: str | int | None = "CaptureAudio 2ch"
     capture_autostart_app_audio_channels: int = 2
-    capture_autostart_bose_mic_enabled: bool = True
+    capture_autostart_bose_mic_enabled: bool = False  # Opens Bose mic, forces HFP (16kHz mono)
     capture_autostart_bose_mic_source_id: str = "bose-mic"
     capture_autostart_bose_mic_device: str | int | None = "Bose QC45"
     capture_autostart_bose_mic_channels: int = 1
@@ -149,8 +149,21 @@ class Settings(BaseSettings):
     audio_forward_target_devices: str = "MacBook Pro Speakers,Bose QC45"
     audio_forward_sample_rate: int = 48_000
     audio_forward_channels: int = 2
-    audio_forward_blocksize: int = 512
+    audio_forward_blocksize: int = 128
     audio_forward_latency: str = "low"
+
+    # Mic forwarding (physical mics → CaptureMic 2ch)
+    mic_forward_enabled: bool = True
+    mic_forward_source_devices: str = "Bose QC45,MacBook Pro Microphone"
+    mic_forward_target_device: str = "CaptureMic 2ch"
+    mic_forward_sample_rate: int = 48_000
+    mic_forward_channels: int = 2
+    mic_forward_blocksize: int = 128
+
+    # Auto-discovery for audio hub
+    audio_hub_excluded_devices: str = "CaptureMic,CaptureAudio,BlackHole,Aggregate Device,Multi-Output Device,ZoomAudioDevice,Cluely,Microsoft Teams Audio"
+    mic_forward_auto_discover: bool = True
+    audio_forward_auto_discover: bool = True
 
     # Screen capture service
     screen_capture_enabled: bool = False

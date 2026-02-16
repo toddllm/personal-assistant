@@ -20,10 +20,13 @@ Configuration via AUDIO_ASSIST_* environment variables:
     AUDIO_ASSIST_AUDIO_FORWARD_TARGET_DEVICES="MacBook Pro Speakers,Bose QC45"
 """
 
+import json
 import logging
 import os
 import signal
+import subprocess
 import sys
+import tempfile
 import threading
 from queue import Empty, Full, Queue
 
@@ -48,6 +51,70 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("audio-forward")
+
+# ---------------------------------------------------------------------------
+# Auto-discovery config
+# ---------------------------------------------------------------------------
+AUTO_DISCOVER = settings.audio_forward_auto_discover
+EXCLUDED_SUBSTRINGS = [s.strip().lower() for s in settings.audio_hub_excluded_devices.split(",") if s.strip()]
+DISCOVERY_INTERVAL = 5.0
+SPEAKER_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "data", "speaker-settings.json")
+
+# Track output writer threads by device name
+_output_threads: dict[str, threading.Thread] = {}
+_output_threads_lock = threading.Lock()
+
+
+def _is_excluded(name: str) -> bool:
+    name_lower = name.lower()
+    return any(ex in name_lower for ex in EXCLUDED_SUBSTRINGS)
+
+
+def _load_speaker_settings() -> dict[str, dict]:
+    try:
+        with open(SPEAKER_SETTINGS_PATH) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_speaker_settings(data: dict[str, dict]) -> None:
+    os.makedirs(os.path.dirname(SPEAKER_SETTINGS_PATH), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(SPEAKER_SETTINGS_PATH), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, SPEAKER_SETTINGS_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _slugify(name: str) -> str:
+    return name.lower().replace(" ", "-")
+
+
+def _discover_output_devices_subprocess() -> list[str]:
+    """Discover all physical output devices via a subprocess."""
+    script = (
+        "import json, sounddevice as sd; "
+        "devs = sd.query_devices(); "
+        "print(json.dumps([d['name'] for d in devs if d['max_output_channels'] > 0]))"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        names = json.loads(result.stdout.strip())
+        return [n for n in names if not _is_excluded(n)]
+    except Exception:
+        log.debug("discovery subprocess error", exc_info=True)
+        return []
+
 
 # ---------------------------------------------------------------------------
 # Device discovery
@@ -76,7 +143,6 @@ def check_device_exists_subprocess(name: str, kind: str) -> bool:
     Spawns a subprocess so that PortAudio re-scans the device list
     without disrupting any active streams in this process.
     """
-    import subprocess
     script = (
         "import sounddevice as sd; "
         f"devs = sd.query_devices(); "
@@ -98,22 +164,32 @@ def check_device_exists_subprocess(name: str, kind: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def resample(data: np.ndarray, from_rate: int, to_rate: int) -> np.ndarray:
-    """Resample audio data using linear interpolation.
+class StreamingResampler:
+    """Lightweight streaming resampler using linear interpolation.
 
-    Handles both mono (n_samples,) and multi-channel (n_samples, channels).
+    Tracks fractional sample position across blocks to prevent sample
+    count drift (which causes crackling over time). Zero internal
+    buffering — no added latency.
     """
-    if from_rate == to_rate:
-        return data
-    ratio = to_rate / from_rate
-    n_out = max(1, int(len(data) * ratio))
-    indices = np.linspace(0, len(data) - 1, n_out)
-    if data.ndim == 1:
-        return np.interp(indices, np.arange(len(data)), data).astype(data.dtype)
-    result = np.empty((n_out, data.shape[1]), dtype=data.dtype)
-    for ch in range(data.shape[1]):
-        result[:, ch] = np.interp(indices, np.arange(len(data)), data[:, ch])
-    return result
+
+    def __init__(self, from_rate: int, to_rate: int):
+        self.ratio = to_rate / from_rate
+        self.frac = 0.0  # accumulated fractional sample carry-over
+
+    def process(self, data: np.ndarray) -> np.ndarray:
+        n_in = len(data)
+        exact_out = n_in * self.ratio + self.frac
+        n_out = int(exact_out)
+        self.frac = exact_out - n_out
+        if n_out == 0:
+            return np.empty((0,) + data.shape[1:], dtype=data.dtype)
+        indices = np.linspace(0, n_in - 1, n_out)
+        if data.ndim == 1:
+            return np.interp(indices, np.arange(n_in), data).astype(data.dtype)
+        result = np.empty((n_out, data.shape[1]), dtype=data.dtype)
+        for ch in range(data.shape[1]):
+            result[:, ch] = np.interp(indices, np.arange(n_in), data[:, ch])
+        return result
 
 
 def downmix_to_mono(data: np.ndarray) -> np.ndarray:
@@ -184,6 +260,7 @@ def _input_reader(source_name: str, source_rate: int, source_channels: int) -> N
                 channels=source_channels,
                 blocksize=blocksize,
                 dtype="float32",
+                latency="low",
             ) as stream:
                 log.info("input reader active")
                 while not _shutdown.is_set() and not _reinit_needed.is_set():
@@ -195,7 +272,15 @@ def _input_reader(source_name: str, source_rate: int, source_channels: int) -> N
                             try:
                                 q.put_nowait(data.copy())
                             except Full:
-                                pass  # target can't keep up, drop frame
+                                # Drop oldest frame to keep latency bounded
+                                try:
+                                    q.get_nowait()
+                                except Empty:
+                                    pass
+                                try:
+                                    q.put_nowait(data.copy())
+                                except Full:
+                                    pass
                 if _reinit_needed.is_set():
                     log.info("input reader: closing for PortAudio reinit")
         except sd.PortAudioError as exc:
@@ -231,6 +316,14 @@ def _output_writer(
     connected; if not, tears down and retries.
     """
     while not _shutdown.is_set():
+        # Check speaker-settings — pause if disabled
+        if AUTO_DISCOVER:
+            slug = _slugify(target_name)
+            spk = _load_speaker_settings()
+            if slug in spk and not spk[slug].get("enabled", True):
+                _shutdown.wait(DISCOVERY_INTERVAL)
+                continue
+
         # Wait during reinit
         if _reinit_needed.is_set():
             _shutdown.wait(1.0)
@@ -269,8 +362,14 @@ def _output_writer(
                  " [resample]" if needs_resample else "",
                  " [downmix]" if needs_downmix else "")
 
+        # Create streaming resampler (tracks fractional samples across blocks)
+        resampler = None
+        if needs_resample:
+            resampler = StreamingResampler(source_rate, target_rate)
+
         # Register queue so input reader feeds us frames
-        q: Queue = Queue(maxsize=200)
+        # Queue bounds latency: 12 * blocksize/rate ≈ 32ms at 128/48kHz
+        q: Queue = Queue(maxsize=12)
         with _queues_lock:
             _target_queues[target_name] = q
 
@@ -295,7 +394,7 @@ def _output_writer(
                 samplerate=target_rate,
                 channels=target_channels,
                 dtype="float32",
-                latency=settings.audio_forward_latency,
+                latency=0.005,
             ) as stream:
                 log.info("[%s] active", target_name)
 
@@ -309,9 +408,9 @@ def _output_writer(
                     if needs_downmix:
                         data = downmix_to_mono(data)
 
-                    # Resample (48kHz -> target rate)
-                    if needs_resample:
-                        data = resample(data, source_rate, target_rate)
+                    # Resample (48kHz -> target rate) — streaming, stateful
+                    if resampler is not None:
+                        data = resampler.process(data)
 
                     try:
                         stream.write(data)
@@ -351,6 +450,59 @@ def _output_writer(
 
 
 # ---------------------------------------------------------------------------
+# Output discovery thread
+# ---------------------------------------------------------------------------
+
+
+def _output_discovery_thread(source_rate: int, source_channels: int) -> None:
+    """Periodically scan for new output devices and start writer threads."""
+    while not _shutdown.is_set():
+        _shutdown.wait(DISCOVERY_INTERVAL)
+        if _shutdown.is_set():
+            break
+        try:
+            discovered = _discover_output_devices_subprocess()
+            speaker_settings = _load_speaker_settings()
+            settings_changed = False
+
+            for dev_name in discovered:
+                slug = _slugify(dev_name)
+
+                # Check speaker-settings — skip if disabled
+                if slug in speaker_settings and not speaker_settings[slug].get("enabled", True):
+                    continue
+
+                # Auto-populate speaker settings
+                if slug not in speaker_settings:
+                    speaker_settings[slug] = {"enabled": True}
+                    settings_changed = True
+
+                with _output_threads_lock:
+                    if dev_name in _output_threads and _output_threads[dev_name].is_alive():
+                        continue
+
+                # New device found
+                log.info("discovered new output: %s [%s]", dev_name, slug)
+                t = threading.Thread(
+                    target=_output_writer,
+                    args=(dev_name, source_rate, source_channels),
+                    name=f"out-{dev_name}",
+                    daemon=True,
+                )
+                t.start()
+                with _output_threads_lock:
+                    _output_threads[dev_name] = t
+                log.info("started output thread for discovered '%s'", dev_name)
+
+            if settings_changed:
+                _save_speaker_settings(speaker_settings)
+        except Exception:
+            log.debug("output discovery thread error", exc_info=True)
+
+    log.info("output discovery thread stopped")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -365,13 +517,34 @@ def main() -> None:
     source_channels = settings.audio_forward_channels
     target_names = [t.strip() for t in settings.audio_forward_target_devices.split(",") if t.strip()]
 
+    log.info("audio-forward starting")
+    log.info("  source: %s (%dch @ %d Hz)", source_name, source_channels, source_rate)
+    log.info("  seed targets: %s", target_names)
+    log.info("  auto-discover: %s", AUTO_DISCOVER)
+
+    # If auto-discover, also scan for devices now
+    if AUTO_DISCOVER:
+        speaker_settings = _load_speaker_settings()
+        discovered = _discover_output_devices_subprocess()
+        settings_changed = False
+        for dev_name in discovered:
+            slug = _slugify(dev_name)
+            # Auto-populate speaker settings
+            if slug not in speaker_settings:
+                speaker_settings[slug] = {"enabled": True}
+                settings_changed = True
+            # Skip disabled devices
+            if not speaker_settings[slug].get("enabled", True):
+                continue
+            if dev_name not in target_names:
+                target_names.append(dev_name)
+                log.info("  discovered: %s", dev_name)
+        if settings_changed:
+            _save_speaker_settings(speaker_settings)
+
     if not target_names:
         log.error("no target devices configured")
         return
-
-    log.info("audio-forward starting")
-    log.info("  source: %s (%dch @ %d Hz)", source_name, source_channels, source_rate)
-    log.info("  targets: %s", target_names)
 
     def _handle_signal(signum, frame):
         sig = signal.Signals(signum).name
@@ -402,7 +575,21 @@ def main() -> None:
         )
         t.start()
         output_threads.append(t)
+        with _output_threads_lock:
+            _output_threads[target_name] = t
         log.info("started output thread for '%s'", target_name)
+
+    # Discovery thread (if auto-discover enabled)
+    if AUTO_DISCOVER:
+        t = threading.Thread(
+            target=_output_discovery_thread,
+            args=(source_rate, source_channels),
+            name="output-discovery",
+            daemon=True,
+        )
+        t.start()
+        output_threads.append(t)
+        log.info("started output discovery thread (interval=%.0fs)", DISCOVERY_INTERVAL)
 
     # Wait for shutdown signal
     _shutdown.wait()
