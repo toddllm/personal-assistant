@@ -22,9 +22,16 @@ FORWARD_LOG="$ROOT_DIR/data/logs/audio-forward.log"
 FORWARD_CMD=("$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/audio-forward.py")
 
 # Mic forwarding daemon (physical mic -> CaptureMic 2ch)
+# Uses the Python multi-mic mixer for Tauri app integration:
+#   - Per-mic gain/enable via data/mic-settings.json
+#   - Live dBFS levels via data/mic-levels.json
+#   - Auto-discovery of new input devices
+# IMPORTANT: Bose QC45 mic must stay disabled (enabled=false in
+# mic-settings.json) to prevent Bluetooth HFP mode, which degrades
+# Bose output quality from 44.1kHz stereo (A2DP) to 16kHz mono.
 MIC_FWD_PID_FILE="$ROOT_DIR/data/run/mic-forward.pid"
 MIC_FWD_LOG="$ROOT_DIR/data/logs/mic-forward.log"
-MIC_FWD_BIN="$ROOT_DIR/driver/build/mic-forward"
+MIC_FWD_CMD=("$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/mic-forward.py")
 
 listener_pid() {
   lsof -tiTCP:8787 -sTCP:LISTEN 2>/dev/null | head -n 1 || true
@@ -107,16 +114,8 @@ start_mic_forward() {
     echo "mic-forward already running (pid $(cat "$MIC_FWD_PID_FILE"))."
     return 0
   fi
-  if [[ ! -x "$MIC_FWD_BIN" ]]; then
-    echo "Building mic-forward..."
-    make -C "$ROOT_DIR/driver" -f Makefile.mic-forward mic-forward
-    if [[ ! -x "$MIC_FWD_BIN" ]]; then
-      echo "mic-forward build failed."
-      return 1
-    fi
-  fi
-  echo "Starting mic-forward..."
-  nohup "$MIC_FWD_BIN" >>"$MIC_FWD_LOG" 2>&1 &
+  echo "Starting mic-forward (Python multi-mic mixer)..."
+  nohup "${MIC_FWD_CMD[@]}" >>"$MIC_FWD_LOG" 2>&1 &
   echo $! >"$MIC_FWD_PID_FILE"
   echo "mic-forward started (pid $!)."
 }
