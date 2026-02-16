@@ -109,8 +109,8 @@ check_port "discord-bot" 8796
 check_port "voice-chat" 8797
 
 # Check daemons (no port, use process name)
-if pgrep -f "driver/build/audio-forward" >/dev/null 2>&1; then
-  ok "audio-forward daemon running (C)"
+if pgrep -f "audio-forward-rs/target/release/audio-forward" >/dev/null 2>&1; then
+  ok "audio-forward daemon running (Rust)"
 elif pgrep -f "audio-forward.py" >/dev/null 2>&1; then
   warn "audio-forward daemon running (Python — high latency, use C version)"
 else
@@ -121,16 +121,16 @@ if pgrep -f "mic-forward.py" >/dev/null 2>&1; then
   ok "mic-forward (Python) daemon running"
 else
   # Check if C binary is running instead
-  if pgrep -f "driver/build/mic-forward" >/dev/null 2>&1; then
-    warn "mic-forward C binary running (should be Python for Tauri integration)"
-    info "The C binary doesn't write mic-levels.json or read mic-settings.json"
+  if pgrep -f "mic-forward" >/dev/null 2>&1; then
+    warn "mic-forward binary running (should be Python for Tauri integration)"
+    info "The binary doesn't write mic-levels.json or read mic-settings.json"
   else
     warn "mic-forward daemon NOT running"
   fi
 fi
 
 # Check for stale C mic-forward (should NOT be running alongside Python)
-if pgrep -f "mic-forward.py" >/dev/null 2>&1 && pgrep -f "driver/build/mic-forward" >/dev/null 2>&1; then
+if pgrep -f "mic-forward.py" >/dev/null 2>&1 && pgrep -xf "mic-forward" >/dev/null 2>&1; then
   fail "BOTH Python and C mic-forward running! They'll double-write to CaptureMic 2ch"
   info "Fix: kill the C binary: kill \$(pgrep -f 'driver/build/mic-forward')"
 fi

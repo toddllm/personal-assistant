@@ -4,20 +4,19 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PID_FILE="$ROOT_DIR/data/run/audio-forward.pid"
 LOG_FILE="$ROOT_DIR/data/logs/audio-forward.log"
-BINARY="$ROOT_DIR/driver/build/audio-forward"
-BINARY_SRC="$ROOT_DIR/driver/audio-forward.c"
-MAKEFILE="$ROOT_DIR/driver/Makefile.audio-forward"
+BINARY="$ROOT_DIR/driver/audio-forward-rs/target/release/audio-forward"
+CARGO_DIR="$ROOT_DIR/driver/audio-forward-rs"
 
 LAUNCHD_LABEL="com.tdeshane.audioforward"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
 
 mkdir -p "$ROOT_DIR/data/run" "$ROOT_DIR/data/logs"
 
-# Auto-build if source is newer than binary
+# Auto-build if binary missing or source changed
 build_if_needed() {
-  if [[ ! -f "$BINARY" ]] || [[ "$BINARY_SRC" -nt "$BINARY" ]]; then
-    echo "Building audio-forward..."
-    make -C "$ROOT_DIR/driver" -f Makefile.audio-forward 2>&1
+  if [[ ! -f "$BINARY" ]] || [[ "$CARGO_DIR/src/main.rs" -nt "$BINARY" ]] || [[ "$CARGO_DIR/Cargo.toml" -nt "$BINARY" ]]; then
+    echo "Building audio-forward (Rust)..."
+    cargo build --release --manifest-path "$CARGO_DIR/Cargo.toml" 2>&1
   fi
 }
 
@@ -30,7 +29,7 @@ is_running() {
     fi
   fi
   local pid
-  pid="$(pgrep -f 'driver/build/audio-forward' 2>/dev/null | head -1 || true)"
+  pid="$(pgrep -f 'audio-forward-rs/target/release/audio-forward' 2>/dev/null | head -1 || true)"
   if [[ -n "$pid" ]]; then
     echo "$pid" > "$PID_FILE"
     return 0
@@ -162,7 +161,7 @@ Usage: scripts/audio-forward-service.sh <command>
 
 Routes audio from CaptureAudio 2ch to the active speakers
 (Bose QC45 headphones or MacBook Pro Speakers) using low-latency
-Core Audio AUHAL callbacks (C daemon).
+Core Audio AUHAL callbacks (Rust daemon).
 
 Commands:
   start       Start audio-forward daemon

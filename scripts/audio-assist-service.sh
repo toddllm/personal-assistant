@@ -16,10 +16,11 @@ else
   APP_CMD=("audio-assist")
 fi
 
-# Audio forwarding daemon (app audio) — C binary for low-latency AUHAL
+# Audio forwarding daemon (app audio) — Rust binary for low-latency AUHAL
 FORWARD_PID_FILE="$ROOT_DIR/data/run/audio-forward.pid"
 FORWARD_LOG="$ROOT_DIR/data/logs/audio-forward.log"
-FORWARD_BINARY="$ROOT_DIR/driver/build/audio-forward"
+FORWARD_BINARY="$ROOT_DIR/driver/audio-forward-rs/target/release/audio-forward"
+FORWARD_CARGO_DIR="$ROOT_DIR/driver/audio-forward-rs"
 FORWARD_CMD=("$FORWARD_BINARY")
 
 # Mic forwarding daemon (physical mic -> CaptureMic 2ch)
@@ -75,7 +76,7 @@ forward_is_running() {
   fi
   # Also check for C binary running without PID file
   local pid
-  pid="$(pgrep -f 'driver/build/audio-forward' 2>/dev/null | head -1 || true)"
+  pid="$(pgrep -f 'audio-forward-rs/target/release/audio-forward' 2>/dev/null | head -1 || true)"
   if [[ -n "$pid" ]]; then
     echo "$pid" > "$FORWARD_PID_FILE"
     return 0
@@ -88,10 +89,10 @@ start_forward() {
     echo "audio-forward already running (pid $(cat "$FORWARD_PID_FILE"))."
     return 0
   fi
-  # Auto-build if C binary missing or source changed
-  if [[ ! -x "$FORWARD_BINARY" ]] || [[ "$ROOT_DIR/driver/audio-forward.c" -nt "$FORWARD_BINARY" ]]; then
-    echo "Building audio-forward..."
-    make -C "$ROOT_DIR/driver" -f Makefile.audio-forward 2>&1
+  # Auto-build if Rust binary missing or source changed
+  if [[ ! -x "$FORWARD_BINARY" ]] || [[ "$FORWARD_CARGO_DIR/src/main.rs" -nt "$FORWARD_BINARY" ]] || [[ "$FORWARD_CARGO_DIR/Cargo.toml" -nt "$FORWARD_BINARY" ]]; then
+    echo "Building audio-forward (Rust)..."
+    cargo build --release --manifest-path "$FORWARD_CARGO_DIR/Cargo.toml" 2>&1
   fi
   echo "Starting audio-forward..."
   nohup "${FORWARD_CMD[@]}" >>"$FORWARD_LOG" 2>&1 &

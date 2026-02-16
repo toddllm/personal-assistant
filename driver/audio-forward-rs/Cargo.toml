@@ -1,0 +1,12 @@
+[package]
+name = "audio-forward"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+coreaudio-sys = "0.2"
+core-foundation-sys = "0.8"
+
+[profile.release]
+opt-level = 2
+strip = true
