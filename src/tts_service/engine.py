@@ -319,20 +319,23 @@ class Qwen3CustomVoiceEngine:
                     "Voice cloning unavailable: Base model not loaded. "
                     "Restart service to retry loading."
                 )
-            prompt = self._cached_prompts.get(selected_voice)
-            if prompt is None:
-                prompt = self._clone_model.create_voice_clone_prompt(
+            cached = self._cached_prompts.get(selected_voice)
+            if cached is not None:
+                wavs, sample_rate = self._clone_model.generate_voice_clone(
+                    text=text.strip(),
+                    language=selected_language,
+                    voice_clone_prompt=cached,
+                    **kwargs,
+                )
+            else:
+                wavs, sample_rate = self._clone_model.generate_voice_clone(
+                    text=text.strip(),
+                    language=selected_language,
                     ref_audio=profile["ref_audio_path"],
                     ref_text=profile["ref_text"],
                     x_vector_only_mode=profile.get("x_vector_only", False),
+                    **kwargs,
                 )
-                self._cached_prompts[selected_voice] = prompt
-            wavs, sample_rate = self._clone_model.generate_voice_clone(
-                text=text.strip(),
-                language=selected_language,
-                voice_clone_prompt=self._clone_model._prompt_items_to_voice_clone_prompt(prompt),
-                **kwargs,
-            )
             provider = "qwen3_voice_clone"
         else:
             wavs, sample_rate = self._model.generate_custom_voice(
@@ -383,7 +386,7 @@ class Qwen3CustomVoiceEngine:
             x_vector_only=x_vector_only,
         )
 
-        # Pre-compute clone prompt if Base model is loaded
+        # Pre-compute clone prompt items if Base model is loaded
         if self._clone_model is not None:
             try:
                 prompt = self._clone_model.create_voice_clone_prompt(
