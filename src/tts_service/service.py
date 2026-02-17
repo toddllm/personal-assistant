@@ -511,6 +511,29 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
   .test-input-row { display: flex; gap: 6px; }
   .test-input-row input { flex: 1; }
   .test-input-row .btn { padding: 8px 14px; }
+
+  /* Bot settings bar */
+  .bot-bar {
+    margin-top: 16px; display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  .bot-card {
+    background: #16213e; border: 1px solid #0f3460;
+    border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 260px;
+  }
+  .bot-card-title {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1px; color: #0f3460; margin-bottom: 8px;
+  }
+  .bot-card-row { display: flex; align-items: center; gap: 8px; }
+  .bot-card-row select {
+    flex: 1; font-size: 12px; padding: 6px 8px;
+    background: #1a1a2e; color: #e0e0e0;
+    border: 1px solid #0f3460; border-radius: 4px; outline: none;
+  }
+  .bot-card-row select:focus { border-color: #e94560; }
+  .bot-status { font-size: 10px; color: #555; margin-top: 6px; }
+  .bot-status.connected { color: #00e676; }
+  .bot-status.offline { color: #ff5252; }
 </style>
 </head>
 <body>
@@ -569,6 +592,18 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
       <div class="status-msg" id="status-msg"></div>
     </div>
   </div>
+
+  <!-- Bot Voice Settings -->
+  <div class="bot-bar">
+    <div class="bot-card">
+      <div class="bot-card-title">Discord Bot Voice</div>
+      <div class="bot-card-row">
+        <select id="discord-voice"><option>loading...</option></select>
+        <button class="btn" id="btn-discord-apply">Apply</button>
+      </div>
+      <div class="bot-status" id="discord-status">checking...</div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -595,6 +630,11 @@ async function init() {
   document.getElementById('clone-name').oninput = updateCloneBtn;
   document.getElementById('clone-display').oninput = updateCloneBtn;
   document.getElementById('clone-reftext').oninput = updateCloneBtn;
+
+  // Discord bot voice
+  document.getElementById('btn-discord-apply').onclick = applyDiscordVoice;
+  loadDiscordVoice();
+  setInterval(loadDiscordVoice, 30000);
 }
 
 // --- Voice List ---
@@ -906,6 +946,63 @@ function showStatus(msg, type) {
   if (type === 'ok') setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 5000);
 }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+// --- Discord Bot Voice ---
+const DISCORD_API = 'http://localhost:8796';
+
+async function loadDiscordVoice() {
+  const sel = document.getElementById('discord-voice');
+  const statusEl = document.getElementById('discord-status');
+  try {
+    const r = await fetch(DISCORD_API + '/voice');
+    if (!r.ok) throw new Error('status ' + r.status);
+    const d = await r.json();
+    sel.innerHTML = '';
+    const voices = d.available_voices && d.available_voices.length > 0 ? d.available_voices : [];
+    if (voices.length === 0) {
+      sel.innerHTML = '<option value="">no voices available</option>';
+    } else {
+      voices.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v; opt.textContent = v;
+        if (v === d.voice) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    }
+    statusEl.textContent = 'connected — current: ' + d.voice;
+    statusEl.className = 'bot-status connected';
+  } catch (e) {
+    sel.innerHTML = '<option value="">offline</option>';
+    statusEl.textContent = 'offline — is discord-bot running on :8796?';
+    statusEl.className = 'bot-status offline';
+  }
+}
+
+async function applyDiscordVoice() {
+  const sel = document.getElementById('discord-voice');
+  const voice = sel.value;
+  if (!voice) return;
+  const statusEl = document.getElementById('discord-status');
+  try {
+    const r = await fetch(DISCORD_API + '/voice', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voice }),
+    });
+    const d = await r.json();
+    if (d.voice) {
+      statusEl.textContent = 'voice set to: ' + d.voice;
+      statusEl.className = 'bot-status connected';
+      showStatus('Discord bot voice changed to "' + d.voice + '"', 'ok');
+    } else {
+      statusEl.textContent = d.detail || 'update failed';
+      statusEl.className = 'bot-status offline';
+    }
+  } catch (e) {
+    statusEl.textContent = 'error: ' + e.message;
+    statusEl.className = 'bot-status offline';
+  }
+}
 
 // --- Edit Voice ---
 function showEdit(name) {
