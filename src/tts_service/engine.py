@@ -142,10 +142,14 @@ class TTSResult:
     provider: str
 
 
+QWEN_BASE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+
 class Qwen3CustomVoiceEngine:
     def __init__(self, settings: Settings):
         self._settings = settings
         self._model: Any | None = None
+        self._clone_model: Any | None = None  # Base model for voice cloning
         self._model_lock = Lock()
         self._load_error: str | None = None
         self._supported_voices: list[str] = list(DEFAULT_QWEN_CUSTOM_VOICES)
@@ -258,7 +262,23 @@ class Qwen3CustomVoiceEngine:
             if supported:
                 self._supported_voices = sorted({str(v) for v in supported})
             self._load_error = None
-            logger.info("Qwen3 TTS model loaded.")
+            logger.info("Qwen3 TTS CustomVoice model loaded.")
+
+            # Load the Base model for voice cloning (separate model variant)
+            logger.info("Loading qwen-tts Base model for voice cloning...")
+            try:
+                self._clone_model = Qwen3TTSModel.from_pretrained(
+                    QWEN_BASE_MODEL_ID,
+                    device_map=self._settings.qwen_device_map,
+                    dtype=dtype,
+                    attn_implementation=attn,
+                )
+                logger.info("Qwen3 TTS Base (clone) model loaded.")
+            except Exception:
+                logger.exception(
+                    "Failed to load Base model for voice cloning. "
+                    "Cloned voices will not work, but builtin voices are fine."
+                )
 
             self._migrate_legacy_clones()
             self._precompute_clone_prompts()
@@ -294,18 +314,23 @@ class Qwen3CustomVoiceEngine:
 
         profile = self._profile_store.get(selected_voice)
         if profile:
+            if self._clone_model is None:
+                raise RuntimeError(
+                    "Voice cloning unavailable: Base model not loaded. "
+                    "Restart service to retry loading."
+                )
             prompt = self._cached_prompts.get(selected_voice)
             if prompt is None:
-                prompt = self._model.create_voice_clone_prompt(
+                prompt = self._clone_model.create_voice_clone_prompt(
                     ref_audio=profile["ref_audio_path"],
                     ref_text=profile["ref_text"],
                     x_vector_only_mode=profile.get("x_vector_only", False),
                 )
                 self._cached_prompts[selected_voice] = prompt
-            wavs, sample_rate = self._model.generate_voice_clone(
+            wavs, sample_rate = self._clone_model.generate_voice_clone(
                 text=text.strip(),
                 language=selected_language,
-                voice_clone_prompt=self._model._prompt_items_to_voice_clone_prompt(prompt),
+                voice_clone_prompt=self._clone_model._prompt_items_to_voice_clone_prompt(prompt),
                 **kwargs,
             )
             provider = "qwen3_voice_clone"
@@ -358,10 +383,10 @@ class Qwen3CustomVoiceEngine:
             x_vector_only=x_vector_only,
         )
 
-        # Pre-compute clone prompt if model is loaded
-        if self._model is not None:
+        # Pre-compute clone prompt if Base model is loaded
+        if self._clone_model is not None:
             try:
-                prompt = self._model.create_voice_clone_prompt(
+                prompt = self._clone_model.create_voice_clone_prompt(
                     ref_audio=str(audio_path),
                     ref_text=ref_text,
                     x_vector_only_mode=x_vector_only,
@@ -433,11 +458,14 @@ class Qwen3CustomVoiceEngine:
 
     def _precompute_clone_prompts(self) -> None:
         """Pre-compute voice clone prompts for all registered profiles."""
+        if self._clone_model is None:
+            logger.warning("Skipping clone prompt precomputation: Base model not loaded.")
+            return
         for name, profile in self._profile_store.list_profiles().items():
             if name in self._cached_prompts:
                 continue
             try:
-                prompt = self._model.create_voice_clone_prompt(
+                prompt = self._clone_model.create_voice_clone_prompt(
                     ref_audio=profile["ref_audio_path"],
                     ref_text=profile["ref_text"],
                     x_vector_only_mode=profile.get("x_vector_only", False),
