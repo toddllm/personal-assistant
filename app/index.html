@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Personal Assistant</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <header>
+      <h1>Personal Assistant</h1>
+      <span id="clock"></span>
+    </header>
+    <section id="audio-panel"></section>
+    <section id="voice-chat-panel"></section>
+    <section id="voice-profile-panel"></section>
+    <main id="service-grid"></main>
+    <div id="log-panel">
+      <div class="log-header">
+        <span id="log-title">Logs</span>
+        <button id="log-close">&times;</button>
+      </div>
+      <pre id="log-content"></pre>
+    </div>
+  </body>
+</html>

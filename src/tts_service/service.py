@@ -15,7 +15,17 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from tts_service.config import Settings
 from tts_service.engine import Qwen3CustomVoiceEngine, StubTTSEngine
-from tts_service.schemas import HealthResponse, SynthesizeRequest, SynthesizeResponse, VoicesResponse
+from tts_service.schemas import (
+    CloneVoiceRequest,
+    HealthResponse,
+    PhotoUploadRequest,
+    SynthesizeRequest,
+    SynthesizeResponse,
+    UpdateProfileRequest,
+    VoiceProfile,
+    VoiceProfilesResponse,
+    VoicesResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,5 +231,111 @@ def create_app(settings: Settings) -> FastAPI:
         if not path.exists():
             raise HTTPException(status_code=404, detail="Audio file not found.")
         return FileResponse(path, media_type="audio/wav", filename=safe_name)
+
+    # --- Voice Profile Endpoints ---
+
+    @app.get("/v1/profiles", response_model=VoiceProfilesResponse)
+    def list_profiles() -> VoiceProfilesResponse:
+        if not hasattr(engine, "list_voices_detailed"):
+            # Stub engine fallback
+            return VoiceProfilesResponse(
+                profiles=[
+                    VoiceProfile(name=v, display_name=v, voice_type="builtin")
+                    for v in engine.list_voices()
+                ]
+            )
+        return VoiceProfilesResponse(
+            profiles=[VoiceProfile(**v) for v in engine.list_voices_detailed()]
+        )
+
+    @app.post("/v1/profiles/clone")
+    def clone_voice(req: CloneVoiceRequest) -> dict:
+        if not hasattr(engine, "clone_voice"):
+            raise HTTPException(status_code=501, detail="Voice cloning not available with stub engine.")
+        try:
+            ref_audio_bytes = base64.b64decode(req.ref_audio_base64)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {exc}") from exc
+
+        try:
+            profile = engine.clone_voice(
+                name=req.name,
+                ref_audio_bytes=ref_audio_bytes,
+                ref_text=req.ref_text,
+                display_name=req.display_name,
+                is_owner=req.is_owner,
+                x_vector_only=req.x_vector_only,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"ok": True, "profile": profile}
+
+    @app.delete("/v1/profiles/{name}")
+    def delete_profile(name: str) -> dict:
+        if not hasattr(engine, "remove_voice"):
+            raise HTTPException(status_code=501, detail="Not available with stub engine.")
+        try:
+            removed = engine.remove_voice(name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Voice profile '{name}' not found.")
+        return {"ok": True}
+
+    @app.put("/v1/profiles/{name}")
+    def update_profile(name: str, req: UpdateProfileRequest) -> dict:
+        if not hasattr(engine, "profile_store"):
+            raise HTTPException(status_code=501, detail="Not available with stub engine.")
+        updates = {k: v for k, v in req.model_dump().items() if v is not None}
+        if not updates:
+            raise HTTPException(status_code=400, detail="No fields to update.")
+        profile = engine.profile_store.update(name, **updates)
+        if profile is None:
+            raise HTTPException(status_code=404, detail=f"Voice profile '{name}' not found.")
+        return {"ok": True, "profile": profile}
+
+    @app.post("/v1/profiles/{name}/photo")
+    def upload_photo(name: str, req: PhotoUploadRequest) -> dict:
+        if not hasattr(engine, "profile_store"):
+            raise HTTPException(status_code=501, detail="Not available with stub engine.")
+        try:
+            photo_bytes = base64.b64decode(req.photo_base64)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 photo: {exc}") from exc
+        # Detect format from magic bytes
+        ext = ".jpg"
+        if photo_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            ext = ".png"
+        path = engine.profile_store.set_photo(name, photo_bytes, ext)
+        if path is None:
+            raise HTTPException(status_code=404, detail=f"Voice profile '{name}' not found.")
+        return {"ok": True, "photo_path": path}
+
+    @app.get("/v1/profiles/{name}/photo")
+    def get_photo(name: str) -> FileResponse:
+        if not hasattr(engine, "profile_store"):
+            raise HTTPException(status_code=501, detail="Not available with stub engine.")
+        photo_path = engine.profile_store.get_photo_path(name)
+        if not photo_path or not Path(photo_path).exists():
+            raise HTTPException(status_code=404, detail="No photo for this profile.")
+        media = "image/png" if photo_path.endswith(".png") else "image/jpeg"
+        return FileResponse(photo_path, media_type=media)
+
+    @app.post("/v1/profiles/{name}/test")
+    def test_voice(name: str) -> dict:
+        test_text = "Hello, this is a test of my voice."
+        try:
+            result = engine.synthesize(text=test_text, voice=name)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        wav_bytes = _wav_bytes_from_float32(result.wav, result.sample_rate)
+        audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
+        return {
+            "voice": result.voice,
+            "sample_rate": result.sample_rate,
+            "audio_base64": audio_b64,
+        }
 
     return app

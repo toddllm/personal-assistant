@@ -35,5 +35,11 @@ class Settings(BaseSettings):
 
     output_dir: Path = Field(default_factory=lambda: Path("data/tts_outputs"))
 
+    voice_profiles_dir: Path = Field(default_factory=lambda: Path("data/voice_profiles"))
+    legacy_clones_json: str | None = None
+    legacy_clones_audio_dir: str | None = None
+    max_ref_audio_seconds: float = 30.0
+    min_ref_audio_seconds: float = 3.0
+
 
 settings = Settings()

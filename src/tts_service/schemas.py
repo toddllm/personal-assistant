@@ -34,3 +34,37 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     load_error: str | None = None
 
+
+# --- Voice Profile schemas ---
+
+
+class VoiceProfile(BaseModel):
+    name: str
+    display_name: str
+    voice_type: str  # "builtin" | "cloned"
+    is_owner: bool = False
+    has_photo: bool = False
+    created_at: str | None = None
+
+
+class VoiceProfilesResponse(BaseModel):
+    profiles: list[VoiceProfile]
+
+
+class CloneVoiceRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_]+$")
+    display_name: str = Field(min_length=1, max_length=100)
+    ref_text: str = Field(min_length=1, max_length=500)
+    ref_audio_base64: str
+    is_owner: bool = False
+    x_vector_only: bool = False
+
+
+class UpdateProfileRequest(BaseModel):
+    display_name: str | None = None
+    is_owner: bool | None = None
+
+
+class PhotoUploadRequest(BaseModel):
+    photo_base64: str
+
