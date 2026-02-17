@@ -11,6 +11,8 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+import discord
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -248,6 +250,28 @@ async def leave():
 
     await _voice_bot.leave_channel()
     return StatusResponse()
+
+
+@app.get("/guilds")
+async def list_guilds():
+    """List guilds and their voice channels the bot can see."""
+    if not _voice_bot:
+        return {"guilds": []}
+    result = []
+    for guild in _voice_bot.bot.guilds:
+        channels = []
+        for ch in guild.channels:
+            if isinstance(ch, discord.VoiceChannel):
+                members = [m.display_name for m in ch.members if not m.bot]
+                channels.append({
+                    "id": ch.id, "name": ch.name,
+                    "members": members, "member_count": len(members),
+                })
+        result.append({
+            "id": guild.id, "name": guild.name,
+            "channels": channels,
+        })
+    return {"guilds": result}
 
 
 @app.get("/voice", response_model=VoiceSettingResponse)
@@ -509,6 +533,11 @@ CONTROL_PANEL_UI = """<!DOCTYPE html>
     <span class="status-detail" id="status-detail"></span>
     <span class="status-spacer"></span>
     <span class="status-uptime" id="status-uptime"></span>
+    <select id="sel-channel" style="font-size:11px;padding:4px 6px;background:#1a1a2e;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;max-width:200px">
+      <option value="">select channel...</option>
+    </select>
+    <button class="btn btn-success" id="btn-join">Join</button>
+    <button class="btn btn-danger" id="btn-leave" disabled>Leave</button>
   </div>
 
   <div class="grid">
@@ -611,11 +640,14 @@ async function init() {
   document.getElementById('btn-tts-test').onclick = testTTS;
   document.getElementById('btn-model-apply').onclick = applyModel;
   document.getElementById('btn-prompt-apply').onclick = applyPrompt;
+  document.getElementById('btn-join').onclick = joinChannel;
+  document.getElementById('btn-leave').onclick = leaveChannel;
   document.getElementById('btn-bench').onclick = runBench;
   document.getElementById('btn-bench-all').onclick = () => {
     document.getElementById('bench-sel').value = '__all__';
     runBench();
   };
+  loadGuilds();
 
   // Slider live labels
   document.getElementById('rng-temp').oninput = (e) => {
@@ -635,6 +667,8 @@ async function loadStatus() {
     const label = document.getElementById('status-label');
     const detail = document.getElementById('status-detail');
     const uptime = document.getElementById('status-uptime');
+    const joinBtn = document.getElementById('btn-join');
+    const leaveBtn = document.getElementById('btn-leave');
     if (d.connected) {
       dot.className = 'status-dot on';
       label.textContent = 'Connected';
@@ -647,15 +681,76 @@ async function loadStatus() {
       if (d.active_speakers != null) {
         uptime.textContent += ' | ' + d.active_speakers + ' speaker(s)';
       }
+      joinBtn.disabled = true;
+      leaveBtn.disabled = false;
     } else {
       dot.className = 'status-dot';
       label.textContent = 'Not in voice channel';
       detail.textContent = d.stt_provider ? ('stt: ' + d.stt_provider + ' | llm: ' + d.llm_provider + ' | tts: ' + d.tts_provider) : '';
       uptime.textContent = '';
+      joinBtn.disabled = false;
+      leaveBtn.disabled = true;
     }
   } catch (e) {
     document.getElementById('status-label').textContent = 'Service error';
   }
+}
+
+// --- Guilds / Join / Leave ---
+async function loadGuilds() {
+  const sel = document.getElementById('sel-channel');
+  try {
+    const r = await fetch(API + '/guilds');
+    const d = await r.json();
+    sel.innerHTML = '<option value="">select channel...</option>';
+    (d.guilds || []).forEach(g => {
+      const grp = document.createElement('optgroup');
+      grp.label = g.name;
+      (g.channels || []).forEach(ch => {
+        const o = document.createElement('option');
+        o.value = g.id + ':' + ch.id;
+        const who = ch.members.length > 0 ? ' (' + ch.members.join(', ') + ')' : '';
+        o.textContent = ch.name + who;
+        grp.appendChild(o);
+      });
+      sel.appendChild(grp);
+    });
+  } catch (e) {
+    sel.innerHTML = '<option value="">error loading guilds</option>';
+  }
+}
+
+async function joinChannel() {
+  const sel = document.getElementById('sel-channel');
+  const val = sel.value;
+  if (!val) { toast('voice-toast', 'Select a channel first', 'err'); return; }
+  const [guildId, channelId] = val.split(':').map(Number);
+  const btn = document.getElementById('btn-join');
+  btn.disabled = true; btn.textContent = 'Joining...';
+  try {
+    const r = await fetch(API + '/join', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ guild_id: guildId, channel_id: channelId }),
+    });
+    if (r.ok) {
+      loadStatus();
+      loadGuilds();
+    } else {
+      const d = await r.json();
+      toast('voice-toast', d.detail || 'Join failed', 'err');
+    }
+  } catch (e) { toast('voice-toast', 'Error: ' + e.message, 'err'); }
+  btn.textContent = 'Join'; btn.disabled = false;
+}
+
+async function leaveChannel() {
+  const btn = document.getElementById('btn-leave');
+  btn.disabled = true; btn.textContent = 'Leaving...';
+  try {
+    await fetch(API + '/leave', { method: 'POST' });
+    loadStatus();
+  } catch (e) { toast('voice-toast', 'Error: ' + e.message, 'err'); }
+  btn.textContent = 'Leave'; btn.disabled = false;
 }
 
 // --- Settings ---
