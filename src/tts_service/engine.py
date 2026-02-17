@@ -26,6 +26,7 @@ class VoiceProfileStore:
         self._photos_dir = profiles_dir / "photos"
         self._json_path = profiles_dir / "profiles.json"
         self._profiles: dict[str, dict[str, Any]] = {}
+        self._deleted: set[str] = set()
         self._ensure_dirs()
         self._load()
 
@@ -37,13 +38,20 @@ class VoiceProfileStore:
     def _load(self) -> None:
         if self._json_path.exists():
             try:
-                self._profiles = json.loads(self._json_path.read_text())
+                data = json.loads(self._json_path.read_text())
+                # Support both old format (flat dict) and new format with _deleted key
+                if "_deleted" in data and isinstance(data["_deleted"], list):
+                    self._deleted = set(data.pop("_deleted"))
+                self._profiles = data
             except Exception:
                 logger.exception("Failed to load voice profiles from %s", self._json_path)
                 self._profiles = {}
 
     def _save(self) -> None:
-        self._json_path.write_text(json.dumps(self._profiles, indent=2, ensure_ascii=False))
+        data = dict(self._profiles)
+        if self._deleted:
+            data["_deleted"] = sorted(self._deleted)
+        self._json_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
 
     def list_profiles(self) -> dict[str, dict[str, Any]]:
         return dict(self._profiles)
@@ -88,6 +96,7 @@ class VoiceProfileStore:
         profile = self._profiles.pop(name, None)
         if profile is None:
             return False
+        self._deleted.add(name)
         # Clean up audio file
         audio_path = Path(profile.get("ref_audio_path", ""))
         if audio_path.exists():
@@ -98,6 +107,10 @@ class VoiceProfileStore:
             Path(photo_path).unlink(missing_ok=True)
         self._save()
         return True
+
+    def is_deleted(self, name: str) -> bool:
+        """Check if a voice name was previously deleted (to prevent re-import)."""
+        return name in self._deleted
 
     def set_photo(self, name: str, photo_bytes: bytes, ext: str = ".jpg") -> str | None:
         profile = self._profiles.get(name)
@@ -431,6 +444,8 @@ class Qwen3CustomVoiceEngine:
             slug = voice_name.lower().replace(" ", "_")
             if self._profile_store.get(slug) is not None:
                 continue  # Already migrated
+            if self._profile_store.is_deleted(slug):
+                continue  # User deleted this voice, don't re-import
             # Legacy format uses "audio_file" (filename only) or "ref_audio" (path)
             ref_audio = voice_info.get("audio_file") or voice_info.get("ref_audio", "")
             ref_text = voice_info.get("ref_text", "")
