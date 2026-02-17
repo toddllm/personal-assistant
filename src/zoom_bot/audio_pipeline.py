@@ -80,6 +80,7 @@ class AudioPipeline:
         self._tts = tts
         self._system_prompt = system_prompt
         self._on_tts_audio = on_tts_audio
+        self._on_event: Callable[[str, dict], None] | None = None
         self._debounce_seconds = debounce_seconds
         self._max_turns = max_conversation_turns
         self._llm_max_tokens = llm_max_tokens
@@ -108,6 +109,22 @@ class AudioPipeline:
             "Huh.",
             "Right.",
         ]
+
+    def set_event_callback(self, cb: Callable[[str, dict], None]) -> None:
+        """Set a callback for pipeline events (transcript, llm_response, tts, etc.)."""
+        self._on_event = cb
+
+    def _emit(self, event_type: str, data: dict) -> None:
+        if self._on_event:
+            try:
+                self._on_event(event_type, {"type": event_type, "ts": time.time(), **data})
+            except Exception:
+                pass
+
+    @property
+    def conversation(self) -> list[dict]:
+        """Return the current conversation history."""
+        return list(self._conversation)
 
     async def start(self) -> None:
         """Start the pipeline (STT provider + audio sender loop)."""
@@ -204,6 +221,7 @@ class AudioPipeline:
             return
 
         logger.info("Combined transcript: %s", combined)
+        self._emit("transcript", {"text": combined})
 
         self._conversation.append({"role": "user", "content": combined})
 
@@ -239,6 +257,7 @@ class AudioPipeline:
                 return
 
             logger.info("LLM response: %s", llm_response[:100])
+            self._emit("llm_response", {"text": llm_response})
             self._conversation.append({"role": "assistant", "content": llm_response})
 
             # Step 2: TTS
@@ -251,8 +270,10 @@ class AudioPipeline:
             # Step 3: Send TTS audio to meeting (queues after filler).
             if self._on_tts_audio:
                 pcm_32k = resample_to_32k(tts_audio, sample_rate)
+                duration_s = len(pcm_32k) / (32000 * 2)
                 logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz)",
-                            len(pcm_32k), len(pcm_32k) / (32000 * 2))
+                            len(pcm_32k), duration_s)
+                self._emit("tts_audio", {"bytes": len(pcm_32k), "duration_s": round(duration_s, 1), "text": llm_response[:200]})
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._on_tts_audio, pcm_32k)
 

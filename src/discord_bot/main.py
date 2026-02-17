@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -158,6 +160,12 @@ class HealthResponse(BaseModel):
 settings = Settings()
 _voice_bot: DiscordVoiceBot | None = None
 _bot_task: asyncio.Task | None = None
+_events: deque[dict] = deque(maxlen=200)
+
+
+def _on_pipeline_event(event_type: str, data: dict) -> None:
+    """Callback fired by AudioPipeline for transcript/llm/tts events."""
+    _events.append(data)
 
 _RUNTIME_SETTINGS_PATH = Path("data/discord-bot-settings.json")
 
@@ -269,6 +277,9 @@ async def join(req: JoinRequest):
         guild_id = int(req.guild_id)
         channel_id = int(req.channel_id)
         await _voice_bot.join_channel(guild_id, channel_id)
+        # Wire pipeline event callback
+        if _voice_bot.pipeline:
+            _voice_bot.pipeline.set_event_callback(_on_pipeline_event)
     except Exception as exc:
         logger.exception("Failed to join voice channel")
         raise HTTPException(500, f"Failed to join: {exc}")
@@ -420,6 +431,20 @@ async def update_settings(req: BotSettingsRequest):
     return await get_settings()
 
 
+@app.get("/events")
+async def get_events(since: float = 0):
+    """Get pipeline events (transcript, llm_response, tts_audio) since a timestamp."""
+    return {"events": [e for e in _events if e.get("ts", 0) > since]}
+
+
+@app.get("/conversation")
+async def get_conversation():
+    """Get the current conversation history from the pipeline."""
+    if _voice_bot and _voice_bot.pipeline:
+        return {"conversation": _voice_bot.pipeline.conversation}
+    return {"conversation": []}
+
+
 @app.get("/ollama/models")
 async def list_ollama_models():
     """List available Ollama models."""
@@ -566,6 +591,31 @@ CONTROL_PANEL_UI = """<!DOCTYPE html>
   .lat-play { cursor: pointer; opacity: 0.5; }
   .lat-play:hover { opacity: 1; }
   .lat-size { font-size: 10px; color: #555; min-width: 40px; }
+
+  /* Live events */
+  .evt { padding: 4px 8px; border-radius: 3px; margin-bottom: 3px; display: flex; gap: 8px; align-items: baseline; }
+  .evt-time { color: #555; font-size: 10px; min-width: 55px; font-variant-numeric: tabular-nums; }
+  .evt-type { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; min-width: 65px; }
+  .evt-type.transcript { color: #2196f3; }
+  .evt-type.llm { color: #00e676; }
+  .evt-type.tts { color: #ffc107; }
+  .evt-text { flex: 1; word-break: break-word; }
+
+  /* Conversation */
+  .msg { padding: 6px 10px; border-radius: 6px; margin-bottom: 4px; }
+  .msg.system { background: rgba(114,137,218,0.08); color: #7289da; font-size: 10px; font-style: italic; }
+  .msg.user { background: rgba(33,150,243,0.08); border-left: 3px solid #2196f3; }
+  .msg.assistant { background: rgba(0,230,118,0.08); border-left: 3px solid #00e676; }
+  .msg-role { font-size: 9px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .msg-role.user { color: #2196f3; }
+  .msg-role.assistant { color: #00e676; }
+  .msg-role.system { color: #7289da; }
+
+  /* Config summary */
+  .cfg-row { display: flex; gap: 12px; margin-bottom: 4px; flex-wrap: wrap; }
+  .cfg-item { display: flex; gap: 4px; }
+  .cfg-label { color: #555; }
+  .cfg-val { color: #e0e0e0; font-weight: 500; }
 </style>
 </head>
 <body>
@@ -662,6 +712,27 @@ CONTROL_PANEL_UI = """<!DOCTYPE html>
         <div style="color:#444; font-size:11px; font-style:italic; text-align:center; padding:12px;">Run a test to see results</div>
       </div>
     </div>
+
+    <!-- Live Activity & Conversation -->
+    <div class="card full">
+      <div class="card-title">Live Activity</div>
+      <div id="live-events" style="max-height:250px; overflow-y:auto; font-size:11px;">
+        <div style="color:#444; font-style:italic; text-align:center; padding:12px;">Waiting for activity...</div>
+      </div>
+    </div>
+
+    <div class="card full">
+      <div class="card-title">Conversation</div>
+      <div id="conversation" style="max-height:350px; overflow-y:auto; font-size:12px;">
+        <div style="color:#444; font-style:italic; text-align:center; padding:12px;">No conversation yet</div>
+      </div>
+    </div>
+
+    <!-- Current Settings Summary -->
+    <div class="card full">
+      <div class="card-title">Current Configuration</div>
+      <div id="config-summary" style="font-size:11px; color:#888;">Loading...</div>
+    </div>
   </div>
 </div>
 
@@ -695,6 +766,12 @@ async function init() {
     runBench();
   };
   loadGuilds();
+  loadConversation();
+  loadConfig();
+  pollEvents();
+
+  setInterval(loadConversation, 5000);
+  setInterval(loadConfig, 10000);
 
   // Slider live labels
   document.getElementById('rng-temp').oninput = (e) => {
@@ -798,6 +875,79 @@ async function leaveChannel() {
     loadStatus();
   } catch (e) { toast('voice-toast', 'Error: ' + e.message, 'err'); }
   btn.textContent = 'Leave'; btn.disabled = false;
+}
+
+// --- Live Events ---
+let lastEventTs = 0;
+async function pollEvents() {
+  try {
+    const r = await fetch(API + '/events?since=' + lastEventTs);
+    const d = await r.json();
+    const events = d.events || [];
+    if (events.length > 0) {
+      const el = document.getElementById('live-events');
+      if (el.querySelector('div[style]')) el.innerHTML = '';
+      events.forEach(evt => {
+        lastEventTs = Math.max(lastEventTs, evt.ts || 0);
+        const div = document.createElement('div');
+        div.className = 'evt';
+        const time = new Date(evt.ts * 1000).toLocaleTimeString();
+        let typeCls = '';
+        let typeLabel = evt.type || '?';
+        if (evt.type === 'transcript') { typeCls = 'transcript'; typeLabel = 'STT'; }
+        else if (evt.type === 'llm_response') { typeCls = 'llm'; typeLabel = 'LLM'; }
+        else if (evt.type === 'tts_audio') { typeCls = 'tts'; typeLabel = 'TTS'; }
+        const text = evt.text || (evt.duration_s ? evt.duration_s + 's audio' : JSON.stringify(evt));
+        div.innerHTML = '<span class="evt-time">' + time + '</span>' +
+          '<span class="evt-type ' + typeCls + '">' + typeLabel + '</span>' +
+          '<span class="evt-text">' + esc(text) + '</span>';
+        el.appendChild(div);
+        el.scrollTop = el.scrollHeight;
+      });
+    }
+  } catch (e) {}
+  setTimeout(pollEvents, 1000);
+}
+
+// --- Conversation ---
+async function loadConversation() {
+  try {
+    const r = await fetch(API + '/conversation');
+    const d = await r.json();
+    const msgs = d.conversation || [];
+    const el = document.getElementById('conversation');
+    if (msgs.length <= 1) {
+      el.innerHTML = '<div style="color:#444; font-style:italic; text-align:center; padding:12px;">No conversation yet</div>';
+      return;
+    }
+    el.innerHTML = msgs.map(m => {
+      const role = m.role || 'system';
+      const cls = role === 'user' ? 'user' : role === 'assistant' ? 'assistant' : 'system';
+      return '<div class="msg ' + cls + '"><div class="msg-role ' + cls + '">' + role + '</div>' + esc(m.content || '') + '</div>';
+    }).join('');
+    el.scrollTop = el.scrollHeight;
+  } catch (e) {}
+}
+
+// --- Config Summary ---
+async function loadConfig() {
+  try {
+    const r = await fetch(API + '/settings');
+    const d = await r.json();
+    const el = document.getElementById('config-summary');
+    el.innerHTML =
+      '<div class="cfg-row">' +
+        '<div class="cfg-item"><span class="cfg-label">Voice:</span> <span class="cfg-val">' + esc(d.tts_voice) + '</span></div>' +
+        '<div class="cfg-item"><span class="cfg-label">TTS:</span> <span class="cfg-val">' + esc(d.tts_url) + '</span></div>' +
+        '<div class="cfg-item"><span class="cfg-label">Model:</span> <span class="cfg-val">' + esc(d.llm_model) + '</span></div>' +
+        '<div class="cfg-item"><span class="cfg-label">LLM:</span> <span class="cfg-val">' + esc(d.llm_url) + '</span></div>' +
+      '</div>' +
+      '<div class="cfg-row">' +
+        '<div class="cfg-item"><span class="cfg-label">Temp:</span> <span class="cfg-val">' + d.llm_temperature + '</span></div>' +
+        '<div class="cfg-item"><span class="cfg-label">Max Tokens:</span> <span class="cfg-val">' + d.llm_max_tokens + '</span></div>' +
+        '<div class="cfg-item"><span class="cfg-label">Debounce:</span> <span class="cfg-val">' + d.debounce_seconds + 's</span></div>' +
+      '</div>';
+  } catch (e) {}
 }
 
 // --- Settings ---
