@@ -106,10 +106,6 @@ def main():
     # Keep callback objects alive
     callbacks = {}
 
-    # Thread-safe queue for TTS audio to send
-    import queue
-    tts_audio_queue = queue.Queue()
-
     def generate_jwt():
         """Generate a Meeting SDK JWT.
 

@@ -13,7 +13,6 @@ Audio format: PCM 16-bit signed, 32 kHz, mono.
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
 from typing import Callable

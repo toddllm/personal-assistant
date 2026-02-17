@@ -15,7 +15,6 @@ import sys
 import urllib.request
 
 import Quartz
-from AppKit import NSSystemDefined
 
 VOLUME_STEP_URL = "http://127.0.0.1:8788/api/volume-step"
 STEP_SIZE = 2

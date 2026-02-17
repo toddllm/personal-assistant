@@ -295,7 +295,7 @@ def call_zoom(
     print(f"  Status: {zoom_result.get('status')}")
 
     # Step 3: Leg 2 — wait for Zoom IVR + DTMF to complete before calling Vapi
-    print(f"\nStep 3: Waiting 15s for Zoom IVR + DTMF...")
+    print("\nStep 3: Waiting 15s for Zoom IVR + DTMF...")
     time.sleep(15)
 
     vapi_twiml = (
@@ -321,7 +321,7 @@ def call_zoom(
     print(f"  Zoom leg:  {zoom_sid}")
     print(f"  Vapi leg:  {vapi_sid}")
     print(f"  Max duration: {max_duration}s")
-    print(f"\nCheck status:")
+    print("\nCheck status:")
     print(f"  scripts/ai-call.py --status {zoom_sid}")
     print(f"  scripts/ai-call.py --status {vapi_sid}")
 
@@ -413,8 +413,8 @@ def zoom_sdk_join(meeting_id: str, passcode: str, system_prompt: str, max_durati
             print("    3. Save and try again")
     else:
         print(f"\nAI assistant joined meeting {meeting_id_clean}")
-        print(f"  Leave:  scripts/ai-call.py --zoom-sdk --leave")
-        print(f"  Status: scripts/ai-call.py --zoom-sdk --bot-status")
+        print("  Leave:  scripts/ai-call.py --zoom-sdk --leave")
+        print("  Status: scripts/ai-call.py --zoom-sdk --bot-status")
 
 
 def zoom_sdk_leave():

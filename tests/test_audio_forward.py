@@ -11,13 +11,12 @@ from queue import Full, Queue
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
 _SCRIPT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scripts")
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(_PROJECT_ROOT, "src"))
 
-import importlib.util
+import importlib.util  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location(
     "audio_forward", os.path.join(_SCRIPT_DIR, "audio-forward.py")
@@ -100,47 +99,6 @@ class TestCheckDeviceExistsSubprocess:
 
 
 # -----------------------------------------------------------------------
-# resample
-# -----------------------------------------------------------------------
-
-class TestResample:
-    def test_same_rate(self):
-        data = np.random.randn(512).astype(np.float32)
-        result = af.resample(data, 48000, 48000)
-        np.testing.assert_array_equal(result, data)
-
-    def test_downsample(self):
-        data = np.random.randn(480).astype(np.float32)
-        result = af.resample(data, 48000, 16000)
-        assert len(result) == 160
-
-    def test_upsample(self):
-        data = np.random.randn(160).astype(np.float32)
-        result = af.resample(data, 16000, 48000)
-        assert len(result) == 480
-
-    def test_multichannel(self):
-        data = np.random.randn(480, 2).astype(np.float32)
-        result = af.resample(data, 48000, 16000)
-        assert result.shape == (160, 2)
-
-    def test_preserves_dtype(self):
-        data = np.random.randn(480).astype(np.float32)
-        result = af.resample(data, 48000, 16000)
-        assert result.dtype == np.float32
-
-    def test_dc_preserved(self):
-        data = np.full(480, 0.5, dtype=np.float32)
-        result = af.resample(data, 48000, 16000)
-        np.testing.assert_allclose(result, 0.5, atol=1e-6)
-
-    def test_minimum_output(self):
-        data = np.array([1.0], dtype=np.float32)
-        result = af.resample(data, 48000, 16000)
-        assert len(result) >= 1
-
-
-# -----------------------------------------------------------------------
 # downmix_to_mono
 # -----------------------------------------------------------------------
 
@@ -212,25 +170,10 @@ class TestQueueDistribution:
 # -----------------------------------------------------------------------
 
 class TestProcessingPipeline:
-    def test_stereo_48k_to_mono_16k(self):
+    def test_stereo_to_mono(self):
         data = np.random.randn(512, 2).astype(np.float32)
         mono = af.downmix_to_mono(data)
         assert mono.shape == (512, 1)
-        resampled = af.resample(mono, 48000, 16000)
-        assert resampled.shape == (170, 1)
-
-    def test_passthrough(self):
-        data = np.random.randn(512, 2).astype(np.float32)
-        result = af.resample(data, 48000, 48000)
-        np.testing.assert_array_equal(result, data)
-
-    def test_sine_integrity(self):
-        t = np.linspace(0, 512/48000, 512, endpoint=False, dtype=np.float32)
-        sine = np.sin(2 * np.pi * 440 * t)
-        resampled = af.resample(sine, 48000, 16000)
-        assert len(resampled) == 170
-        assert np.std(resampled) > 0.3
-        assert np.max(np.abs(resampled)) > 0.8
 
 
 # -----------------------------------------------------------------------

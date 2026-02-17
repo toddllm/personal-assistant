@@ -16,6 +16,8 @@ import struct
 import sys
 import wave
 
+import httpx  # noqa: E402 — must import before .env loading for type availability
+
 # Load .env
 for env_path in ("/opt/zoom-bot/.env", "/opt/zoom-bot/zoom_bot/.env"):
     if os.path.isfile(env_path):
@@ -28,8 +30,6 @@ for env_path in ("/opt/zoom-bot/.env", "/opt/zoom-bot/zoom_bot/.env"):
                 key, value = key.strip(), value.strip().strip("'\"")
                 if key and key not in os.environ:
                     os.environ[key] = value
-
-import httpx
 
 ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"  # Sarah
@@ -171,12 +171,12 @@ def main():
     # Step 5: Summary
     duration_22k = len(raw_pcm) / 2 / 22050
     duration_48k = len(pcm_48k) / 2 / 48000
-    print(f"\n5. Summary:")
+    print("\n5. Summary:")
     print(f"  Original duration: {duration_22k:.2f}s")
     print(f"  Final duration:    {duration_48k:.2f}s")
     print(f"  Duration ratio:    {duration_48k/duration_22k:.4f} (should be ~1.0)")
-    print(f"\n  WAV files saved to /tmp/tts-test-*.wav")
-    print(f"  Copy to Mac and play: scp zoom-bot.orb.local:/tmp/tts-test-*.wav /tmp/")
+    print("\n  WAV files saved to /tmp/tts-test-*.wav")
+    print("  Copy to Mac and play: scp zoom-bot.orb.local:/tmp/tts-test-*.wav /tmp/")
     print("=" * 60)
 
 

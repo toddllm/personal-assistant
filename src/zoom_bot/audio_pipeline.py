@@ -1,38 +1,29 @@
-"""Audio pipeline: Deepgram STT -> Groq LLM -> ElevenLabs TTS.
+"""Audio pipeline: STT -> LLM -> TTS orchestrator.
 
-Processes raw PCM audio from the Zoom SDK, transcribes it, generates
-an AI response, synthesizes speech, and returns PCM audio to send
-back into the meeting.
+Processes raw PCM audio, transcribes it via a pluggable STT provider,
+generates an AI response via a pluggable LLM, synthesizes speech via
+a pluggable TTS provider, and returns PCM audio via callback.
 """
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
+import random
 import struct
 import time
 from collections import deque
 from typing import Callable
 
-import httpx
+from zoom_bot.llm_providers import LLMProvider
+from zoom_bot.stt_providers import STTProvider
+from zoom_bot.tts_providers import TTSProvider
 
 logger = logging.getLogger(__name__)
 
-# Deepgram WebSocket URL for real-time STT
-DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen"
-
-# Groq API
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-GROQ_MODEL = "llama-3.3-70b-versatile"
-
-# ElevenLabs API
-ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1/text-to-speech"
-ELEVENLABS_VOICE_ID = "EXAVITQu4vr4xnSDxMaL"  # Sarah
-
 # Audio specs
 SDK_SAMPLE_RATE = 32000
-DEEPGRAM_SAMPLE_RATE = 16000
+STT_SAMPLE_RATE = 16000
 
 
 def resample_32k_to_16k(pcm_32k: bytes) -> bytes:
@@ -67,57 +58,104 @@ def resample_to_32k(pcm_data: bytes, source_rate: int) -> bytes:
 
 
 class AudioPipeline:
-    """Manages the STT -> LLM -> TTS pipeline for a meeting session."""
+    """Manages the STT -> LLM -> TTS pipeline for a meeting session.
+
+    Provider-pluggable: accepts any STTProvider, LLMProvider, TTSProvider.
+    """
 
     def __init__(
         self,
-        deepgram_api_key: str,
-        groq_api_key: str,
-        elevenlabs_api_key: str,
+        stt: STTProvider,
+        llm: LLMProvider,
+        tts: TTSProvider,
         system_prompt: str,
         on_tts_audio: Callable[[bytes], None] | None = None,
+        debounce_seconds: float = 0.8,
+        max_conversation_turns: int = 20,
+        llm_max_tokens: int = 80,
+        llm_temperature: float = 0.5,
     ):
-        self._deepgram_key = deepgram_api_key
-        self._groq_key = groq_api_key
-        self._elevenlabs_key = elevenlabs_api_key
+        self._stt = stt
+        self._llm = llm
+        self._tts = tts
         self._system_prompt = system_prompt
         self._on_tts_audio = on_tts_audio
+        self._debounce_seconds = debounce_seconds
+        self._max_turns = max_conversation_turns
+        self._llm_max_tokens = llm_max_tokens
+        self._llm_temperature = llm_temperature
 
         self._conversation: list[dict] = [
             {"role": "system", "content": system_prompt}
         ]
-        self._audio_buffer = deque(maxlen=500)  # ~10s of 20ms chunks
+        self._audio_buffer: deque[bytes] = deque(maxlen=500)  # ~10s of 20ms chunks
         self._running = False
-        self._deepgram_ws = None
         self._tasks: list[asyncio.Task] = []
-        self._http_client: httpx.AsyncClient | None = None
         self._is_speaking = False
         self._last_transcript_time = 0.0
+        self._pending_text: list[str] = []
+        self._debounce_task: asyncio.Task | None = None
+
+        # Pre-cached filler audio (PCM 32kHz) for instant acknowledgment
+        self._filler_cache: list[bytes] = []
+        self._filler_phrases = [
+            "Hmm.",
+            "Oh.",
+            "Hmm, let me think.",
+            "Ooh, interesting.",
+            "Oh yeah.",
+            "Hmm, okay.",
+            "Huh.",
+            "Right.",
+        ]
 
     async def start(self) -> None:
-        """Start the pipeline (Deepgram WebSocket + processing loop)."""
+        """Start the pipeline (STT provider + audio sender loop)."""
         self._running = True
-        self._http_client = httpx.AsyncClient(timeout=30)
-        self._tasks.append(asyncio.create_task(self._deepgram_loop()))
+
+        # Wire up STT transcript callback
+        self._stt.set_transcript_callback(self._on_transcript)
+        await self._stt.start()
+
         self._tasks.append(asyncio.create_task(self._audio_sender_loop()))
+
+        # Pre-cache filler audio in the background
+        self._tasks.append(asyncio.create_task(self._precache_fillers()))
+
         logger.info("Audio pipeline started")
+
+    async def _precache_fillers(self) -> None:
+        """Pre-generate TTS for filler phrases so they can play instantly."""
+        logger.info("Pre-caching %d filler phrases...", len(self._filler_phrases))
+        for phrase in self._filler_phrases:
+            try:
+                result = await self._tts.synthesize(phrase)
+                if result:
+                    pcm, rate = result
+                    pcm_32k = resample_to_32k(pcm, rate)
+                    self._filler_cache.append(pcm_32k)
+            except Exception:
+                logger.debug("Failed to cache filler: %s", phrase)
+        logger.info("Cached %d/%d filler clips", len(self._filler_cache), len(self._filler_phrases))
 
     async def stop(self) -> None:
         """Stop the pipeline and clean up."""
         self._running = False
+
         for task in self._tasks:
             task.cancel()
         self._tasks.clear()
 
-        if self._deepgram_ws:
-            try:
-                await self._deepgram_ws.close()
-            except Exception:
-                pass
+        await self._stt.stop()
 
-        if self._http_client:
-            await self._http_client.aclose()
-            self._http_client = None
+        # Close providers that have a close method
+        for provider in (self._llm, self._tts):
+            close = getattr(provider, "close", None)
+            if close:
+                try:
+                    await close()
+                except Exception:
+                    pass
 
         logger.info("Audio pipeline stopped")
 
@@ -128,81 +166,17 @@ class AudioPipeline:
         self._audio_buffer.append(pcm_32k)
 
     async def _audio_sender_loop(self) -> None:
-        """Send buffered audio to Deepgram WebSocket."""
+        """Send buffered audio to the STT provider."""
         while self._running:
-            if self._deepgram_ws and self._audio_buffer:
+            if self._audio_buffer:
                 chunk = self._audio_buffer.popleft()
                 pcm_16k = resample_32k_to_16k(chunk)
-                try:
-                    await self._deepgram_ws.send(pcm_16k)
-                except Exception:
-                    logger.debug("Failed to send audio to Deepgram")
+                await self._stt.send_audio(pcm_16k)
             else:
                 await asyncio.sleep(0.01)
 
-    async def _deepgram_loop(self) -> None:
-        """Maintain Deepgram WebSocket connection and process transcripts."""
-        import websockets
-
-        params = (
-            f"?encoding=linear16&sample_rate={DEEPGRAM_SAMPLE_RATE}"
-            f"&channels=1&model=nova-2&punctuate=true"
-            f"&interim_results=false&endpointing=300"
-            f"&vad_events=true&smart_format=true"
-        )
-
-        while self._running:
-            try:
-                headers = {"Authorization": f"Token {self._deepgram_key}"}
-                async with websockets.connect(
-                    DEEPGRAM_WS_URL + params,
-                    additional_headers=headers,
-                    ping_interval=20,
-                ) as ws:
-                    self._deepgram_ws = ws
-                    logger.info("Deepgram WebSocket connected")
-
-                    async for msg in ws:
-                        if not self._running:
-                            break
-                        await self._handle_deepgram_message(msg)
-
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception("Deepgram connection error, reconnecting...")
-                self._deepgram_ws = None
-                await asyncio.sleep(2)
-
-    async def _handle_deepgram_message(self, msg: str | bytes) -> None:
-        """Process a Deepgram transcript result."""
-        import json
-
-        if isinstance(msg, bytes):
-            return
-
-        try:
-            data = json.loads(msg)
-        except (json.JSONDecodeError, TypeError):
-            return
-
-        if data.get("type") != "Results":
-            return
-
-        channel = data.get("channel", {})
-        alternatives = channel.get("alternatives", [])
-        if not alternatives:
-            return
-
-        transcript = alternatives[0].get("transcript", "").strip()
-        if not transcript:
-            return
-
-        is_final = data.get("is_final", False)
-        if not is_final:
-            return
-
-        logger.info("Transcript: %s", transcript)
+    def _on_transcript(self, transcript: str) -> None:
+        """Called by STT provider when a final transcript is ready."""
         self._last_transcript_time = time.time()
 
         # Don't process if we're currently speaking (avoid echo)
@@ -210,38 +184,73 @@ class AudioPipeline:
             logger.debug("Ignoring transcript while speaking")
             return
 
-        # Add to conversation and get LLM response
-        self._conversation.append({"role": "user", "content": transcript})
+        # Accumulate transcript segments and debounce
+        self._pending_text.append(transcript)
 
-        # Keep conversation history manageable (last 20 turns)
-        if len(self._conversation) > 21:
-            self._conversation = [self._conversation[0]] + self._conversation[-20:]
+        # Cancel any pending debounce timer
+        if self._debounce_task and not self._debounce_task.done():
+            self._debounce_task.cancel()
 
-        asyncio.create_task(self._respond())
+        self._debounce_task = asyncio.create_task(self._debounced_respond())
+
+    async def _debounced_respond(self) -> None:
+        """Wait for silence, then combine pending text and respond."""
+        await asyncio.sleep(self._debounce_seconds)
+
+        combined = " ".join(self._pending_text).strip()
+        self._pending_text.clear()
+
+        if not combined:
+            return
+
+        logger.info("Combined transcript: %s", combined)
+
+        self._conversation.append({"role": "user", "content": combined})
+
+        # Keep conversation history manageable
+        if len(self._conversation) > self._max_turns + 1:
+            self._conversation = [self._conversation[0]] + self._conversation[-self._max_turns:]
+
+        await self._respond()
+
+    def _play_filler(self) -> None:
+        """Play a random pre-cached filler clip instantly."""
+        if not self._filler_cache or not self._on_tts_audio:
+            return
+        clip = random.choice(self._filler_cache)
+        logger.info("Playing filler clip (%d bytes)", len(clip))
+        self._on_tts_audio(clip)
 
     async def _respond(self) -> None:
         """Generate LLM response and synthesize speech."""
         try:
             self._is_speaking = True
 
-            # Step 1: Groq LLM
-            llm_response = await self._call_groq()
+            # Play a filler immediately so the user hears something fast
+            self._play_filler()
+
+            # Step 1: LLM (runs while filler is playing)
+            llm_response = await self._llm.chat(
+                self._conversation,
+                max_tokens=self._llm_max_tokens,
+                temperature=self._llm_temperature,
+            )
             if not llm_response:
                 return
 
             logger.info("LLM response: %s", llm_response[:100])
             self._conversation.append({"role": "assistant", "content": llm_response})
 
-            # Step 2: ElevenLabs TTS
-            tts_audio = await self._call_elevenlabs(llm_response)
-            if not tts_audio:
+            # Step 2: TTS
+            tts_result = await self._tts.synthesize(llm_response)
+            if not tts_result:
                 return
 
-            # Step 3: Send TTS audio to meeting via WebSocket → WebRTC injection.
-            # Resample to 32kHz (on_tts_audio resamples to 48kHz for Web Audio).
-            # Run in thread executor to avoid blocking asyncio event loop.
+            tts_audio, sample_rate = tts_result
+
+            # Step 3: Send TTS audio to meeting (queues after filler).
             if self._on_tts_audio:
-                pcm_32k = resample_to_32k(tts_audio, 22050)
+                pcm_32k = resample_to_32k(tts_audio, sample_rate)
                 logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz)",
                             len(pcm_32k), len(pcm_32k) / (32000 * 2))
                 loop = asyncio.get_event_loop()
@@ -252,59 +261,23 @@ class AudioPipeline:
         finally:
             self._is_speaking = False
 
-    async def _call_groq(self) -> str | None:
-        """Call Groq LLM for a chat completion."""
-        if not self._http_client:
-            return None
-
+    async def send_tts(self, text: str) -> None:
+        """Synthesize and send speech directly, bypassing the LLM."""
         try:
-            resp = await self._http_client.post(
-                GROQ_API_URL,
-                headers={
-                    "Authorization": f"Bearer {self._groq_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": GROQ_MODEL,
-                    "messages": self._conversation,
-                    "temperature": 0.5,
-                    "max_tokens": 200,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-        except Exception:
-            logger.exception("Groq API error")
-            return None
+            self._is_speaking = True
+            logger.info("Sending direct TTS: %s", text)
 
-    async def _call_elevenlabs(self, text: str) -> bytes | None:
-        """Call ElevenLabs TTS and return raw PCM audio."""
-        if not self._http_client:
-            return None
+            tts_result = await self._tts.synthesize(text)
+            if tts_result and self._on_tts_audio:
+                tts_audio, sample_rate = tts_result
+                pcm_32k = resample_to_32k(tts_audio, sample_rate)
+                logger.info("Direct TTS audio: %d bytes (%.1fs at 32kHz)",
+                            len(pcm_32k), len(pcm_32k) / (32000 * 2))
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._on_tts_audio, pcm_32k)
 
-        try:
-            # output_format MUST be a query parameter (not in JSON body),
-            # otherwise ElevenLabs ignores it and returns MP3 by default.
-            resp = await self._http_client.post(
-                f"{ELEVENLABS_API_URL}/{ELEVENLABS_VOICE_ID}?output_format=pcm_22050",
-                headers={
-                    "xi-api-key": self._elevenlabs_key,
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "text": text,
-                    "model_id": "eleven_turbo_v2_5",
-                    "voice_settings": {
-                        "stability": 0.3,
-                        "similarity_boost": 0.75,
-                        "style": 0.5,
-                        "use_speaker_boost": True,
-                    },
-                },
-            )
-            resp.raise_for_status()
-            return resp.content
+            self._conversation.append({"role": "assistant", "content": text})
         except Exception:
-            logger.exception("ElevenLabs API error")
-            return None
+            logger.exception("Error in direct TTS")
+        finally:
+            self._is_speaking = False

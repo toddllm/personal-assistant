@@ -9,9 +9,9 @@ from threading import Event, Lock, Thread
 from typing import Callable
 from uuid import uuid4
 
-logger = logging.getLogger(__name__)
-
 from audio_assist.transcriber import AudioSegment
+
+logger = logging.getLogger(__name__)
 
 
 OnSegment = Callable[[AudioSegment], None]

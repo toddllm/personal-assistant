@@ -225,7 +225,7 @@ For interactive AI conversations, use scripts/ai-call.py instead.
     parser.add_argument("--zoom-number", help="Zoom dial-in number")
     parser.add_argument("--meeting-id", help="Zoom meeting ID")
     parser.add_argument("--passcode", help="Zoom meeting passcode")
-    parser.add_argument("--message", help=f"TTS message to speak (default: test phrase)")
+    parser.add_argument("--message", help="TTS message to speak (default: test phrase)")
     parser.add_argument("--status", help="Check status of a call by SID", metavar="CALL_SID")
 
     args = parser.parse_args()
