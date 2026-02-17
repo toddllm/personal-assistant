@@ -8,8 +8,10 @@ Run with: uvicorn discord_bot.main:app --host 0.0.0.0 --port 8796
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import discord
 
@@ -89,8 +91,8 @@ def _create_providers(settings: Settings):
 # ---------------------------------------------------------------------------
 
 class JoinRequest(BaseModel):
-    guild_id: int
-    channel_id: int
+    guild_id: str  # String to preserve JS precision for snowflake IDs
+    channel_id: str
 
 
 class StatusResponse(BaseModel):
@@ -156,6 +158,38 @@ class HealthResponse(BaseModel):
 settings = Settings()
 _voice_bot: DiscordVoiceBot | None = None
 _bot_task: asyncio.Task | None = None
+
+_RUNTIME_SETTINGS_PATH = Path("data/discord-bot-settings.json")
+
+
+def _load_runtime_overrides() -> None:
+    """Apply saved runtime overrides (voice, model, etc.) to settings."""
+    if not _RUNTIME_SETTINGS_PATH.exists():
+        return
+    try:
+        overrides = json.loads(_RUNTIME_SETTINGS_PATH.read_text())
+        for key in ("tts_qwen_voice", "llm_model", "llm_temperature", "llm_max_tokens", "system_prompt"):
+            if key in overrides:
+                setattr(settings, key, overrides[key])
+        logger.info("Loaded runtime overrides: %s", list(overrides.keys()))
+    except Exception:
+        logger.exception("Failed to load runtime overrides")
+
+
+def _save_runtime_overrides(**kwargs: object) -> None:
+    """Persist runtime settings so they survive restarts."""
+    existing: dict = {}
+    if _RUNTIME_SETTINGS_PATH.exists():
+        try:
+            existing = json.loads(_RUNTIME_SETTINGS_PATH.read_text())
+        except Exception:
+            pass
+    existing.update(kwargs)
+    _RUNTIME_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _RUNTIME_SETTINGS_PATH.write_text(json.dumps(existing, indent=2))
+
+
+_load_runtime_overrides()
 
 
 @asynccontextmanager
@@ -232,7 +266,9 @@ async def join(req: JoinRequest):
         raise HTTPException(400, "Already in a voice channel. Leave first.")
 
     try:
-        await _voice_bot.join_channel(req.guild_id, req.channel_id)
+        guild_id = int(req.guild_id)
+        channel_id = int(req.channel_id)
+        await _voice_bot.join_channel(guild_id, channel_id)
     except Exception as exc:
         logger.exception("Failed to join voice channel")
         raise HTTPException(500, f"Failed to join: {exc}")
@@ -264,11 +300,11 @@ async def list_guilds():
             if isinstance(ch, discord.VoiceChannel):
                 members = [m.display_name for m in ch.members if not m.bot]
                 channels.append({
-                    "id": ch.id, "name": ch.name,
+                    "id": str(ch.id), "name": ch.name,
                     "members": members, "member_count": len(members),
                 })
         result.append({
-            "id": guild.id, "name": guild.name,
+            "id": str(guild.id), "name": guild.name,
             "channels": channels,
         })
     return {"guilds": result}
@@ -315,6 +351,7 @@ async def set_voice(req: VoiceSettingRequest):
         raise HTTPException(503, "TTS provider not available.")
     # Also update settings so status reflects it
     settings.tts_qwen_voice = new_voice
+    _save_runtime_overrides(tts_qwen_voice=new_voice)
     return VoiceSettingResponse(voice=new_voice)
 
 
@@ -348,27 +385,37 @@ async def update_settings(req: BotSettingsRequest):
     if not _voice_bot:
         raise HTTPException(503, "Bot not initialized")
 
+    persist: dict = {}
+
     if req.tts_voice is not None and hasattr(_voice_bot._tts, "_voice"):
         _voice_bot._tts._voice = req.tts_voice
         settings.tts_qwen_voice = req.tts_voice
+        persist["tts_qwen_voice"] = req.tts_voice
         logger.info("TTS voice changed to: %s", req.tts_voice)
 
     if req.llm_model is not None and hasattr(_voice_bot._llm, "_model"):
         _voice_bot._llm._model = req.llm_model
         settings.llm_model = req.llm_model
+        persist["llm_model"] = req.llm_model
         logger.info("LLM model changed to: %s", req.llm_model)
 
     if req.llm_temperature is not None:
         settings.llm_temperature = req.llm_temperature
+        persist["llm_temperature"] = req.llm_temperature
 
     if req.llm_max_tokens is not None:
         settings.llm_max_tokens = req.llm_max_tokens
+        persist["llm_max_tokens"] = req.llm_max_tokens
 
     if req.system_prompt is not None:
         settings.system_prompt = req.system_prompt
+        persist["system_prompt"] = req.system_prompt
 
     if req.debounce_seconds is not None:
         settings.debounce_seconds = req.debounce_seconds
+
+    if persist:
+        _save_runtime_overrides(**persist)
 
     return await get_settings()
 
@@ -724,7 +771,7 @@ async function joinChannel() {
   const sel = document.getElementById('sel-channel');
   const val = sel.value;
   if (!val) { toast('voice-toast', 'Select a channel first', 'err'); return; }
-  const [guildId, channelId] = val.split(':').map(Number);
+  const [guildId, channelId] = val.split(':');
   const btn = document.getElementById('btn-join');
   btn.disabled = true; btn.textContent = 'Joining...';
   try {
