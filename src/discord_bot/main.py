@@ -101,9 +101,16 @@ class StatusResponse(BaseModel):
     active_speakers: int | None = None
 
 
+class VoiceOption(BaseModel):
+    name: str
+    display_name: str
+    voice_type: str = "builtin"
+    is_owner: bool = False
+
+
 class VoiceSettingResponse(BaseModel):
     voice: str = ""
-    available_voices: list[str] = Field(default_factory=list)
+    available_voices: list[VoiceOption] = Field(default_factory=list)
 
 
 class VoiceSettingRequest(BaseModel):
@@ -218,14 +225,20 @@ async def get_voice():
     """Get the current TTS voice and list of available voices."""
     current = settings.tts_qwen_voice
     # Try to fetch available voices from TTS service
-    available: list[str] = []
+    available: list[VoiceOption] = []
     try:
         import httpx
         async with httpx.AsyncClient(timeout=5) as client:
             r = await client.get(f"{settings.tts_qwen_url}/v1/profiles")
             if r.status_code == 200:
                 data = r.json()
-                available = [p["name"] for p in data.get("profiles", [])]
+                for p in data.get("profiles", []):
+                    available.append(VoiceOption(
+                        name=p["name"],
+                        display_name=p.get("display_name", p["name"]),
+                        voice_type=p.get("voice_type", "builtin"),
+                        is_owner=p.get("is_owner", False),
+                    ))
     except Exception:
         pass
     # Also report the runtime voice if TTS provider is live

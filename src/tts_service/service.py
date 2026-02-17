@@ -1007,30 +1007,58 @@ async function loadDiscordVoice() {
   const sel = document.getElementById('discord-voice');
   const benchSel = document.getElementById('bench-voice-select');
   const statusEl = document.getElementById('discord-status');
+
+  // Helper to populate a select from voice objects
+  function populateSelect(selectEl, voices, currentVoice, includeAll) {
+    selectEl.innerHTML = '';
+    if (includeAll) {
+      const allOpt = document.createElement('option');
+      allOpt.value = '__all__'; allOpt.textContent = 'All voices';
+      selectEl.appendChild(allOpt);
+    }
+    const cloned = voices.filter(v => v.voice_type === 'cloned');
+    const builtin = voices.filter(v => v.voice_type !== 'cloned');
+    if (cloned.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = 'Cloned';
+      cloned.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v.name;
+        opt.textContent = v.display_name + (v.is_owner ? ' (owner)' : '');
+        if (v.name === currentVoice) opt.selected = true;
+        grp.appendChild(opt);
+      });
+      selectEl.appendChild(grp);
+    }
+    if (builtin.length > 0) {
+      const grp = document.createElement('optgroup');
+      grp.label = 'Builtin';
+      builtin.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v.name;
+        opt.textContent = v.display_name;
+        if (v.name === currentVoice) opt.selected = true;
+        grp.appendChild(opt);
+      });
+      selectEl.appendChild(grp);
+    }
+  }
+
   try {
     const r = await fetch(DISCORD_API + '/voice');
     if (!r.ok) throw new Error('status ' + r.status);
     const d = await r.json();
-    sel.innerHTML = '';
-    const voices = d.available_voices && d.available_voices.length > 0 ? d.available_voices : [];
+    const voices = d.available_voices || [];
     if (voices.length === 0) {
       sel.innerHTML = '<option value="">no voices available</option>';
     } else {
-      voices.forEach(v => {
-        const opt = document.createElement('option');
-        opt.value = v; opt.textContent = v;
-        if (v === d.voice) opt.selected = true;
-        sel.appendChild(opt);
-      });
+      populateSelect(sel, voices, d.voice, false);
+      populateSelect(benchSel, voices, null, true);
     }
-    // Also populate benchmark voice dropdown from TTS profiles
-    benchSel.innerHTML = '<option value="__all__">All voices</option>';
-    voices.forEach(v => {
-      const opt = document.createElement('option');
-      opt.value = v; opt.textContent = v;
-      benchSel.appendChild(opt);
-    });
-    statusEl.textContent = 'connected — current: ' + d.voice;
+    // Show display name for current voice
+    const currentProfile = voices.find(v => v.name === d.voice);
+    const currentLabel = currentProfile ? currentProfile.display_name : d.voice;
+    statusEl.textContent = 'connected — current: ' + currentLabel;
     statusEl.className = 'bot-status connected';
   } catch (e) {
     sel.innerHTML = '<option value="">offline</option>';
@@ -1040,12 +1068,11 @@ async function loadDiscordVoice() {
     try {
       const r2 = await fetch(API + '/v1/profiles');
       const d2 = await r2.json();
-      benchSel.innerHTML = '<option value="__all__">All voices</option>';
-      d2.profiles.forEach(p => {
-        const opt = document.createElement('option');
-        opt.value = p.name; opt.textContent = p.name;
-        benchSel.appendChild(opt);
-      });
+      const voices = (d2.profiles || []).map(p => ({
+        name: p.name, display_name: p.display_name || p.name,
+        voice_type: p.voice_type || 'builtin', is_owner: p.is_owner || false,
+      }));
+      populateSelect(benchSel, voices, null, true);
     } catch (_) {}
   }
 }
