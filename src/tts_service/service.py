@@ -514,26 +514,49 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
 
   /* Bot settings bar */
   .bot-bar {
-    margin-top: 16px; display: flex; gap: 16px; flex-wrap: wrap;
+    margin-top: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
   }
+  @media (max-width: 760px) { .bot-bar { grid-template-columns: 1fr; } }
   .bot-card {
     background: #16213e; border: 1px solid #0f3460;
-    border-radius: 8px; padding: 12px 16px; flex: 1; min-width: 260px;
+    border-radius: 8px; padding: 12px 16px;
   }
+  .bot-card.full-width { grid-column: 1 / -1; }
   .bot-card-title {
     font-size: 11px; font-weight: 600; text-transform: uppercase;
     letter-spacing: 1px; color: #0f3460; margin-bottom: 8px;
   }
-  .bot-card-row { display: flex; align-items: center; gap: 8px; }
-  .bot-card-row select {
+  .bot-card-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  .bot-card-row:last-child { margin-bottom: 0; }
+  .bot-card-row select, .bot-card-row input[type=text] {
     flex: 1; font-size: 12px; padding: 6px 8px;
     background: #1a1a2e; color: #e0e0e0;
     border: 1px solid #0f3460; border-radius: 4px; outline: none;
   }
-  .bot-card-row select:focus { border-color: #e94560; }
+  .bot-card-row select:focus, .bot-card-row input:focus { border-color: #e94560; }
   .bot-status { font-size: 10px; color: #555; margin-top: 6px; }
   .bot-status.connected { color: #00e676; }
   .bot-status.offline { color: #ff5252; }
+
+  /* Latency results */
+  .latency-results {
+    margin-top: 10px; max-height: 300px; overflow-y: auto;
+  }
+  .latency-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 8px; border-radius: 4px; margin-bottom: 3px;
+    font-size: 11px; background: rgba(15, 52, 96, 0.2);
+  }
+  .latency-voice { font-weight: 500; min-width: 80px; }
+  .latency-time { color: #00e676; font-variant-numeric: tabular-nums; min-width: 60px; }
+  .latency-time.slow { color: #ffc107; }
+  .latency-time.very-slow { color: #ff5252; }
+  .latency-bar {
+    flex: 1; height: 6px; background: #1a1a2e; border-radius: 3px; overflow: hidden;
+  }
+  .latency-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .latency-play { cursor: pointer; opacity: 0.6; transition: opacity 0.15s; }
+  .latency-play:hover { opacity: 1; }
 </style>
 </head>
 <body>
@@ -593,7 +616,7 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Bot Voice Settings -->
+  <!-- Bot Voice Settings & Testing -->
   <div class="bot-bar">
     <div class="bot-card">
       <div class="bot-card-title">Discord Bot Voice</div>
@@ -602,6 +625,26 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
         <button class="btn" id="btn-discord-apply">Apply</button>
       </div>
       <div class="bot-status" id="discord-status">checking...</div>
+    </div>
+
+    <div class="bot-card">
+      <div class="bot-card-title">Voice Latency Test</div>
+      <div class="bot-card-row">
+        <input type="text" id="bench-text" value="The quick brown fox jumps over the lazy dog." placeholder="Test phrase..." />
+      </div>
+      <div class="bot-card-row">
+        <select id="bench-voice-select"><option value="__all__">All voices</option></select>
+        <button class="btn" id="btn-bench">Run Test</button>
+        <button class="btn" id="btn-bench-all">Benchmark All</button>
+      </div>
+      <div class="bot-status" id="bench-status"></div>
+    </div>
+
+    <div class="bot-card full-width">
+      <div class="bot-card-title">Results</div>
+      <div class="latency-results" id="latency-results">
+        <div class="empty-list">Run a test to see latency results</div>
+      </div>
     </div>
   </div>
 </div>
@@ -633,6 +676,15 @@ async function init() {
 
   // Discord bot voice
   document.getElementById('btn-discord-apply').onclick = applyDiscordVoice;
+  document.getElementById('btn-bench').onclick = () => {
+    const v = document.getElementById('bench-voice-select').value;
+    if (v !== '__all__') document.getElementById('bench-voice-select').value = v;
+    runBenchmark();
+  };
+  document.getElementById('btn-bench-all').onclick = () => {
+    document.getElementById('bench-voice-select').value = '__all__';
+    runBenchmark();
+  };
   loadDiscordVoice();
   setInterval(loadDiscordVoice, 30000);
 }
@@ -949,9 +1001,11 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 
 // --- Discord Bot Voice ---
 const DISCORD_API = 'http://localhost:8796';
+let benchResults = [];
 
 async function loadDiscordVoice() {
   const sel = document.getElementById('discord-voice');
+  const benchSel = document.getElementById('bench-voice-select');
   const statusEl = document.getElementById('discord-status');
   try {
     const r = await fetch(DISCORD_API + '/voice');
@@ -969,12 +1023,30 @@ async function loadDiscordVoice() {
         sel.appendChild(opt);
       });
     }
+    // Also populate benchmark voice dropdown from TTS profiles
+    benchSel.innerHTML = '<option value="__all__">All voices</option>';
+    voices.forEach(v => {
+      const opt = document.createElement('option');
+      opt.value = v; opt.textContent = v;
+      benchSel.appendChild(opt);
+    });
     statusEl.textContent = 'connected — current: ' + d.voice;
     statusEl.className = 'bot-status connected';
   } catch (e) {
     sel.innerHTML = '<option value="">offline</option>';
     statusEl.textContent = 'offline — is discord-bot running on :8796?';
     statusEl.className = 'bot-status offline';
+    // Still load voices from TTS for benchmark
+    try {
+      const r2 = await fetch(API + '/v1/profiles');
+      const d2 = await r2.json();
+      benchSel.innerHTML = '<option value="__all__">All voices</option>';
+      d2.profiles.forEach(p => {
+        const opt = document.createElement('option');
+        opt.value = p.name; opt.textContent = p.name;
+        benchSel.appendChild(opt);
+      });
+    } catch (_) {}
   }
 }
 
@@ -1002,6 +1074,108 @@ async function applyDiscordVoice() {
     statusEl.textContent = 'error: ' + e.message;
     statusEl.className = 'bot-status offline';
   }
+}
+
+// --- Latency Benchmarking ---
+async function benchmarkVoice(voice, text) {
+  const t0 = performance.now();
+  const r = await fetch(API + '/v1/synthesize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text, voice, save_audio: false }),
+  });
+  const d = await r.json();
+  const latencyMs = performance.now() - t0;
+  const audioSize = d.audio_base64 ? Math.round(d.audio_base64.length * 3 / 4 / 1024) : 0;
+  return { voice, latencyMs, audioSize, audioBase64: d.audio_base64, provider: d.provider || '' };
+}
+
+async function runBenchmark() {
+  const text = document.getElementById('bench-text').value.trim();
+  if (!text) { showStatus('Enter test text', 'err'); return; }
+  const voiceSel = document.getElementById('bench-voice-select').value;
+  const statusEl = document.getElementById('bench-status');
+  const btnSingle = document.getElementById('btn-bench');
+  const btnAll = document.getElementById('btn-bench-all');
+  btnSingle.disabled = true; btnAll.disabled = true;
+
+  let voices = [];
+  if (voiceSel === '__all__') {
+    const opts = document.getElementById('bench-voice-select').options;
+    for (let i = 1; i < opts.length; i++) voices.push(opts[i].value);
+  } else {
+    voices = [voiceSel];
+  }
+
+  benchResults = [];
+  statusEl.textContent = 'Testing ' + voices.length + ' voice(s)...';
+  statusEl.className = 'bot-status connected';
+
+  for (let i = 0; i < voices.length; i++) {
+    statusEl.textContent = 'Testing ' + voices[i] + ' (' + (i + 1) + '/' + voices.length + ')...';
+    try {
+      const result = await benchmarkVoice(voices[i], text);
+      benchResults.push(result);
+      renderBenchResults();
+    } catch (e) {
+      benchResults.push({ voice: voices[i], latencyMs: -1, audioSize: 0, audioBase64: null, error: e.message });
+      renderBenchResults();
+    }
+  }
+
+  statusEl.textContent = 'Done — ' + voices.length + ' voice(s) tested';
+  btnSingle.disabled = false; btnAll.disabled = false;
+}
+
+function renderBenchResults() {
+  const el = document.getElementById('latency-results');
+  if (benchResults.length === 0) {
+    el.innerHTML = '<div class="empty-list">Run a test to see latency results</div>';
+    return;
+  }
+
+  const maxMs = Math.max(...benchResults.filter(r => r.latencyMs > 0).map(r => r.latencyMs), 1);
+  let html = '';
+  const sorted = [...benchResults].sort((a, b) => {
+    if (a.latencyMs < 0) return 1;
+    if (b.latencyMs < 0) return -1;
+    return a.latencyMs - b.latencyMs;
+  });
+
+  sorted.forEach((r, i) => {
+    if (r.latencyMs < 0) {
+      html += '<div class="latency-row"><span class="latency-voice">' + esc(r.voice) + '</span><span class="latency-time very-slow">error</span><span style="font-size:10px;color:#ff5252">' + esc(r.error || 'failed') + '</span></div>';
+      return;
+    }
+    const ms = Math.round(r.latencyMs);
+    const pct = Math.round((r.latencyMs / maxMs) * 100);
+    const cls = ms > 5000 ? 'very-slow' : ms > 2000 ? 'slow' : '';
+    const color = ms > 5000 ? '#ff5252' : ms > 2000 ? '#ffc107' : '#00e676';
+    const provTag = r.provider.includes('clone') ? '<span class="voice-tag">clone</span>' : '';
+    html += '<div class="latency-row">' +
+      '<span class="latency-voice">' + esc(r.voice) + ' ' + provTag + '</span>' +
+      '<span class="latency-time ' + cls + '">' + ms + 'ms</span>' +
+      '<div class="latency-bar"><div class="latency-bar-fill" style="width:' + pct + '%;background:' + color + '"></div></div>' +
+      '<span style="font-size:10px;color:#555">' + r.audioSize + 'KB</span>' +
+      (r.audioBase64 ? '<span class="latency-play" onclick="playBenchAudio(' + i + ')" title="Play">&#9654;</span>' : '') +
+      '</div>';
+  });
+  el.innerHTML = html;
+}
+
+let benchAudio = null;
+function playBenchAudio(idx) {
+  if (benchAudio) { benchAudio.pause(); benchAudio = null; }
+  const sorted = [...benchResults].sort((a, b) => {
+    if (a.latencyMs < 0) return 1;
+    if (b.latencyMs < 0) return -1;
+    return a.latencyMs - b.latencyMs;
+  });
+  const r = sorted[idx];
+  if (!r || !r.audioBase64) return;
+  benchAudio = new Audio('data:audio/wav;base64,' + r.audioBase64);
+  benchAudio.onended = () => { benchAudio = null; };
+  benchAudio.play();
 }
 
 // --- Edit Voice ---
