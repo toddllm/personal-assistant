@@ -480,6 +480,32 @@ VOICE_CLONE_UI = """<!DOCTYPE html>
 
   .empty-list { color: #444; font-size: 12px; font-style: italic; padding: 20px 0; text-align: center; }
 
+  /* Edit form (inline) */
+  .edit-form {
+    padding: 10px; margin: 4px 0 8px; border-radius: 6px;
+    background: rgba(15, 52, 96, 0.3); border: 1px solid #0f3460;
+  }
+  .edit-form .form-group { margin-bottom: 8px; }
+  .edit-form .form-label { margin-bottom: 2px; }
+  .edit-form input[type=text] { font-size: 12px; padding: 6px 8px; }
+  .edit-form .edit-btn-row { display: flex; gap: 6px; margin-top: 8px; }
+  .edit-form .btn-save {
+    font-size: 11px; padding: 6px 14px; font-weight: 600;
+    border: 1px solid #00e676; border-radius: 4px;
+    background: rgba(0,230,118,0.1); color: #00e676;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .edit-form .btn-save:hover { background: rgba(0,230,118,0.2); }
+  .edit-form .btn-cancel {
+    font-size: 11px; padding: 6px 14px;
+    border: 1px solid #555; border-radius: 4px;
+    background: transparent; color: #888;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .edit-form .btn-cancel:hover { border-color: #888; color: #e0e0e0; }
+  .btn-edit { border-color: #ffc107; color: #ffc107; background: rgba(255,193,7,0.08); }
+  .btn-edit:hover { background: rgba(255,193,7,0.2); }
+
   /* Test text input */
   .test-row { margin-top: 12px; padding-top: 12px; border-top: 1px solid #0f3460; }
   .test-input-row { display: flex; gap: 6px; }
@@ -598,7 +624,22 @@ function renderVoices(profiles) {
         ${isOwner ? '<span class="voice-tag owner">owner</span>' : '<span class="voice-tag">cloned</span>'}
         <div class="voice-actions">
           <button class="btn" onclick="testVoice('${esc(p.name)}', this)">Test</button>
+          <button class="btn btn-edit" onclick="showEdit('${esc(p.name)}', '${esc(p.display_name)}', ${p.is_owner})">Edit</button>
           <button class="btn btn-danger" onclick="deleteVoice('${esc(p.name)}')">Delete</button>
+        </div>
+      </div>
+      <div class="edit-form" id="edit-${esc(p.name)}" style="display:none">
+        <div class="form-group">
+          <label class="form-label">Display Name</label>
+          <input type="text" id="edit-display-${esc(p.name)}" value="${esc(p.display_name)}" maxlength="100" />
+        </div>
+        <div class="checkbox-row">
+          <input type="checkbox" id="edit-owner-${esc(p.name)}" ${p.is_owner ? 'checked' : ''} />
+          <label for="edit-owner-${esc(p.name)}">Owner voice</label>
+        </div>
+        <div class="edit-btn-row">
+          <button class="btn-save" onclick="saveEdit('${esc(p.name)}')">Save</button>
+          <button class="btn-cancel" onclick="hideEdit('${esc(p.name)}')">Cancel</button>
         </div>
       </div>`;
     });
@@ -865,6 +906,38 @@ function showStatus(msg, type) {
   if (type === 'ok') setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 5000);
 }
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+// --- Edit Voice ---
+function showEdit(name) {
+  const el = document.getElementById('edit-' + name);
+  if (el) el.style.display = 'block';
+}
+function hideEdit(name) {
+  const el = document.getElementById('edit-' + name);
+  if (el) el.style.display = 'none';
+}
+async function saveEdit(name) {
+  const displayEl = document.getElementById('edit-display-' + name);
+  const ownerEl = document.getElementById('edit-owner-' + name);
+  if (!displayEl) return;
+  const displayName = displayEl.value.trim();
+  if (!displayName) { showStatus('Display name cannot be empty', 'err'); return; }
+  const isOwner = ownerEl ? ownerEl.checked : false;
+  try {
+    const r = await fetch(API + '/v1/profiles/' + encodeURIComponent(name), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ display_name: displayName, is_owner: isOwner }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showStatus('Updated "' + name + '"', 'ok');
+      await loadVoices();
+    } else {
+      showStatus(d.detail || 'Update failed', 'err');
+    }
+  } catch (e) { showStatus('Error: ' + e.message, 'err'); }
+}
 
 init();
 </script>
