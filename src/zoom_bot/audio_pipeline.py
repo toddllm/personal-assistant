@@ -243,26 +243,53 @@ class AudioPipeline:
         """Generate LLM response and synthesize speech."""
         try:
             self._is_speaking = True
+            self._emit("responding", {"stage": "start"})
 
             # Play a filler immediately so the user hears something fast
             self._play_filler()
 
             # Step 1: LLM (runs while filler is playing)
-            llm_response = await self._llm.chat(
-                self._conversation,
-                max_tokens=self._llm_max_tokens,
-                temperature=self._llm_temperature,
-            )
+            t0 = time.time()
+            try:
+                llm_response = await asyncio.wait_for(
+                    self._llm.chat(
+                        self._conversation,
+                        max_tokens=self._llm_max_tokens,
+                        temperature=self._llm_temperature,
+                    ),
+                    timeout=60.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error("LLM timed out after 60s")
+                self._emit("error", {"stage": "llm", "error": "timeout"})
+                return
+            llm_elapsed = time.time() - t0
+
             if not llm_response:
+                logger.warning("LLM returned empty response")
+                self._emit("error", {"stage": "llm", "error": "empty response"})
                 return
 
-            logger.info("LLM response: %s", llm_response[:100])
-            self._emit("llm_response", {"text": llm_response})
+            logger.info("LLM response (%.1fs): %s", llm_elapsed, llm_response[:100])
+            self._emit("llm_response", {"text": llm_response, "elapsed_s": round(llm_elapsed, 1)})
             self._conversation.append({"role": "assistant", "content": llm_response})
 
             # Step 2: TTS
-            tts_result = await self._tts.synthesize(llm_response)
+            t0 = time.time()
+            try:
+                tts_result = await asyncio.wait_for(
+                    self._tts.synthesize(llm_response),
+                    timeout=90.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error("TTS timed out after 90s")
+                self._emit("error", {"stage": "tts", "error": "timeout"})
+                return
+            tts_elapsed = time.time() - t0
+
             if not tts_result:
+                logger.warning("TTS returned no audio")
+                self._emit("error", {"stage": "tts", "error": "no audio"})
                 return
 
             tts_audio, sample_rate = tts_result
@@ -271,14 +298,18 @@ class AudioPipeline:
             if self._on_tts_audio:
                 pcm_32k = resample_to_32k(tts_audio, sample_rate)
                 duration_s = len(pcm_32k) / (32000 * 2)
-                logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz)",
-                            len(pcm_32k), duration_s)
-                self._emit("tts_audio", {"bytes": len(pcm_32k), "duration_s": round(duration_s, 1), "text": llm_response[:200]})
+                logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz, synth %.1fs)",
+                            len(pcm_32k), duration_s, tts_elapsed)
+                self._emit("tts_audio", {
+                    "bytes": len(pcm_32k), "duration_s": round(duration_s, 1),
+                    "text": llm_response[:200], "synth_s": round(tts_elapsed, 1),
+                })
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._on_tts_audio, pcm_32k)
 
         except Exception:
             logger.exception("Error in response pipeline")
+            self._emit("error", {"stage": "pipeline", "error": "exception"})
         finally:
             self._is_speaking = False
 
