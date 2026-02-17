@@ -11,7 +11,8 @@ import wave
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from tts_service.config import Settings
 from tts_service.engine import Qwen3CustomVoiceEngine, StubTTSEngine
@@ -92,6 +93,9 @@ def _split_text_for_stream(text: str, max_chars: int) -> list[str]:
 
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="tts-service", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    )
     settings.output_dir.mkdir(parents=True, exist_ok=True)
 
     if settings.provider == "stub":
@@ -106,6 +110,10 @@ def create_app(settings: Settings) -> FastAPI:
                 engine.load()
             except Exception:  # noqa: BLE001
                 logger.exception("TTS model startup load failed. Service will continue in degraded mode.")
+
+    @app.get("/", response_class=HTMLResponse)
+    def index() -> HTMLResponse:
+        return HTMLResponse(VOICE_CLONE_UI)
 
     @app.get("/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -339,3 +347,527 @@ def create_app(settings: Settings) -> FastAPI:
         }
 
     return app
+
+
+# ---------------------------------------------------------------------------
+# Voice Clone Web UI
+# ---------------------------------------------------------------------------
+
+VOICE_CLONE_UI = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Voice Profiles — TTS Service</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #1a1a2e; color: #e0e0e0;
+    min-height: 100vh; padding: 20px;
+  }
+  .container { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; color: #e94560; margin-bottom: 4px; }
+  .subtitle { font-size: 11px; color: #555; margin-bottom: 24px; }
+
+  .grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; }
+  @media (max-width: 760px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: #16213e; border: 1px solid #0f3460;
+    border-radius: 8px; padding: 16px;
+  }
+  .panel-title {
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1px; color: #0f3460; margin-bottom: 12px;
+  }
+
+  /* Voice list */
+  .voice-list { max-height: 520px; overflow-y: auto; }
+  .section-label {
+    font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.5px; color: #e94560; margin: 10px 0 6px; padding-left: 2px;
+  }
+  .voice-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-radius: 6px; margin-bottom: 4px;
+    transition: background 0.15s;
+  }
+  .voice-row:hover { background: rgba(15, 52, 96, 0.4); }
+  .voice-row.owner { background: rgba(233, 69, 96, 0.06); border: 1px solid rgba(233, 69, 96, 0.15); }
+  .voice-name { font-size: 13px; font-weight: 500; flex: 1; }
+  .voice-tag {
+    font-size: 9px; color: #888; background: rgba(15, 52, 96, 0.5);
+    padding: 2px 6px; border-radius: 3px;
+  }
+  .voice-tag.owner { color: #e94560; background: rgba(233, 69, 96, 0.12); }
+  .voice-actions { display: flex; gap: 4px; }
+
+  /* Buttons */
+  .btn {
+    font-size: 10px; padding: 4px 10px;
+    border: 1px solid #0f3460; border-radius: 4px;
+    background: #1a1a2e; color: #e0e0e0;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  .btn:hover { background: #0f3460; border-color: #e94560; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn.playing { border-color: #2196f3; color: #2196f3; }
+  .btn-danger { border-color: #ff5252; color: #ff5252; background: rgba(255,82,82,0.08); }
+  .btn-danger:hover { background: rgba(255,82,82,0.2); }
+  .btn-primary {
+    font-size: 12px; padding: 10px 20px; font-weight: 600;
+    border: 1px solid #e94560; border-radius: 6px;
+    background: rgba(233, 69, 96, 0.1); color: #e94560;
+    cursor: pointer; transition: all 0.15s; width: 100%; margin-top: 8px;
+  }
+  .btn-primary:hover:not(:disabled) { background: rgba(233, 69, 96, 0.2); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; border-color: #555; color: #888; background: rgba(85,85,85,0.1); }
+
+  /* Clone form */
+  .form-group { margin-bottom: 12px; }
+  .form-label {
+    display: block; font-size: 10px; color: #888;
+    text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px;
+  }
+  input[type=text], textarea {
+    width: 100%; font-size: 12px; padding: 8px 10px;
+    background: #1a1a2e; color: #e0e0e0;
+    border: 1px solid #0f3460; border-radius: 4px; outline: none;
+    font-family: inherit;
+  }
+  input:focus, textarea:focus { border-color: #e94560; }
+  textarea { resize: vertical; min-height: 60px; }
+
+  .file-row { display: flex; align-items: center; gap: 8px; }
+  .file-btn {
+    font-size: 11px; padding: 8px 14px;
+    border: 1px dashed #0f3460; border-radius: 4px;
+    background: transparent; color: #888;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  .file-btn:hover { border-color: #e94560; color: #e0e0e0; }
+  .file-btn.has-file { border-style: solid; border-color: #00e676; color: #00e676; }
+  .file-name { font-size: 10px; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .file-info { font-size: 10px; color: #444; margin-top: 4px; }
+
+  /* Record button */
+  .record-row { display: flex; gap: 8px; margin-top: 8px; }
+  .btn-record {
+    font-size: 11px; padding: 6px 14px;
+    border: 1px solid #ff5252; border-radius: 4px;
+    background: rgba(255, 82, 82, 0.08); color: #ff5252;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .btn-record:hover { background: rgba(255, 82, 82, 0.2); }
+  .btn-record.recording {
+    border-color: #ff5252; color: #fff; background: #ff5252;
+    animation: rec-pulse 1s ease-in-out infinite;
+  }
+  @keyframes rec-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+  .record-time { font-size: 11px; color: #888; line-height: 30px; font-variant-numeric: tabular-nums; }
+
+  .checkbox-row { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; }
+  .checkbox-row label { font-size: 11px; color: #888; cursor: pointer; }
+
+  .status-msg {
+    font-size: 11px; min-height: 16px; margin-top: 8px; padding: 6px;
+    border-radius: 4px; text-align: center;
+  }
+  .status-msg.ok { color: #00e676; background: rgba(0,230,118,0.08); }
+  .status-msg.err { color: #ff5252; background: rgba(255,82,82,0.08); }
+  .status-msg.info { color: #2196f3; background: rgba(33,150,243,0.08); }
+
+  .empty-list { color: #444; font-size: 12px; font-style: italic; padding: 20px 0; text-align: center; }
+
+  /* Test text input */
+  .test-row { margin-top: 12px; padding-top: 12px; border-top: 1px solid #0f3460; }
+  .test-input-row { display: flex; gap: 6px; }
+  .test-input-row input { flex: 1; }
+  .test-input-row .btn { padding: 8px 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Voice Profiles</h1>
+  <div class="subtitle">Manage voice clones &amp; test TTS voices</div>
+
+  <div class="grid">
+    <!-- Left: Voice List -->
+    <div class="panel">
+      <div class="panel-title">All Voices</div>
+      <div class="voice-list" id="voice-list">
+        <div class="empty-list">Loading voices...</div>
+      </div>
+      <div class="test-row">
+        <label class="form-label">Test Any Voice</label>
+        <div class="test-input-row">
+          <input type="text" id="test-text" value="Hello, this is a test of my voice." placeholder="Enter text to speak..." />
+          <button class="btn" id="btn-test-custom" disabled>Speak</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Clone Form -->
+    <div class="panel">
+      <div class="panel-title">Clone New Voice</div>
+      <div class="form-group">
+        <label class="form-label">Voice ID (lowercase, a-z, 0-9, _)</label>
+        <input type="text" id="clone-name" placeholder="e.g. todd" pattern="[a-z0-9_]+" maxlength="50" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Display Name</label>
+        <input type="text" id="clone-display" placeholder="e.g. Todd" maxlength="100" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Reference Text (what's said in the audio)</label>
+        <textarea id="clone-reftext" placeholder="Type the exact transcript of the reference audio..."></textarea>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Reference Audio (3-30 seconds WAV)</label>
+        <div class="file-row">
+          <button class="file-btn" id="btn-choose-file">Choose WAV File</button>
+          <span class="file-name" id="file-name">no file selected</span>
+          <input type="file" id="file-input" accept=".wav,audio/wav,audio/x-wav" style="display:none" />
+        </div>
+        <div class="file-info" id="file-info"></div>
+        <div class="record-row">
+          <button class="btn-record" id="btn-record">Record from Mic</button>
+          <span class="record-time" id="record-time"></span>
+        </div>
+      </div>
+      <div class="checkbox-row">
+        <input type="checkbox" id="clone-owner" /> <label for="clone-owner">Mark as owner voice</label>
+      </div>
+      <button class="btn-primary" id="btn-clone" disabled>Clone Voice</button>
+      <div class="status-msg" id="status-msg"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let selectedVoice = null;
+let audioCtx = null;
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingStartTime = 0;
+let recordTimer = null;
+let recordedBlob = null;
+
+// --- Init ---
+async function init() {
+  await loadVoices();
+  setInterval(loadVoices, 30000);
+
+  document.getElementById('btn-choose-file').onclick = () => document.getElementById('file-input').click();
+  document.getElementById('file-input').onchange = onFileSelected;
+  document.getElementById('btn-record').onclick = toggleRecording;
+  document.getElementById('btn-clone').onclick = cloneVoice;
+  document.getElementById('btn-test-custom').onclick = testCustomText;
+
+  document.getElementById('clone-name').oninput = updateCloneBtn;
+  document.getElementById('clone-display').oninput = updateCloneBtn;
+  document.getElementById('clone-reftext').oninput = updateCloneBtn;
+}
+
+// --- Voice List ---
+async function loadVoices() {
+  try {
+    const r = await fetch(API + '/v1/profiles');
+    const d = await r.json();
+    renderVoices(d.profiles);
+  } catch (e) {
+    document.getElementById('voice-list').innerHTML = '<div class="empty-list">Service unavailable</div>';
+  }
+}
+
+function renderVoices(profiles) {
+  const el = document.getElementById('voice-list');
+  const cloned = profiles.filter(p => p.voice_type === 'cloned');
+  const builtin = profiles.filter(p => p.voice_type === 'builtin');
+  let html = '';
+
+  if (cloned.length > 0) {
+    html += '<div class="section-label">Cloned Voices</div>';
+    cloned.forEach(p => {
+      const isOwner = p.is_owner;
+      const sel = selectedVoice === p.name ? ' style="outline:1px solid #e94560"' : '';
+      html += `<div class="voice-row${isOwner ? ' owner' : ''}"${sel} data-voice="${esc(p.name)}">
+        <span class="voice-name">${esc(p.display_name)}</span>
+        ${isOwner ? '<span class="voice-tag owner">owner</span>' : '<span class="voice-tag">cloned</span>'}
+        <div class="voice-actions">
+          <button class="btn" onclick="testVoice('${esc(p.name)}', this)">Test</button>
+          <button class="btn btn-danger" onclick="deleteVoice('${esc(p.name)}')">Delete</button>
+        </div>
+      </div>`;
+    });
+  }
+
+  html += '<div class="section-label">Builtin Voices</div>';
+  builtin.forEach(p => {
+    html += `<div class="voice-row" data-voice="${esc(p.name)}">
+      <span class="voice-name">${esc(p.display_name)}</span>
+      <span class="voice-tag">builtin</span>
+      <div class="voice-actions">
+        <button class="btn" onclick="testVoice('${esc(p.name)}', this)">Test</button>
+      </div>
+    </div>`;
+  });
+
+  el.innerHTML = html;
+
+  // Click to select voice for custom test
+  el.querySelectorAll('.voice-row').forEach(row => {
+    row.style.cursor = 'pointer';
+    row.onclick = (e) => {
+      if (e.target.tagName === 'BUTTON') return;
+      selectedVoice = row.dataset.voice;
+      document.getElementById('btn-test-custom').disabled = false;
+      el.querySelectorAll('.voice-row').forEach(r => r.style.outline = '');
+      row.style.outline = '1px solid #e94560';
+    };
+  });
+}
+
+// --- Test Voice ---
+let currentAudio = null;
+async function testVoice(name, btn) {
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  const origText = btn.textContent;
+  btn.textContent = '...';
+  btn.classList.add('playing');
+  try {
+    const r = await fetch(API + '/v1/profiles/' + encodeURIComponent(name) + '/test', { method: 'POST' });
+    const d = await r.json();
+    if (d.audio_base64) {
+      currentAudio = new Audio('data:audio/wav;base64,' + d.audio_base64);
+      currentAudio.onended = () => { btn.textContent = origText; btn.classList.remove('playing'); currentAudio = null; };
+      currentAudio.play();
+    } else {
+      btn.textContent = origText; btn.classList.remove('playing');
+    }
+  } catch (e) {
+    btn.textContent = origText; btn.classList.remove('playing');
+    console.error(e);
+  }
+}
+
+async function testCustomText() {
+  if (!selectedVoice) return;
+  const text = document.getElementById('test-text').value.trim();
+  if (!text) return;
+  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  const btn = document.getElementById('btn-test-custom');
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const r = await fetch(API + '/v1/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice: selectedVoice, save_audio: false }),
+    });
+    const d = await r.json();
+    if (d.audio_base64) {
+      currentAudio = new Audio('data:audio/wav;base64,' + d.audio_base64);
+      currentAudio.onended = () => { btn.textContent = 'Speak'; btn.disabled = false; currentAudio = null; };
+      btn.textContent = 'Playing...';
+      currentAudio.play();
+    } else {
+      btn.textContent = 'Speak'; btn.disabled = false;
+      showStatus(d.detail || 'No audio returned', 'err');
+    }
+  } catch (e) {
+    btn.textContent = 'Speak'; btn.disabled = false;
+    showStatus('Error: ' + e.message, 'err');
+  }
+}
+
+// --- Delete Voice ---
+async function deleteVoice(name) {
+  if (!confirm('Delete cloned voice "' + name + '"?')) return;
+  try {
+    const r = await fetch(API + '/v1/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) { showStatus('Deleted "' + name + '"', 'ok'); loadVoices(); }
+    else showStatus(d.detail || 'Delete failed', 'err');
+  } catch (e) { showStatus('Error: ' + e.message, 'err'); }
+}
+
+// --- File Selection ---
+let selectedFile = null;
+function onFileSelected() {
+  const input = document.getElementById('file-input');
+  const file = input.files[0];
+  if (!file) return;
+  selectedFile = file;
+  recordedBlob = null;
+  document.getElementById('file-name').textContent = file.name;
+  document.getElementById('btn-choose-file').className = 'file-btn has-file';
+
+  // Show duration info
+  const url = URL.createObjectURL(file);
+  const audio = new Audio(url);
+  audio.onloadedmetadata = () => {
+    document.getElementById('file-info').textContent =
+      file.name + ' — ' + audio.duration.toFixed(1) + 's, ' + (file.size / 1024).toFixed(0) + ' KB';
+    URL.revokeObjectURL(url);
+  };
+  updateCloneBtn();
+}
+
+// --- Recording ---
+async function toggleRecording() {
+  const btn = document.getElementById('btn-record');
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    btn.textContent = 'Record from Mic';
+    btn.classList.remove('recording');
+    clearInterval(recordTimer);
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async () => {
+      stream.getTracks().forEach(t => t.stop());
+      // Convert webm to wav via AudioContext
+      const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+      try {
+        const arrayBuf = await webmBlob.arrayBuffer();
+        if (!audioCtx) audioCtx = new AudioContext({ sampleRate: 24000 });
+        const decoded = await audioCtx.decodeAudioData(arrayBuf);
+        const wavBlob = audioBufferToWav(decoded);
+        recordedBlob = wavBlob;
+        selectedFile = null;
+        document.getElementById('file-input').value = '';
+        document.getElementById('file-name').textContent = 'recorded audio';
+        document.getElementById('btn-choose-file').className = 'file-btn has-file';
+        const dur = decoded.duration.toFixed(1);
+        document.getElementById('file-info').textContent = 'Recorded ' + dur + 's — ' + (wavBlob.size / 1024).toFixed(0) + ' KB';
+        updateCloneBtn();
+      } catch (e) { showStatus('Failed to convert recording: ' + e.message, 'err'); }
+    };
+    mediaRecorder.start(100);
+    recordingStartTime = Date.now();
+    btn.textContent = 'Stop Recording';
+    btn.classList.add('recording');
+    recordTimer = setInterval(() => {
+      const s = ((Date.now() - recordingStartTime) / 1000).toFixed(1);
+      document.getElementById('record-time').textContent = s + 's';
+    }, 100);
+  } catch (e) {
+    showStatus('Mic access denied: ' + e.message, 'err');
+  }
+}
+
+function audioBufferToWav(buffer) {
+  const numCh = 1;
+  const sr = buffer.sampleRate;
+  const data = buffer.getChannelData(0);
+  const bitsPerSample = 16;
+  const byteRate = sr * numCh * bitsPerSample / 8;
+  const blockAlign = numCh * bitsPerSample / 8;
+  const dataSize = data.length * blockAlign;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+
+  function writeStr(off, str) { for (let i = 0; i < str.length; i++) view.setUint8(off + i, str.charCodeAt(i)); }
+  writeStr(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numCh, true);
+  view.setUint32(24, sr, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bitsPerSample, true);
+  writeStr(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < data.length; i++) {
+    const s = Math.max(-1, Math.min(1, data[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    offset += 2;
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// --- Clone ---
+function updateCloneBtn() {
+  const name = document.getElementById('clone-name').value.trim();
+  const display = document.getElementById('clone-display').value.trim();
+  const reftext = document.getElementById('clone-reftext').value.trim();
+  const hasAudio = selectedFile || recordedBlob;
+  document.getElementById('btn-clone').disabled = !(name && display && reftext && hasAudio);
+}
+
+async function cloneVoice() {
+  const name = document.getElementById('clone-name').value.trim();
+  const display = document.getElementById('clone-display').value.trim();
+  const reftext = document.getElementById('clone-reftext').value.trim();
+  const isOwner = document.getElementById('clone-owner').checked;
+  const audioBlob = recordedBlob || selectedFile;
+  if (!name || !display || !reftext || !audioBlob) return;
+
+  const btn = document.getElementById('btn-clone');
+  btn.disabled = true; btn.textContent = 'Cloning...';
+  showStatus('Uploading audio and computing voice embedding...', 'info');
+
+  try {
+    const arrayBuf = await audioBlob.arrayBuffer();
+    const bytes = new Uint8Array(arrayBuf);
+    let binary = '';
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    const audioB64 = btoa(binary);
+
+    const r = await fetch(API + '/v1/profiles/clone', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name, display_name: display, ref_text: reftext,
+        ref_audio_base64: audioB64, is_owner: isOwner,
+      }),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showStatus('Voice "' + display + '" cloned successfully!', 'ok');
+      document.getElementById('clone-name').value = '';
+      document.getElementById('clone-display').value = '';
+      document.getElementById('clone-reftext').value = '';
+      document.getElementById('clone-owner').checked = false;
+      document.getElementById('file-input').value = '';
+      document.getElementById('file-name').textContent = 'no file selected';
+      document.getElementById('file-info').textContent = '';
+      document.getElementById('btn-choose-file').className = 'file-btn';
+      selectedFile = null; recordedBlob = null;
+      updateCloneBtn();
+      await loadVoices();
+    } else {
+      showStatus(d.detail || 'Clone failed', 'err');
+    }
+  } catch (e) {
+    showStatus('Error: ' + e.message, 'err');
+  }
+  btn.disabled = false; btn.textContent = 'Clone Voice';
+}
+
+// --- Helpers ---
+function showStatus(msg, type) {
+  const el = document.getElementById('status-msg');
+  el.textContent = msg;
+  el.className = 'status-msg ' + (type || '');
+  if (type === 'ok') setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 5000);
+}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+init();
+</script>
+</body>
+</html>
+"""
