@@ -212,20 +212,58 @@ _DEVICE_CHECK_INTERVAL = 2.0  # how often to check if target still exists
 _target_queues: dict[str, Queue] = {}
 _queues_lock = threading.Lock()
 
+# Per-target software volume (0.0 to 1.0), read from speaker-settings.json.
+# Updated periodically by the settings-refresh loop.
+_target_volumes: dict[str, float] = {}
+_volumes_lock = threading.Lock()
+
 # Event: set by output threads when they detect a device via subprocess
 # that isn't in the cached list.  The input reader closes briefly so
 # PortAudio can reinit.
 _reinit_needed = threading.Event()
 
 
+def _refresh_volumes() -> None:
+    """Periodically read speaker-settings.json and update per-target volumes."""
+    while not _shutdown.is_set():
+        try:
+            spk = _load_speaker_settings()
+            with _volumes_lock:
+                for slug, entry in spk.items():
+                    _target_volumes[slug] = max(0.0, min(1.0, entry.get("volume", 100) / 100.0))
+        except Exception:
+            pass
+        _shutdown.wait(0.5)
+
+
 def _refresh_portaudio() -> None:
-    """Terminate and reinitialize PortAudio to pick up new devices."""
-    log.info("refreshing PortAudio device list")
+    """Terminate and reinitialize PortAudio to pick up new devices.
+
+    CoreAudio can throw '!obj' or other errors when devices are mid-hotplug.
+    Retry a few times, and if it still fails, just continue — the output
+    writer threads will retry individually with subprocess-based discovery.
+    """
+    for attempt in range(3):
+        log.info("refreshing PortAudio device list (attempt %d/3)", attempt + 1)
+        try:
+            sd._terminate()
+            sd._initialize()
+            # Verify it actually works by querying devices
+            sd.query_devices()
+            log.info("PortAudio refresh succeeded")
+            return
+        except Exception:
+            log.warning("PortAudio refresh attempt %d failed", attempt + 1, exc_info=True)
+            import time
+            time.sleep(1.0)
+
+    # All retries failed — reinitialize one last time without verification
+    log.warning("PortAudio refresh failed after 3 attempts, continuing anyway")
     try:
-        sd._terminate()
         sd._initialize()
     except Exception:
-        log.debug("PortAudio refresh error (non-fatal)", exc_info=True)
+        log.error("PortAudio reinit failed completely — streams may not work until restart",
+                  exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +278,11 @@ def _input_reader(source_name: str, source_rate: int, source_channels: int) -> N
     while not _shutdown.is_set():
         # Refresh PortAudio if requested by an output thread
         if _reinit_needed.is_set():
-            _refresh_portaudio()
+            try:
+                _refresh_portaudio()
+            except Exception:
+                log.error("PortAudio refresh crashed — will retry on next cycle",
+                          exc_info=True)
             _reinit_needed.clear()
 
         source_idx = find_device(source_name, kind="input")
@@ -394,14 +436,21 @@ def _output_writer(
                 samplerate=target_rate,
                 channels=target_channels,
                 dtype="float32",
-                latency=0.005,
+                latency=0.05,
             ) as stream:
                 log.info("[%s] active", target_name)
+                # Use the stream's actual blocksize for silence frames
+                silence_blocksize = stream.blocksize or settings.audio_forward_blocksize
 
                 while not _shutdown.is_set() and not _reinit_needed.is_set() and not device_gone.is_set():
                     try:
-                        data = q.get(timeout=0.5)
+                        data = q.get(timeout=0.02)
                     except Empty:
+                        # Write silence to prevent CoreAudio underrun replay
+                        try:
+                            stream.write(np.zeros((silence_blocksize, target_channels), dtype="float32"))
+                        except sd.PortAudioError:
+                            device_gone.set()
                         continue
 
                     # Channel downmix (stereo -> mono)
@@ -411,6 +460,13 @@ def _output_writer(
                     # Resample (48kHz -> target rate) — streaming, stateful
                     if resampler is not None:
                         data = resampler.process(data)
+
+                    # Apply software volume from speaker-settings.json
+                    slug = _slugify(target_name)
+                    with _volumes_lock:
+                        vol = _target_volumes.get(slug, 1.0)
+                    if vol < 0.999:
+                        data = data * vol
 
                     try:
                         stream.write(data)
@@ -553,6 +609,15 @@ def main() -> None:
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
+
+    # Volume refresh thread (reads speaker-settings.json every 0.5s)
+    vol_thread = threading.Thread(
+        target=_refresh_volumes,
+        name="volume-refresh",
+        daemon=True,
+    )
+    vol_thread.start()
+    log.info("started volume refresh thread")
 
     # Input reader thread (single reader for CaptureAudio)
     input_thread = threading.Thread(
