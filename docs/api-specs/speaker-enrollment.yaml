@@ -1,0 +1,232 @@
+openapi: "3.1.0"
+info:
+  title: Speaker Enrollment & Verification API
+  description: >
+    Voice enrollment and speaker verification endpoints, extending the
+    existing speaker-service on port 8791.  Uses the same pcm_s16le_base64
+    audio format as /v1/diarize/chunk.
+  version: "0.1.0"
+  contact:
+    name: Audio Assist
+servers:
+  - url: http://127.0.0.1:8791
+    description: Local speaker-service (loopback only)
+
+paths:
+  /v1/enroll:
+    post:
+      operationId: enrollSpeaker
+      summary: Enroll a speaker from an audio sample
+      description: >
+        Submit a PCM audio clip to create or update a speaker profile.
+        The service extracts an ECAPA-TDNN embedding and stores it.
+        If a profile with the same name already exists, its embedding
+        is updated (averaged) and sample_count is incremented.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnrollRequest"
+      responses:
+        "201":
+          description: Profile created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeakerProfile"
+        "200":
+          description: Existing profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SpeakerProfile"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/profiles:
+    get:
+      operationId: listProfiles
+      summary: List all enrolled speaker profiles
+      description: >
+        Returns metadata for every enrolled speaker.  Embedding blobs
+        are never exposed through the API.
+      responses:
+        "200":
+          description: List of profiles
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SpeakerProfile"
+
+  /v1/profiles/{profile_id}:
+    delete:
+      operationId: deleteProfile
+      summary: Delete a speaker profile
+      parameters:
+        - name: profile_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "204":
+          description: Profile deleted
+        "404":
+          description: Profile not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/verify:
+    post:
+      operationId: verifySpeaker
+      summary: Verify a speaker against enrolled profiles
+      description: >
+        Submit a PCM audio clip and optionally a target profile id.
+        Returns similarity scores for matching profiles.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyRequest"
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VerifyResponse"
+        "422":
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    EnrollRequest:
+      type: object
+      required:
+        - name
+        - sample_rate
+        - pcm_s16le_base64
+      properties:
+        name:
+          type: string
+          description: Human-readable speaker name
+          examples: ["Alice"]
+        sample_rate:
+          type: integer
+          minimum: 8000
+          maximum: 192000
+          description: Sample rate of the audio in Hz
+          examples: [16000]
+        pcm_s16le_base64:
+          type: string
+          format: byte
+          description: Base64-encoded signed 16-bit little-endian PCM audio
+        is_owner:
+          type: boolean
+          default: false
+          description: Mark this profile as the device owner
+
+    SpeakerProfile:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        embedding_dim:
+          type: integer
+          description: Dimensionality of the stored embedding vector
+          examples: [192]
+        enrolled_at:
+          type: string
+          format: date-time
+        sample_count:
+          type: integer
+          description: Number of audio samples used to build this profile
+        is_owner:
+          type: boolean
+      required:
+        - id
+        - name
+        - embedding_dim
+        - enrolled_at
+        - sample_count
+        - is_owner
+
+    VerifyRequest:
+      type: object
+      required:
+        - sample_rate
+        - pcm_s16le_base64
+      properties:
+        sample_rate:
+          type: integer
+          minimum: 8000
+          maximum: 192000
+          examples: [16000]
+        pcm_s16le_base64:
+          type: string
+          format: byte
+        profile_id:
+          type: integer
+          description: >
+            Optional target profile to compare against.  If omitted,
+            the audio is compared against all enrolled profiles.
+
+    VerifyResponse:
+      type: object
+      properties:
+        matches:
+          type: array
+          items:
+            $ref: "#/components/schemas/VerifyMatch"
+        threshold:
+          type: number
+          format: float
+          description: Similarity threshold used for matching
+          examples: [0.25]
+      required:
+        - matches
+        - threshold
+
+    VerifyMatch:
+      type: object
+      properties:
+        profile_id:
+          type: integer
+        name:
+          type: string
+        similarity:
+          type: number
+          format: float
+          description: Cosine similarity score (0.0 – 1.0)
+        is_match:
+          type: boolean
+          description: Whether similarity exceeds the configured threshold
+      required:
+        - profile_id
+        - name
+        - similarity
+        - is_match
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+      required:
+        - detail

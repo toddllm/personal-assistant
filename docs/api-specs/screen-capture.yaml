@@ -1,0 +1,229 @@
+openapi: "3.1.0"
+info:
+  title: Screen Capture Service API
+  description: >
+    Microservice for periodic screen captures during meetings.
+    Runs as a standalone FastAPI service on port 8794 (loopback only).
+  version: "0.1.0"
+  contact:
+    name: Audio Assist
+servers:
+  - url: http://127.0.0.1:8794
+    description: Local screen-capture service (loopback only)
+
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Health check
+      description: Returns service status and uptime information.
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /v1/capture:
+    post:
+      operationId: triggerCapture
+      summary: Trigger a single screen capture
+      description: >
+        Takes an immediate screenshot, saves it to disk, and records
+        metadata in the database.  Returns the capture record.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CaptureRequest"
+      responses:
+        "201":
+          description: Capture completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureRecord"
+        "503":
+          description: Screen capture unavailable (e.g. no display)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/captures/{session_id}:
+    get:
+      operationId: listSessionCaptures
+      summary: List captures for a session
+      description: >
+        Returns all screen captures associated with the given session,
+        ordered by captured_at descending (most recent first).
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        "200":
+          description: List of captures
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  captures:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/CaptureRecord"
+                  total:
+                    type: integer
+                required:
+                  - captures
+                  - total
+    delete:
+      operationId: deleteSessionCaptures
+      summary: Delete all captures for a session
+      description: >
+        Removes all capture records and their associated files for the
+        given session.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Captures deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count:
+                    type: integer
+                required:
+                  - deleted_count
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/captures/latest:
+    get:
+      operationId: getLatestCapture
+      summary: Get the most recent capture
+      description: Returns the single most recent screen capture across all sessions.
+      responses:
+        "200":
+          description: Latest capture
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureRecord"
+        "404":
+          description: No captures exist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    CaptureRequest:
+      type: object
+      required:
+        - session_id
+      properties:
+        session_id:
+          type: string
+          description: Session identifier to associate the capture with
+          examples: ["sess-abc123"]
+        quality:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Image quality (1-100). Overrides server default if provided.
+        scale:
+          type: number
+          format: float
+          minimum: 0.1
+          maximum: 1.0
+          description: Scale factor for the captured image. Overrides server default.
+
+    CaptureRecord:
+      type: object
+      properties:
+        id:
+          type: integer
+        session_id:
+          type: string
+        captured_at:
+          type: string
+          format: date-time
+        file_path:
+          type: string
+          description: Relative path to the saved image file
+        width:
+          type: integer
+        height:
+          type: integer
+        file_size_bytes:
+          type: integer
+        ocr_text:
+          type: string
+          nullable: true
+          description: Extracted text from OCR (populated asynchronously)
+        participants_detected:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Participant names detected in the capture
+      required:
+        - id
+        - session_id
+        - captured_at
+        - file_path
+        - width
+        - height
+        - file_size_bytes
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: ["ok"]
+        uptime_seconds:
+          type: number
+          format: float
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        detail:
+          type: string
+      required:
+        - detail
