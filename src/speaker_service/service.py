@@ -1,15 +1,28 @@
 from __future__ import annotations
 
-import base64
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from threading import Lock
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response, status
 import numpy as np
 
+from audio_assist.enroll import ProfileStore, SpeakerProfile, StoredSpeakerProfile
 from speaker_service.config import Settings
-from speaker_service.schemas import DiarizeChunkRequest, DiarizeChunkResponse, DiarizedSegment
+from speaker_service.embeddings import (
+    LightweightSpeakerEmbeddingExtractor,
+    decode_pcm_s16le_base64,
+)
+from speaker_service.schemas import (
+    DiarizeChunkRequest,
+    DiarizeChunkResponse,
+    DiarizedSegment,
+    EnrollRequest,
+    SpeakerProfileResponse,
+    VerifyMatch,
+    VerifyRequest,
+    VerifyResponse,
+)
 
 
 @dataclass(slots=True)
@@ -27,38 +40,53 @@ class SourceState:
     last_seen: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
 
 
-class ClusteringSpeakerEngine:
-    """Lightweight per-source speaker clustering for short PCM chunks."""
+class SpeakerEngine:
+    """Named speaker matching plus lightweight per-source clustering."""
 
     def __init__(self, settings: Settings):
         self._settings = settings
         self._lock = Lock()
         self._states: dict[str, SourceState] = {}
+        self._extractor = LightweightSpeakerEmbeddingExtractor(
+            min_voice_dbfs=settings.min_voice_dbfs,
+        )
+        self._profile_store = ProfileStore(settings.profiles_db_path)
+
+    def status(self) -> dict[str, object]:
+        now = datetime.now(tz=UTC)
+        with self._lock:
+            self._prune_locked(now)
+            state_count = len(self._states)
+            cluster_count = sum(len(item.clusters) for item in self._states.values())
+        return {
+            "status": "ok",
+            "active_sources": state_count,
+            "active_clusters": cluster_count,
+            "profiles": len(self._profile_store.list_all()),
+            "window_seconds": self._settings.window_seconds,
+            "similarity_threshold": self._settings.similarity_threshold,
+            "profile_similarity_threshold": self._settings.profile_similarity_threshold,
+            "verification_threshold": self._settings.verification_threshold,
+        }
 
     def diarize_chunk(self, req: DiarizeChunkRequest) -> DiarizeChunkResponse:
-        try:
-            pcm = base64.b64decode(req.pcm_s16le_base64)
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError("Invalid pcm_s16le_base64 payload.") from exc
-
-        if not pcm:
-            return DiarizeChunkResponse()
-
-        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        samples = self._decode_audio(req.pcm_s16le_base64, req.channels)
         if samples.size == 0:
             return DiarizeChunkResponse()
 
         windows = self._windows(samples.size, req.sample_rate)
+        profiles = self._profile_store.list_all_with_embeddings()
         segments: list[DiarizedSegment] = []
         for start_idx, end_idx in windows:
             window_audio = samples[start_idx:end_idx]
-            embedding = self._embedding(window_audio, req.sample_rate)
+            embedding = self._extract_embedding(window_audio, req.sample_rate)
             if embedding is None:
                 continue
-            speaker, confidence = self._assign_cluster(
+            speaker, confidence = self._assign_label(
                 source_id=req.source_id,
                 session_id=req.session_id,
                 embedding=embedding,
+                profiles=profiles,
             )
             if not speaker:
                 continue
@@ -85,20 +113,92 @@ class ClusteringSpeakerEngine:
             segments=merged,
         )
 
-    def status(self) -> dict[str, object]:
-        now = datetime.now(tz=UTC)
-        with self._lock:
-            self._prune_locked(now)
-            state_count = len(self._states)
-            cluster_count = sum(len(item.clusters) for item in self._states.values())
-        return {
-            "status": "ok",
-            "active_sources": state_count,
-            "active_clusters": cluster_count,
-            "window_seconds": self._settings.window_seconds,
-            "similarity_threshold": self._settings.similarity_threshold,
-            "create_threshold": self._settings.create_threshold,
-        }
+    def enroll(self, req: EnrollRequest) -> tuple[SpeakerProfileResponse, bool]:
+        name = str(req.name or "").strip()
+        if not name:
+            raise ValueError("Speaker name is required.")
+        samples = self._decode_audio(req.pcm_s16le_base64, req.channels)
+        min_samples = int(req.sample_rate * self._settings.enrollment_min_voice_seconds)
+        if samples.size < min_samples:
+            raise ValueError(
+                f"Enrollment sample must be at least {self._settings.enrollment_min_voice_seconds:.1f}s."
+            )
+        embedding = self._extract_embedding(samples, req.sample_rate)
+        if embedding is None:
+            raise ValueError("Enrollment sample does not contain enough voiced audio.")
+        existing = self._profile_store.get_by_name(name) is not None
+        profile = self._profile_store.upsert(name, embedding, is_owner=req.is_owner)
+        return self._profile_response(profile), existing
+
+    def list_profiles(self) -> list[SpeakerProfileResponse]:
+        return [self._profile_response(item) for item in self._profile_store.list_all()]
+
+    def delete_profile(self, profile_id: int) -> bool:
+        return self._profile_store.delete(profile_id)
+
+    def verify(self, req: VerifyRequest) -> VerifyResponse:
+        samples = self._decode_audio(req.pcm_s16le_base64, req.channels)
+        embedding = self._extract_embedding(samples, req.sample_rate)
+        if embedding is None:
+            raise ValueError("Verification sample does not contain enough voiced audio.")
+
+        if req.profile_id is not None:
+            profiles = [
+                item for item in self._profile_store.list_all_with_embeddings()
+                if item.profile.id == req.profile_id
+            ]
+            if not profiles:
+                raise KeyError(req.profile_id)
+        else:
+            profiles = self._profile_store.list_all_with_embeddings()
+
+        matches: list[VerifyMatch] = []
+        threshold = float(self._settings.verification_threshold)
+        for item in profiles:
+            similarity = self._cosine_similarity(item.embedding, embedding)
+            matches.append(
+                VerifyMatch(
+                    profile_id=item.profile.id,
+                    name=item.profile.name,
+                    similarity=similarity,
+                    is_match=similarity >= threshold,
+                )
+            )
+        matches.sort(key=lambda item: item.similarity, reverse=True)
+        return VerifyResponse(matches=matches, threshold=threshold)
+
+    def _assign_label(
+        self,
+        source_id: str,
+        session_id: str | None,
+        embedding: np.ndarray,
+        profiles: list[StoredSpeakerProfile],
+    ) -> tuple[str, float]:
+        profile_match = self._match_profile(embedding, profiles)
+        if profile_match is not None:
+            return profile_match
+        return self._assign_cluster(source_id=source_id, session_id=session_id, embedding=embedding)
+
+    def _match_profile(
+        self,
+        embedding: np.ndarray,
+        profiles: list[StoredSpeakerProfile],
+    ) -> tuple[str, float] | None:
+        if not profiles:
+            return None
+        best_profile: StoredSpeakerProfile | None = None
+        best_similarity = -1.0
+        for item in profiles:
+            similarity = self._cosine_similarity(item.embedding, embedding)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_profile = item
+        if (
+            best_profile is None
+            or best_similarity < float(self._settings.profile_similarity_threshold)
+        ):
+            return None
+        return best_profile.profile.name, best_similarity
 
     def _assign_cluster(
         self,
@@ -122,7 +222,7 @@ class ClusteringSpeakerEngine:
             best_cluster: ClusterState | None = None
             best_similarity = -1.0
             for cluster in state.clusters:
-                similarity = float(np.dot(cluster.centroid, embedding))
+                similarity = self._cosine_similarity(cluster.centroid, embedding)
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_cluster = cluster
@@ -142,8 +242,7 @@ class ClusteringSpeakerEngine:
                 best_cluster.centroid = updated
             best_cluster.count += 1
             best_cluster.last_seen = now
-            confidence = self._similarity_to_confidence(best_similarity)
-            return best_cluster.label, confidence
+            return best_cluster.label, best_similarity
 
     def _create_cluster_locked(
         self,
@@ -161,7 +260,27 @@ class ClusteringSpeakerEngine:
                 last_seen=now,
             )
         )
-        return label, max(0.55, self._similarity_to_confidence(self._settings.create_threshold))
+        return label, max(0.55, float(self._settings.create_threshold))
+
+    @staticmethod
+    def _profile_response(profile: SpeakerProfile) -> SpeakerProfileResponse:
+        return SpeakerProfileResponse(
+            id=profile.id,
+            name=profile.name,
+            embedding_dim=profile.embedding_dim,
+            enrolled_at=profile.enrolled_at,
+            sample_count=profile.sample_count,
+            is_owner=profile.is_owner,
+        )
+
+    def _decode_audio(self, payload: str, channels: int) -> np.ndarray:
+        return decode_pcm_s16le_base64(payload, channels=channels)
+
+    def _extract_embedding(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
+        embedding = self._extractor.extract(samples, sample_rate)
+        if embedding is None:
+            return None
+        return self._normalize_vector(embedding)
 
     def _windows(self, sample_count: int, sample_rate: int) -> list[tuple[int, int]]:
         min_samples = max(1, int(sample_rate * self._settings.min_window_seconds))
@@ -183,42 +302,6 @@ class ClusteringSpeakerEngine:
             windows = [(0, sample_count)]
         return windows
 
-    def _embedding(self, samples: np.ndarray, sample_rate: int) -> np.ndarray | None:
-        frame_size = max(256, int(sample_rate * 0.025))
-        hop_size = max(128, int(sample_rate * 0.01))
-        if samples.size < frame_size:
-            return None
-
-        n_fft = 1
-        while n_fft < frame_size:
-            n_fft *= 2
-
-        window = np.hanning(frame_size).astype(np.float32)
-        feature_rows: list[np.ndarray] = []
-
-        for start in range(0, samples.size - frame_size + 1, hop_size):
-            frame = samples[start : start + frame_size]
-            rms = float(np.sqrt(np.mean(frame * frame)))
-            dbfs = -96.0 if rms <= 1e-9 else float(20.0 * np.log10(rms))
-            if dbfs < self._settings.min_voice_dbfs:
-                continue
-            spectrum = np.abs(np.fft.rfft(frame * window, n=n_fft)).astype(np.float32)
-            if spectrum.size <= 1:
-                continue
-            spectrum = spectrum[1:]
-            # 32 coarse spectral bands.
-            band_values = np.array(
-                [float(np.mean(chunk)) for chunk in np.array_split(spectrum, 32)],
-                dtype=np.float32,
-            )
-            feature_rows.append(np.log1p(band_values))
-
-        if len(feature_rows) < 3:
-            return None
-
-        embedding = np.mean(np.stack(feature_rows, axis=0), axis=0)
-        return self._normalize_vector(embedding)
-
     @staticmethod
     def _normalize_vector(vector: np.ndarray) -> np.ndarray:
         centered = vector.astype(np.float32) - float(np.mean(vector))
@@ -236,9 +319,9 @@ class ClusteringSpeakerEngine:
         return source
 
     @staticmethod
-    def _similarity_to_confidence(similarity: float) -> float:
-        clipped = max(-1.0, min(1.0, similarity))
-        return max(0.0, min(1.0, (clipped + 1.0) * 0.5))
+    def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+        similarity = float(np.dot(left, right))
+        return max(0.0, min(1.0, similarity))
 
     @staticmethod
     def _merge_segments(segments: list[DiarizedSegment], max_gap_seconds: float = 0.08) -> list[DiarizedSegment]:
@@ -290,7 +373,7 @@ class ClusteringSpeakerEngine:
 
 def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="speaker-service", version="0.1.0")
-    engine = ClusteringSpeakerEngine(settings)
+    engine = SpeakerEngine(settings)
 
     @app.get("/health")
     def health() -> dict[str, object]:
@@ -302,5 +385,38 @@ def create_app(settings: Settings) -> FastAPI:
             return engine.diarize_chunk(req)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post(
+        "/v1/enroll",
+        response_model=SpeakerProfileResponse,
+        status_code=status.HTTP_201_CREATED,
+    )
+    def enroll(req: EnrollRequest, response: Response) -> SpeakerProfileResponse:
+        try:
+            profile, existed = engine.enroll(req)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if existed:
+            response.status_code = status.HTTP_200_OK
+        return profile
+
+    @app.get("/v1/profiles", response_model=list[SpeakerProfileResponse])
+    def list_profiles() -> list[SpeakerProfileResponse]:
+        return engine.list_profiles()
+
+    @app.delete("/v1/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_profile(profile_id: int) -> Response:
+        if not engine.delete_profile(profile_id):
+            raise HTTPException(status_code=404, detail=f"Profile {profile_id} not found.")
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post("/v1/verify", response_model=VerifyResponse)
+    def verify(req: VerifyRequest) -> VerifyResponse:
+        try:
+            return engine.verify(req)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"Profile {exc.args[0]} not found.") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return app

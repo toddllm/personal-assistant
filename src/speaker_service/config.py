@@ -16,11 +16,15 @@ class Settings(BaseSettings):
     log_file_backup_count: int = 7
     access_log: bool = True
 
+    profiles_db_path: Path = Field(default_factory=lambda: Path("data/speaker_profiles.db"))
     window_seconds: float = 0.9
     min_window_seconds: float = 0.45
     min_voice_dbfs: float = -46.0
+    enrollment_min_voice_seconds: float = 2.0
     similarity_threshold: float = 0.88
     create_threshold: float = 0.74
+    profile_similarity_threshold: float = 0.86
+    verification_threshold: float = 0.86
     max_clusters_per_source: int = 10
     stale_source_seconds: int = 6 * 3600
 

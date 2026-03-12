@@ -143,11 +143,27 @@ class DiscordVoiceBot:
             max_conversation_turns=self._settings.max_conversation_turns,
             llm_max_tokens=self._settings.llm_max_tokens,
             llm_temperature=self._settings.llm_temperature,
+            post_speech_cooldown=self._settings.post_speech_cooldown,
+            echo_similarity_threshold=self._settings.echo_similarity_threshold,
+            default_response_mode=self._settings.default_response_mode,
+            trigger_keyword=self._settings.trigger_keyword,
         )
+
+        # Wire playback state to pipeline for echo suppression
+        self._pipeline._get_playback_remaining = lambda: (
+            self._tts_source.duration_remaining_ms if self._tts_source else 0.0
+        )
+
         await self._pipeline.start()
 
         # Start recording audio from the voice channel
         self._sink = PipelineSink(self._pipeline, self.bot.user.id)
+
+        # Wire audio recorder for debug recordings
+        self._pipeline._audio_recorder = lambda transcript="", dur=5.0: (
+            self._sink.save_utterance(transcript=transcript, duration_s=dur)
+        )
+
         self._voice_client.start_recording(self._sink, self._on_recording_done)
 
         logger.info("Joined voice channel %d in guild %d", channel_id, guild_id)

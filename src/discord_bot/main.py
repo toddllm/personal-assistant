@@ -19,7 +19,7 @@ import discord
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
 from discord_bot.bot import DiscordVoiceBot
@@ -39,7 +39,7 @@ def _create_providers(settings: Settings):
     Reuses the same provider classes as the Zoom bot.
     """
     from zoom_bot.llm_providers import OpenAICompatibleLLM
-    from zoom_bot.stt_providers import DeepgramSTT, FasterWhisperBatchSTT, WhisperStreamingSTT
+    from zoom_bot.stt_providers import DeepgramSTT, FasterWhisperBatchSTT, RemoteWhisperSTT, WhisperStreamingSTT
     from zoom_bot.tts_providers import ElevenLabsTTS, QwenTTS
 
     # STT
@@ -50,6 +50,8 @@ def _create_providers(settings: Settings):
         stt = WhisperStreamingSTT(url=settings.stt_whisper_url, model=settings.stt_whisper_model)
     elif stt_provider in ("faster_whisper", "whisper_local", "local"):
         stt = FasterWhisperBatchSTT(model=settings.stt_whisper_model, silence_ms=int(settings.debounce_seconds * 1000))
+    elif stt_provider in ("remote_whisper", "remote"):
+        stt = RemoteWhisperSTT(url=settings.stt_remote_url, silence_ms=int(settings.debounce_seconds * 1000))
     else:
         raise ValueError(f"Unknown STT provider: {stt_provider}")
 
@@ -148,6 +150,32 @@ class BotSettingsRequest(BaseModel):
     debounce_seconds: float | None = None
 
 
+class SpeakRequest(BaseModel):
+    text: str
+
+
+class InjectRequest(BaseModel):
+    text: str
+    role: str = "system"
+
+
+class NudgeRequest(BaseModel):
+    hint: str
+
+
+class ResponseModeRequest(BaseModel):
+    mode: str  # "auto" | "keyword" | "manual"
+    keyword: str = ""
+
+
+class ReloadSTTRequest(BaseModel):
+    model: str = ""  # e.g. "medium.en", "large-v3"; empty = use current setting
+
+
+class RetranscribeRequest(BaseModel):
+    model: str = "medium.en"
+
+
 class HealthResponse(BaseModel):
     status: str = "ok"
     connected: bool = False
@@ -176,7 +204,12 @@ def _load_runtime_overrides() -> None:
         return
     try:
         overrides = json.loads(_RUNTIME_SETTINGS_PATH.read_text())
-        for key in ("tts_qwen_voice", "llm_model", "llm_temperature", "llm_max_tokens", "system_prompt"):
+        for key in (
+            "tts_qwen_voice", "llm_model", "llm_temperature", "llm_max_tokens",
+            "system_prompt", "stt_whisper_model",
+            "post_speech_cooldown", "echo_similarity_threshold",
+            "default_response_mode", "trigger_keyword",
+        ):
             if key in overrides:
                 setattr(settings, key, overrides[key])
         logger.info("Loaded runtime overrides: %s", list(overrides.keys()))
@@ -208,6 +241,25 @@ async def lifespan(app: FastAPI):
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Load Opus codec for voice decoding (py-cord needs this for receiving audio)
+    if not discord.opus.is_loaded():
+        _opus_paths = [
+            "/opt/homebrew/lib/libopus.dylib",          # macOS Homebrew ARM
+            "/usr/local/lib/libopus.dylib",              # macOS Homebrew Intel
+            "/usr/lib/x86_64-linux-gnu/libopus.so.0",   # Debian/Ubuntu
+            "libopus",                                    # system default
+        ]
+        for path in _opus_paths:
+            try:
+                discord.opus.load_opus(path)
+                logger.info("Loaded Opus codec from %s", path)
+                break
+            except OSError:
+                continue
+        if not discord.opus.is_loaded():
+            logger.warning("Could not load Opus codec — incoming voice audio will not work")
+
     logger.info("Discord bot service starting on port %d", settings.port)
 
     # Create providers and bot
@@ -372,21 +424,25 @@ async def get_settings():
     resp = BotSettingsResponse(
         tts_url=settings.tts_qwen_url,
         tts_language=settings.tts_qwen_language,
+        tts_voice=settings.tts_qwen_voice,
         llm_url=settings.llm_url,
+        llm_model=settings.llm_model,
         llm_temperature=settings.llm_temperature,
         llm_max_tokens=settings.llm_max_tokens,
         system_prompt=settings.system_prompt,
         debounce_seconds=settings.debounce_seconds,
     )
-    # Get live runtime values from providers
+    # Override with live runtime values from providers when available
     if _voice_bot:
         if hasattr(_voice_bot._tts, "_voice"):
             resp.tts_voice = _voice_bot._tts._voice
         if hasattr(_voice_bot._llm, "_model"):
             resp.llm_model = _voice_bot._llm._model
-    else:
-        resp.tts_voice = settings.tts_qwen_voice
-        resp.llm_model = settings.llm_model
+        # Also read from live pipeline if running
+        if _voice_bot.pipeline:
+            resp.llm_temperature = _voice_bot.pipeline._llm_temperature
+            resp.llm_max_tokens = _voice_bot.pipeline._llm_max_tokens
+            resp.debounce_seconds = _voice_bot.pipeline._debounce_seconds
     return resp
 
 
@@ -404,26 +460,48 @@ async def update_settings(req: BotSettingsRequest):
         persist["tts_qwen_voice"] = req.tts_voice
         logger.info("TTS voice changed to: %s", req.tts_voice)
 
-    if req.llm_model is not None and hasattr(_voice_bot._llm, "_model"):
-        _voice_bot._llm._model = req.llm_model
+    if req.llm_model is not None:
+        if hasattr(_voice_bot._llm, "_model"):
+            old_model = _voice_bot._llm._model
+            _voice_bot._llm._model = req.llm_model
+            logger.info("LLM model changed: %s -> %s (live provider updated)", old_model, req.llm_model)
+        else:
+            logger.warning("LLM provider has no _model attribute, cannot update live")
         settings.llm_model = req.llm_model
         persist["llm_model"] = req.llm_model
-        logger.info("LLM model changed to: %s", req.llm_model)
 
     if req.llm_temperature is not None:
         settings.llm_temperature = req.llm_temperature
         persist["llm_temperature"] = req.llm_temperature
+        # Propagate to live pipeline
+        if _voice_bot and _voice_bot.pipeline:
+            _voice_bot.pipeline._llm_temperature = req.llm_temperature
+        logger.info("LLM temperature changed to: %s", req.llm_temperature)
 
     if req.llm_max_tokens is not None:
         settings.llm_max_tokens = req.llm_max_tokens
         persist["llm_max_tokens"] = req.llm_max_tokens
+        # Propagate to live pipeline
+        if _voice_bot and _voice_bot.pipeline:
+            _voice_bot.pipeline._llm_max_tokens = req.llm_max_tokens
+        logger.info("LLM max_tokens changed to: %s", req.llm_max_tokens)
 
     if req.system_prompt is not None:
         settings.system_prompt = req.system_prompt
         persist["system_prompt"] = req.system_prompt
+        # Propagate to live pipeline — update conversation's system message
+        if _voice_bot and _voice_bot.pipeline:
+            _voice_bot.pipeline._system_prompt = req.system_prompt
+            conv = _voice_bot.pipeline._conversation
+            if conv and conv[0].get("role") == "system":
+                conv[0]["content"] = req.system_prompt
+        logger.info("System prompt updated (%d chars)", len(req.system_prompt))
 
     if req.debounce_seconds is not None:
         settings.debounce_seconds = req.debounce_seconds
+        # Propagate to live pipeline
+        if _voice_bot and _voice_bot.pipeline:
+            _voice_bot.pipeline._debounce_seconds = req.debounce_seconds
 
     if persist:
         _save_runtime_overrides(**persist)
@@ -459,6 +537,303 @@ async def list_ollama_models():
     except Exception:
         pass
     return {"models": []}
+
+
+@app.post("/speak")
+async def speak(req: SpeakRequest):
+    """Operator: make the bot speak text in the voice channel."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    await _voice_bot.pipeline.speak(req.text)
+    return {"ok": True, "text": req.text}
+
+
+@app.post("/inject")
+async def inject(req: InjectRequest):
+    """Operator: add context to conversation silently."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    _voice_bot.pipeline.inject(req.text, req.role)
+    return {"ok": True, "role": req.role, "text": req.text}
+
+
+@app.post("/nudge")
+async def nudge(req: NudgeRequest):
+    """Operator: queue a one-shot hint for the next response."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    _voice_bot.pipeline.nudge(req.hint)
+    return {"ok": True, "hint": req.hint}
+
+
+@app.post("/mute")
+async def mute():
+    """Operator: pause auto-responding (transcripts still recorded)."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    _voice_bot.pipeline.mute()
+    return {"ok": True, "muted": True}
+
+
+@app.post("/unmute")
+async def unmute():
+    """Operator: resume auto-responding."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    _voice_bot.pipeline.unmute()
+    return {"ok": True, "muted": False}
+
+
+@app.post("/cancel")
+async def cancel():
+    """Operator: abort in-flight response and clear audio buffer."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    await _voice_bot.pipeline.cancel()
+    # Also clear the TTS audio buffer
+    if _voice_bot._tts_source:
+        _voice_bot._tts_source.clear()
+    return {"ok": True}
+
+
+@app.post("/response-mode")
+async def set_response_mode(req: ResponseModeRequest):
+    """Operator: set response mode (auto/keyword/manual)."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+    try:
+        _voice_bot.pipeline.set_response_mode(req.mode, req.keyword)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _save_runtime_overrides(default_response_mode=req.mode, trigger_keyword=req.keyword or settings.trigger_keyword)
+    return {"ok": True, "mode": req.mode, "keyword": _voice_bot.pipeline._trigger_keyword}
+
+
+@app.get("/pipeline-state")
+async def pipeline_state():
+    """Get current pipeline state for UI (mute, mode, etc.)."""
+    if not _voice_bot or not _voice_bot.pipeline:
+        return {
+            "active": False, "muted": False, "response_mode": settings.default_response_mode,
+            "trigger_keyword": settings.trigger_keyword,
+            "post_speech_cooldown": settings.post_speech_cooldown,
+            "playback_remaining_ms": 0,
+        }
+    p = _voice_bot.pipeline
+    remaining = 0.0
+    if _voice_bot._tts_source:
+        remaining = _voice_bot._tts_source.duration_remaining_ms
+    return {
+        "active": True,
+        "muted": p.muted,
+        "response_mode": p.response_mode,
+        "trigger_keyword": p._trigger_keyword,
+        "post_speech_cooldown": p._post_speech_cooldown,
+        "playback_remaining_ms": round(remaining, 1),
+        "responding": p._responding,
+    }
+
+
+@app.post("/reload-stt")
+async def reload_stt(req: ReloadSTTRequest):
+    """Hot-swap the STT model without restarting the bot.
+
+    Stops the current STT provider, loads the new model, restarts it,
+    and re-wires the transcript callback.
+    """
+    if not _voice_bot or not _voice_bot.pipeline:
+        raise HTTPException(503, "Bot not in a voice channel")
+
+    new_model = req.model.strip() or settings.stt_whisper_model
+    old_model = settings.stt_whisper_model
+
+    logger.info("Reloading STT: %s -> %s", old_model, new_model)
+
+    pipeline = _voice_bot.pipeline
+
+    # Stop current STT
+    try:
+        await pipeline._stt.stop()
+    except Exception:
+        logger.exception("Error stopping old STT")
+
+    # Create new STT provider
+    from zoom_bot.stt_providers import FasterWhisperBatchSTT
+    new_stt = FasterWhisperBatchSTT(
+        model=new_model,
+        silence_ms=int(settings.debounce_seconds * 1000),
+    )
+
+    # Wire and start
+    new_stt.set_transcript_callback(pipeline._on_transcript)
+    await new_stt.start()
+
+    # Swap into pipeline
+    pipeline._stt = new_stt
+
+    # Persist
+    settings.stt_whisper_model = new_model
+    _save_runtime_overrides(stt_whisper_model=new_model)
+
+    logger.info("STT reloaded: %s -> %s", old_model, new_model)
+    return {"ok": True, "old_model": old_model, "new_model": new_model}
+
+
+# ---------------------------------------------------------------------------
+# Debug Audio Recordings
+# ---------------------------------------------------------------------------
+
+_RECORDINGS_DIR = Path("data/recordings")
+
+
+@app.get("/debug/recordings")
+async def list_recordings():
+    """List all recordings in data/recordings/ with metadata."""
+    if not _RECORDINGS_DIR.exists():
+        return {"recordings": []}
+
+    recordings = []
+    # Find all .json metadata files
+    for meta_path in sorted(_RECORDINGS_DIR.glob("*.json"), reverse=True):
+        try:
+            meta = json.loads(meta_path.read_text())
+            # Add filename info for the UI
+            base = meta_path.stem  # e.g. "20260216_233500_hello"
+            meta["base"] = base
+            meta["has_48k"] = (_RECORDINGS_DIR / f"{base}.48k.wav").exists()
+            meta["has_32k"] = (_RECORDINGS_DIR / f"{base}.32k.wav").exists()
+            recordings.append(meta)
+        except Exception:
+            continue
+
+    # Also find orphan WAV files without metadata
+    known_bases = {r["base"] for r in recordings}
+    for wav_path in _RECORDINGS_DIR.glob("*.wav"):
+        base = wav_path.name
+        for suffix in (".48k.wav", ".32k.wav"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if base not in known_bases:
+            known_bases.add(base)
+            recordings.append({
+                "base": base,
+                "timestamp": base[:15] if len(base) >= 15 else base,
+                "transcript": "",
+                "has_48k": (_RECORDINGS_DIR / f"{base}.48k.wav").exists(),
+                "has_32k": (_RECORDINGS_DIR / f"{base}.32k.wav").exists(),
+            })
+
+    return {"recordings": recordings}
+
+
+@app.get("/debug/recordings/{filename}")
+async def get_recording(filename: str):
+    """Serve a WAV file from the recordings directory."""
+    # Sanitize filename to prevent directory traversal
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Invalid filename")
+    path = _RECORDINGS_DIR / filename
+    if not path.exists() or not path.suffix == ".wav":
+        raise HTTPException(404, "Recording not found")
+    return FileResponse(str(path), media_type="audio/wav", filename=filename)
+
+
+@app.post("/debug/retranscribe/{filename}")
+async def retranscribe(filename: str, req: RetranscribeRequest | None = None):
+    """Re-transcribe a WAV file using the remote STT service.
+
+    Reads the 32kHz mono WAV, resamples to 16kHz, sends raw PCM to STT.
+    """
+    import struct as _struct
+    import wave as _wave
+
+    if ".." in filename or "/" in filename or "\\" in filename:
+        raise HTTPException(400, "Invalid filename")
+    path = _RECORDINGS_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, "Recording not found")
+
+    model = req.model if req else "medium.en"
+
+    # Read the WAV file
+    try:
+        with _wave.open(str(path), "rb") as wf:
+            n_channels = wf.getnchannels()
+            sample_rate = wf.getframerate()
+            pcm_data = wf.readframes(wf.getnframes())
+    except Exception as exc:
+        raise HTTPException(400, f"Cannot read WAV: {exc}")
+
+    # If stereo, mix to mono
+    if n_channels == 2:
+        n_frames = len(pcm_data) // 4
+        samples = _struct.unpack(f"<{n_frames * 2}h", pcm_data[: n_frames * 4])
+        mono = []
+        for i in range(n_frames):
+            mono.append((samples[i * 2] + samples[i * 2 + 1]) // 2)
+        pcm_data = _struct.pack(f"<{len(mono)}h", *mono)
+
+    # Resample to 16kHz if needed
+    if sample_rate != 16000:
+        n_samples = len(pcm_data) // 2
+        samples = _struct.unpack(f"<{n_samples}h", pcm_data)
+        ratio = 16000 / sample_rate
+        out_len = int(n_samples * ratio)
+        result = []
+        for i in range(out_len):
+            src_idx = i / ratio
+            idx = int(src_idx)
+            frac = src_idx - idx
+            if idx + 1 < len(samples):
+                val = samples[idx] * (1 - frac) + samples[idx + 1] * frac
+            else:
+                val = samples[min(idx, len(samples) - 1)]
+            result.append(max(-32768, min(32767, int(val))))
+        pcm_16k = _struct.pack(f"<{len(result)}h", *result)
+    else:
+        pcm_16k = pcm_data
+
+    # Send to STT service
+    import httpx
+    stt_url = getattr(settings, "stt_remote_url", "http://toddllm:8791")
+    transcribe_url = f"{stt_url}/v1/transcribe"
+    if model:
+        transcribe_url += f"?model={model}"
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                transcribe_url,
+                content=pcm_16k,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                transcript = data.get("text", data.get("transcript", ""))
+                return {
+                    "ok": True,
+                    "model": model,
+                    "transcript": transcript,
+                    "filename": filename,
+                    "pcm_bytes": len(pcm_16k),
+                    "duration_s": round(len(pcm_16k) / (16000 * 2), 2),
+                    "raw_response": data,
+                }
+            else:
+                return {
+                    "ok": False,
+                    "error": f"STT returned {r.status_code}: {r.text[:200]}",
+                    "model": model,
+                }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "model": model}
+
+
+@app.get("/debug/audio", response_class=HTMLResponse)
+async def debug_audio_page():
+    """HTML page to browse, play, and re-transcribe audio recordings."""
+    return HTMLResponse(AUDIO_DEBUG_UI)
 
 
 def main():
@@ -635,6 +1010,14 @@ CONTROL_PANEL_UI = """<!DOCTYPE html>
     </select>
     <button class="btn btn-success" id="btn-join">Join</button>
     <button class="btn btn-danger" id="btn-leave" disabled>Leave</button>
+    <span style="border-left:1px solid #0f3460;height:20px;margin:0 4px;"></span>
+    <button class="btn" id="btn-mute" title="Mute/Unmute bot responses">Mute</button>
+    <select id="sel-mode" style="font-size:11px;padding:4px 6px;background:#1a1a2e;color:#e0e0e0;border:1px solid #0f3460;border-radius:4px;" title="Response mode">
+      <option value="auto">Auto</option>
+      <option value="keyword">Keyword</option>
+      <option value="manual">Manual</option>
+    </select>
+    <button class="btn btn-danger" id="btn-cancel" title="Cancel in-flight response">Cancel</button>
   </div>
 
   <div class="grid">
@@ -694,6 +1077,49 @@ CONTROL_PANEL_UI = """<!DOCTYPE html>
       <div style="display:flex; gap:8px; margin-top:6px;">
         <button class="btn btn-apply" id="btn-prompt-apply">Save Prompt</button>
         <span class="toast" id="prompt-toast" style="margin:0; line-height:28px;"></span>
+      </div>
+    </div>
+
+    <!-- Puppet Master -->
+    <div class="card full">
+      <div class="card-title">Puppet Master</div>
+      <div class="form-row">
+        <label class="form-label">Speak (text &rarr; TTS &rarr; voice channel)</label>
+        <div class="input-row">
+          <input type="text" id="txt-speak" placeholder="Type something for the bot to say..." />
+          <button class="btn btn-apply" id="btn-speak">Send</button>
+        </div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Nudge (one-shot hint for next response)</label>
+        <div class="input-row">
+          <input type="text" id="txt-nudge" placeholder="e.g. Be more enthusiastic, ask about their weekend..." />
+          <button class="btn" id="btn-nudge">Nudge</button>
+        </div>
+      </div>
+      <div class="form-row">
+        <label class="form-label">Inject Context (add to conversation silently)</label>
+        <div class="input-row" style="flex-direction:column;gap:4px;">
+          <textarea id="txt-inject" rows="2" placeholder="Context text to inject into conversation..."></textarea>
+          <div style="display:flex;gap:6px;">
+            <select id="sel-inject-role" style="max-width:120px;">
+              <option value="system">system</option>
+              <option value="user">user</option>
+            </select>
+            <button class="btn" id="btn-inject">Inject</button>
+          </div>
+        </div>
+      </div>
+      <div class="toast" id="puppet-toast"></div>
+    </div>
+
+    <!-- Response Latency -->
+    <div class="card">
+      <div class="card-title">Response Latency (last)</div>
+      <div id="latency-display" style="font-size:11px; color:#888;">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;" id="latency-items">
+          <span>Waiting for first response...</span>
+        </div>
       </div>
     </div>
 
@@ -769,9 +1195,11 @@ async function init() {
   loadConversation();
   loadConfig();
   pollEvents();
+  loadPipelineState();
 
   setInterval(loadConversation, 5000);
   setInterval(loadConfig, 10000);
+  setInterval(loadPipelineState, 2000);
 
   // Slider live labels
   document.getElementById('rng-temp').oninput = (e) => {
@@ -780,6 +1208,13 @@ async function init() {
   document.getElementById('rng-tokens').oninput = (e) => {
     document.getElementById('lbl-tokens').textContent = e.target.value;
   };
+  // Puppet master buttons
+  document.getElementById('btn-speak').onclick = doSpeak;
+  document.getElementById('btn-nudge').onclick = doNudge;
+  document.getElementById('btn-inject').onclick = doInject;
+  document.getElementById('btn-mute').onclick = toggleMute;
+  document.getElementById('btn-cancel').onclick = doCancel;
+  document.getElementById('sel-mode').onchange = changeResponseMode;
 }
 
 // --- Status ---
@@ -889,6 +1324,7 @@ async function pollEvents() {
       if (el.querySelector('div[style]')) el.innerHTML = '';
       events.forEach(evt => {
         lastEventTs = Math.max(lastEventTs, evt.ts || 0);
+        updateLatencyDisplay(evt);
         const div = document.createElement('div');
         div.className = 'evt';
         const time = new Date(evt.ts * 1000).toLocaleTimeString();
@@ -897,7 +1333,9 @@ async function pollEvents() {
         if (evt.type === 'transcript') { typeCls = 'transcript'; typeLabel = 'STT'; }
         else if (evt.type === 'llm_response') { typeCls = 'llm'; typeLabel = 'LLM'; }
         else if (evt.type === 'tts_audio') { typeCls = 'tts'; typeLabel = 'TTS'; }
-        const text = evt.text || (evt.duration_s ? evt.duration_s + 's audio' : JSON.stringify(evt));
+        else if (evt.type === 'echo_suppressed') { typeCls = ''; typeLabel = 'ECHO'; }
+        else if (evt.type === 'cancelled') { typeCls = ''; typeLabel = 'CANCEL'; }
+        const text = evt.text || evt.hint || (evt.duration_s ? evt.duration_s + 's audio' : JSON.stringify(evt));
         div.innerHTML = '<span class="evt-time">' + time + '</span>' +
           '<span class="evt-type ' + typeCls + '">' + typeLabel + '</span>' +
           '<span class="evt-text">' + esc(text) + '</span>';
@@ -1046,8 +1484,10 @@ async function applyVoice() {
       method: 'PUT', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ tts_voice: voice }),
     });
+    if (!r.ok) { const e = await r.json(); toast('voice-toast', e.detail || 'Error ' + r.status, 'err'); return; }
     const d = await r.json();
     toast('voice-toast', 'Voice set to: ' + d.tts_voice, 'ok');
+    loadConfig();
   } catch (e) { toast('voice-toast', 'Error: ' + e.message, 'err'); }
 }
 
@@ -1055,13 +1495,16 @@ async function applyModel() {
   const model = document.getElementById('sel-model').value;
   const temp = parseFloat(document.getElementById('rng-temp').value);
   const tokens = parseInt(document.getElementById('rng-tokens').value);
+  if (!model || model === 'loading...') { toast('model-toast', 'Select a model first', 'err'); return; }
   try {
     const r = await fetch(API + '/settings', {
       method: 'PUT', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ llm_model: model, llm_temperature: temp, llm_max_tokens: tokens }),
     });
+    if (!r.ok) { const e = await r.json(); toast('model-toast', e.detail || 'Error ' + r.status, 'err'); return; }
     const d = await r.json();
-    toast('model-toast', 'Model: ' + d.llm_model + ' | temp: ' + d.llm_temperature + ' | tokens: ' + d.llm_max_tokens, 'ok');
+    toast('model-toast', 'Applied: ' + d.llm_model + ' | temp=' + d.llm_temperature + ' | tokens=' + d.llm_max_tokens, 'ok');
+    loadConfig();
   } catch (e) { toast('model-toast', 'Error: ' + e.message, 'err'); }
 }
 
@@ -1072,8 +1515,9 @@ async function applyPrompt() {
       method: 'PUT', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ system_prompt: prompt }),
     });
-    if (r.ok) toast('prompt-toast', 'Saved', 'ok');
-    else toast('prompt-toast', 'Error', 'err');
+    if (!r.ok) { const e = await r.json(); toast('prompt-toast', e.detail || 'Error', 'err'); return; }
+    toast('prompt-toast', 'Saved', 'ok');
+    loadConfig();
   } catch (e) { toast('prompt-toast', 'Error: ' + e.message, 'err'); }
 }
 
@@ -1172,6 +1616,132 @@ function playBench(idx) {
   playingAudio.play();
 }
 
+// --- Pipeline State ---
+async function loadPipelineState() {
+  try {
+    const r = await fetch(API + '/pipeline-state');
+    const d = await r.json();
+    const muteBtn = document.getElementById('btn-mute');
+    const modeSel = document.getElementById('sel-mode');
+    if (d.muted) {
+      muteBtn.textContent = 'Unmute';
+      muteBtn.className = 'btn btn-success';
+    } else {
+      muteBtn.textContent = 'Mute';
+      muteBtn.className = 'btn';
+    }
+    modeSel.value = d.response_mode || 'auto';
+  } catch (e) {}
+}
+
+// --- Puppet Master ---
+async function doSpeak() {
+  const text = document.getElementById('txt-speak').value.trim();
+  if (!text) return;
+  const btn = document.getElementById('btn-speak');
+  btn.disabled = true; btn.textContent = '...';
+  try {
+    const r = await fetch(API + '/speak', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text }),
+    });
+    if (r.ok) {
+      toast('puppet-toast', 'Speaking: ' + text.substring(0, 60), 'ok');
+      document.getElementById('txt-speak').value = '';
+    } else {
+      const d = await r.json();
+      toast('puppet-toast', d.detail || 'Error', 'err');
+    }
+  } catch (e) { toast('puppet-toast', 'Error: ' + e.message, 'err'); }
+  btn.disabled = false; btn.textContent = 'Send';
+}
+
+async function doNudge() {
+  const hint = document.getElementById('txt-nudge').value.trim();
+  if (!hint) return;
+  try {
+    const r = await fetch(API + '/nudge', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ hint }),
+    });
+    if (r.ok) {
+      toast('puppet-toast', 'Nudge queued', 'ok');
+      document.getElementById('txt-nudge').value = '';
+    } else {
+      const d = await r.json();
+      toast('puppet-toast', d.detail || 'Error', 'err');
+    }
+  } catch (e) { toast('puppet-toast', 'Error: ' + e.message, 'err'); }
+}
+
+async function doInject() {
+  const text = document.getElementById('txt-inject').value.trim();
+  const role = document.getElementById('sel-inject-role').value;
+  if (!text) return;
+  try {
+    const r = await fetch(API + '/inject', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text, role }),
+    });
+    if (r.ok) {
+      toast('puppet-toast', 'Injected ' + role + ' context', 'ok');
+      document.getElementById('txt-inject').value = '';
+      loadConversation();
+    } else {
+      const d = await r.json();
+      toast('puppet-toast', d.detail || 'Error', 'err');
+    }
+  } catch (e) { toast('puppet-toast', 'Error: ' + e.message, 'err'); }
+}
+
+async function toggleMute() {
+  const btn = document.getElementById('btn-mute');
+  const isMuted = btn.textContent === 'Unmute';
+  const endpoint = isMuted ? '/unmute' : '/mute';
+  try {
+    const r = await fetch(API + endpoint, { method: 'POST' });
+    if (r.ok) {
+      loadPipelineState();
+    }
+  } catch (e) {}
+}
+
+async function doCancel() {
+  try {
+    await fetch(API + '/cancel', { method: 'POST' });
+    toast('puppet-toast', 'Cancelled', 'info');
+  } catch (e) {}
+}
+
+async function changeResponseMode() {
+  const mode = document.getElementById('sel-mode').value;
+  let keyword = '';
+  if (mode === 'keyword') {
+    keyword = prompt('Enter trigger keyword:', 'hey bot') || 'hey bot';
+  }
+  try {
+    await fetch(API + '/response-mode', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ mode, keyword }),
+    });
+  } catch (e) {}
+}
+
+// --- Response Latency (from events) ---
+function updateLatencyDisplay(evt) {
+  if (evt.type !== 'tts_audio') return;
+  const el = document.getElementById('latency-items');
+  const llm = evt.llm_s != null ? evt.llm_s + 's' : '?';
+  const tts = evt.synth_s != null ? evt.synth_s + 's' : '?';
+  const total = evt.total_s != null ? evt.total_s + 's' : '?';
+  const dur = evt.duration_s != null ? evt.duration_s + 's' : '?';
+  el.innerHTML =
+    '<div class="cfg-item"><span class="cfg-label">LLM:</span> <span class="cfg-val">' + llm + '</span></div>' +
+    '<div class="cfg-item"><span class="cfg-label">TTS:</span> <span class="cfg-val">' + tts + '</span></div>' +
+    '<div class="cfg-item"><span class="cfg-label">Total:</span> <span class="cfg-val">' + total + '</span></div>' +
+    '<div class="cfg-item"><span class="cfg-label">Audio:</span> <span class="cfg-val">' + dur + '</span></div>';
+}
+
 // --- Helpers ---
 function toast(id, msg, type) {
   const el = document.getElementById(id);
@@ -1181,6 +1751,259 @@ function toast(id, msg, type) {
 function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 init();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Audio Debug UI
+# ---------------------------------------------------------------------------
+
+AUDIO_DEBUG_UI = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Audio Debug — Recordings</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    background: #1a1a2e; color: #e0e0e0;
+    min-height: 100vh; padding: 20px;
+  }
+  .container { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; color: #7289da; margin-bottom: 4px; }
+  .subtitle { font-size: 11px; color: #555; margin-bottom: 20px; }
+  .nav-link { font-size: 11px; color: #7289da; text-decoration: none; }
+  .nav-link:hover { text-decoration: underline; }
+  .header-row { display: flex; align-items: baseline; gap: 16px; margin-bottom: 16px; }
+
+  .recording {
+    background: #16213e; border: 1px solid #0f3460;
+    border-radius: 8px; padding: 14px; margin-bottom: 12px;
+  }
+  .rec-header {
+    display: flex; gap: 12px; align-items: baseline; margin-bottom: 8px; flex-wrap: wrap;
+  }
+  .rec-time { font-size: 12px; font-weight: 600; color: #7289da; font-variant-numeric: tabular-nums; }
+  .rec-transcript { font-size: 13px; color: #e0e0e0; flex: 1; word-break: break-word; }
+  .rec-duration { font-size: 10px; color: #555; }
+
+  .audio-row {
+    display: flex; gap: 12px; align-items: center; margin-bottom: 6px; flex-wrap: wrap;
+  }
+  .audio-label {
+    font-size: 10px; color: #888; text-transform: uppercase;
+    letter-spacing: 0.5px; min-width: 65px;
+  }
+  audio { height: 28px; flex: 1; min-width: 180px; }
+  audio::-webkit-media-controls-panel { background: #1a1a2e; }
+
+  .retranscribe-row {
+    display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap;
+  }
+  .btn {
+    font-size: 11px; padding: 5px 12px;
+    border: 1px solid #0f3460; border-radius: 4px;
+    background: #1a1a2e; color: #e0e0e0;
+    cursor: pointer; transition: all 0.15s; white-space: nowrap;
+  }
+  .btn:hover { background: #0f3460; border-color: #7289da; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { border-color: #7289da; color: #7289da; background: rgba(114,137,218,0.08); }
+  .btn-primary:hover { background: rgba(114,137,218,0.2); }
+  .btn-refresh { border-color: #00e676; color: #00e676; }
+  .btn-refresh:hover { background: rgba(0,230,118,0.15); }
+
+  .retranscript-result {
+    margin-top: 6px; padding: 6px 10px; border-radius: 4px;
+    font-size: 12px; background: rgba(114,137,218,0.06);
+    border-left: 3px solid #7289da;
+  }
+  .retranscript-result .model-tag {
+    font-size: 9px; font-weight: 600; text-transform: uppercase;
+    color: #7289da; letter-spacing: 0.5px;
+  }
+  .retranscript-result .result-text { margin-top: 2px; }
+  .retranscript-result.error { border-left-color: #ff5252; }
+  .retranscript-result.error .model-tag { color: #ff5252; }
+
+  .empty-state {
+    text-align: center; padding: 40px; color: #444;
+    font-style: italic; font-size: 13px;
+  }
+
+  .status-bar {
+    display: flex; gap: 12px; align-items: center; margin-bottom: 16px;
+    padding: 10px 14px; background: #16213e; border: 1px solid #0f3460;
+    border-radius: 8px; font-size: 11px;
+  }
+  .status-count { color: #7289da; font-weight: 500; }
+  .status-spacer { flex: 1; }
+  .auto-refresh-label { color: #555; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header-row">
+    <div>
+      <h1>Audio Debug</h1>
+      <div class="subtitle">Browse, play, and re-transcribe recorded utterances</div>
+    </div>
+    <a href="/" class="nav-link">Back to Control Panel</a>
+  </div>
+
+  <div class="status-bar">
+    <span class="status-count" id="rec-count">0 recordings</span>
+    <span class="status-spacer"></span>
+    <label class="auto-refresh-label">
+      <input type="checkbox" id="chk-auto" checked /> Auto-refresh (10s)
+    </label>
+    <button class="btn btn-refresh" id="btn-refresh" onclick="loadRecordings()">Refresh</button>
+  </div>
+
+  <div id="recordings-list">
+    <div class="empty-state">Loading recordings...</div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let autoRefreshTimer = null;
+
+async function loadRecordings() {
+  try {
+    const r = await fetch(API + '/debug/recordings');
+    const d = await r.json();
+    const recs = d.recordings || [];
+    document.getElementById('rec-count').textContent = recs.length + ' recording' + (recs.length !== 1 ? 's' : '');
+
+    const container = document.getElementById('recordings-list');
+    if (recs.length === 0) {
+      container.innerHTML = '<div class="empty-state">No recordings yet. Audio will be recorded when the bot receives speech and produces a transcript.</div>';
+      return;
+    }
+
+    container.innerHTML = recs.map((rec, idx) => {
+      const ts = rec.timestamp || rec.base || '?';
+      const transcript = rec.transcript || '(no transcript)';
+      const dur = rec.actual_duration_32k || rec.actual_duration_48k || rec.duration_s || '?';
+
+      let audioHtml = '';
+      if (rec.has_32k) {
+        audioHtml += '<div class="audio-row">' +
+          '<span class="audio-label">32kHz Mono</span>' +
+          '<audio controls preload="none" src="' + API + '/debug/recordings/' + esc(rec.base) + '.32k.wav"></audio>' +
+          '</div>';
+      }
+      if (rec.has_48k) {
+        audioHtml += '<div class="audio-row">' +
+          '<span class="audio-label">48kHz Stereo</span>' +
+          '<audio controls preload="none" src="' + API + '/debug/recordings/' + esc(rec.base) + '.48k.wav"></audio>' +
+          '</div>';
+      }
+
+      // Determine which file to retranscribe (prefer 32k)
+      const retranscribeFile = rec.has_32k ? rec.base + '.32k.wav' : (rec.has_48k ? rec.base + '.48k.wav' : '');
+
+      let retranscribeHtml = '';
+      if (retranscribeFile) {
+        retranscribeHtml = '<div class="retranscribe-row">' +
+          '<button class="btn btn-primary" onclick="retranscribe(\'' + esc(retranscribeFile) + '\', \'medium.en\', ' + idx + ')">Re-transcribe (medium.en)</button>' +
+          '<button class="btn btn-primary" onclick="retranscribe(\'' + esc(retranscribeFile) + '\', \'large-v3\', ' + idx + ')">Re-transcribe (large-v3)</button>' +
+          '</div>' +
+          '<div id="retranscript-' + idx + '"></div>';
+      }
+
+      return '<div class="recording">' +
+        '<div class="rec-header">' +
+          '<span class="rec-time">' + esc(formatTimestamp(ts)) + '</span>' +
+          '<span class="rec-transcript">' + esc(transcript) + '</span>' +
+          '<span class="rec-duration">' + dur + 's</span>' +
+        '</div>' +
+        audioHtml +
+        retranscribeHtml +
+        '</div>';
+    }).join('');
+
+  } catch (e) {
+    document.getElementById('recordings-list').innerHTML =
+      '<div class="empty-state">Error loading recordings: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function retranscribe(filename, model, idx) {
+  const resultDiv = document.getElementById('retranscript-' + idx);
+  if (!resultDiv) return;
+
+  // Add a loading indicator
+  const loadingId = 'loading-' + model.replace(/[^a-z0-9]/g, '') + '-' + idx;
+  resultDiv.innerHTML += '<div id="' + loadingId + '" class="retranscript-result" style="opacity:0.5;">' +
+    '<span class="model-tag">' + esc(model) + '</span> transcribing...' +
+    '</div>';
+
+  try {
+    const r = await fetch(API + '/debug/retranscribe/' + encodeURIComponent(filename), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: model }),
+    });
+    const d = await r.json();
+    const loadEl = document.getElementById(loadingId);
+    if (!loadEl) return;
+
+    if (d.ok) {
+      loadEl.style.opacity = '1';
+      loadEl.innerHTML = '<span class="model-tag">' + esc(model) + '</span>' +
+        '<div class="result-text">' + esc(d.transcript) + '</div>' +
+        '<div style="font-size:9px;color:#555;margin-top:2px;">' +
+          (d.duration_s || '?') + 's audio, ' + (d.pcm_bytes || '?') + ' bytes PCM' +
+        '</div>';
+    } else {
+      loadEl.style.opacity = '1';
+      loadEl.className = 'retranscript-result error';
+      loadEl.innerHTML = '<span class="model-tag">' + esc(model) + ' - ERROR</span>' +
+        '<div class="result-text">' + esc(d.error || 'Unknown error') + '</div>';
+    }
+  } catch (e) {
+    const loadEl = document.getElementById(loadingId);
+    if (loadEl) {
+      loadEl.style.opacity = '1';
+      loadEl.className = 'retranscript-result error';
+      loadEl.innerHTML = '<span class="model-tag">' + esc(model) + ' - ERROR</span>' +
+        '<div class="result-text">' + esc(e.message) + '</div>';
+    }
+  }
+}
+
+function formatTimestamp(ts) {
+  // Convert "20260216_233500" to "2026-02-16 23:35:00"
+  if (ts.length >= 15 && ts[8] === '_') {
+    return ts.substring(0, 4) + '-' + ts.substring(4, 6) + '-' + ts.substring(6, 8) +
+      ' ' + ts.substring(9, 11) + ':' + ts.substring(11, 13) + ':' + ts.substring(13, 15);
+  }
+  return ts;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function setupAutoRefresh() {
+  const chk = document.getElementById('chk-auto');
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  if (chk.checked) {
+    autoRefreshTimer = setInterval(loadRecordings, 10000);
+  }
+  chk.onchange = setupAutoRefresh;
+}
+
+// Init
+loadRecordings();
+setupAutoRefresh();
 </script>
 </body>
 </html>
