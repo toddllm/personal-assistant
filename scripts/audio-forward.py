@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from queue import Empty, Full, Queue
 
 import numpy as np
@@ -206,6 +207,7 @@ def downmix_to_mono(data: np.ndarray) -> np.ndarray:
 _shutdown = threading.Event()
 _RETRY_INTERVAL = 5.0
 _DEVICE_CHECK_INTERVAL = 2.0  # how often to check if target still exists
+_MAX_STREAM_SECONDS = 1800.0  # force-cycle streams to prevent silent stalls
 
 # Per-target queues, only populated when target is actively streaming.
 # Guarded by _queues_lock.
@@ -441,17 +443,32 @@ def _output_writer(
                 log.info("[%s] active", target_name)
                 # Use the stream's actual blocksize for silence frames
                 silence_blocksize = stream.blocksize or settings.audio_forward_blocksize
+                primed = False  # True once first real audio arrives
+                stream_opened_at = time.monotonic()
 
                 while not _shutdown.is_set() and not _reinit_needed.is_set() and not device_gone.is_set():
+                    # Force-cycle long-lived streams to prevent silent stalls
+                    # where CoreAudio stops routing audio but PortAudio doesn't
+                    # report any error.
+                    stream_age = time.monotonic() - stream_opened_at
+                    if stream_age > _MAX_STREAM_SECONDS:
+                        log.info("[%s] cycling stream after %.0fs to prevent stale output",
+                                 target_name, stream_age)
+                        break
+
                     try:
-                        data = q.get(timeout=0.02)
+                        data = q.get(timeout=0.1)
                     except Empty:
-                        # Write silence to prevent CoreAudio underrun replay
-                        try:
-                            stream.write(np.zeros((silence_blocksize, target_channels), dtype="float32"))
-                        except sd.PortAudioError:
-                            device_gone.set()
+                        if not primed:
+                            # Before first real data, write silence to prevent
+                            # CoreAudio underrun replaying stale buffer contents
+                            try:
+                                stream.write(np.zeros((silence_blocksize, target_channels), dtype="float32"))
+                            except sd.PortAudioError:
+                                device_gone.set()
+                        # Once primed, the 50ms output buffer handles brief gaps
                         continue
+                    primed = True
 
                     # Channel downmix (stereo -> mono)
                     if needs_downmix:
@@ -472,6 +489,14 @@ def _output_writer(
                         stream.write(data)
                     except sd.PortAudioError:
                         log.warning("[%s] write error, closing stream", target_name)
+                        device_gone.set()
+                        continue
+
+                    # Detect silently dead streams: CoreAudio may stop the
+                    # PortAudio stream without raising an error on write.
+                    if not stream.active:
+                        log.warning("[%s] stream no longer active (CoreAudio killed it), reconnecting",
+                                    target_name)
                         device_gone.set()
 
         except sd.PortAudioError as exc:

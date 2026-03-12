@@ -18,8 +18,8 @@ warnings=0
 errors=0
 
 ok()   { echo -e "  ${GRN}OK${RST}  $1"; }
-warn() { echo -e "  ${YEL}WARN${RST} $1"; ((warnings++)); }
-fail() { echo -e "  ${RED}FAIL${RST} $1"; ((errors++)); }
+warn() { echo -e "  ${YEL}WARN${RST} $1"; warnings=$((warnings + 1)); }
+fail() { echo -e "  ${RED}FAIL${RST} $1"; errors=$((errors + 1)); }
 info() { echo -e "  ${DIM}----${RST} $1"; }
 
 echo "=== Audio Routing Health Check ==="

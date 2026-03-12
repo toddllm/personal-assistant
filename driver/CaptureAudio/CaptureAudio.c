@@ -340,6 +340,67 @@ static const UInt32                 kDevice_SampleRatesSize             = sizeof
 #define                             kRing_Buffer_Frame_Size             ((65536 + kLatency_Frame_Size))
 static Float32*                     gRingBuffer = NULL;
 
+//==================================================================================================
+#pragma mark -
+#pragma mark Client Tracking
+//==================================================================================================
+
+//  Track which processes are using this virtual device so the audio control API
+//  can report "which apps are playing audio".  We store up to MAX_CLIENTS entries
+//  and write the list to /tmp/capture-audio-clients.json on every add/remove.
+
+#define MAX_CLIENTS 64
+
+typedef struct {
+    UInt32  clientID;
+    pid_t   pid;
+    char    bundleID[256];
+} ClientEntry;
+
+static ClientEntry  gClients[MAX_CLIENTS];
+static UInt32       gClientCount = 0;
+
+/// Build a JSON snapshot of the client list into `outBuf`.
+/// Must be called while gPlugIn_StateMutex is held.
+/// Returns the number of bytes written.
+static int _BuildClientsJSON(char* outBuf, size_t bufSize)
+{
+    int  pos = 0;
+    pos += snprintf(outBuf + pos, bufSize - pos, "[\n");
+    for (UInt32 i = 0; i < gClientCount && i < MAX_CLIENTS; i++) {
+        pos += snprintf(outBuf + pos, bufSize - pos,
+                        "  {\"pid\": %d, \"client_id\": %u, \"bundle_id\": \"%s\"}%s\n",
+                        gClients[i].pid,
+                        (unsigned)gClients[i].clientID,
+                        gClients[i].bundleID,
+                        (i + 1 < gClientCount) ? "," : "");
+    }
+    pos += snprintf(outBuf + pos, bufSize - pos, "]\n");
+    return pos;
+}
+
+/// Write the JSON string to /tmp/capture-audio-clients.json.
+/// Called after releasing the mutex — only does file I/O.
+static void _FlushClientsJSON(const char* jsonBuf, int jsonLen)
+{
+    const char* tmpPath = "/tmp/capture-audio-clients.json.tmp";
+    const char* finalPath = "/tmp/capture-audio-clients.json";
+    FILE* f = fopen(tmpPath, "w");
+    if (f) {
+        fwrite(jsonBuf, 1, jsonLen, f);
+        fclose(f);
+        rename(tmpPath, finalPath);
+    }
+}
+
+static void _CFStringToCString(CFStringRef cfStr, char* outBuf, size_t bufLen)
+{
+    outBuf[0] = '\0';
+    if (cfStr) {
+        CFStringGetCString(cfStr, outBuf, (CFIndex)bufLen, kCFStringEncodingUTF8);
+    }
+}
+
 
 //==================================================================================================
 #pragma mark -
@@ -838,18 +899,34 @@ Done:
 static OSStatus	CaptureAudio_AddDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
 {
 	//	This method is used to inform the driver about a new client that is using the given device.
-	//	This allows the device to act differently depending on who the client is. This driver does
-	//	not need to track the clients using the device, so we just check the arguments and return
-	//	successfully.
-	
-	#pragma unused(inClientInfo)
-	
+	//	We track client PIDs and bundle IDs so the audio control API can report which apps are
+	//	using the virtual device.
+
 	//	declare the local variables
 	OSStatus theAnswer = 0;
-	
+
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "CaptureAudio_AddDeviceClient: bad driver reference");
 	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "CaptureAudio_AddDeviceClient: bad device ID");
+
+	//	track the client
+	if (inClientInfo != NULL) {
+		char jsonBuf[MAX_CLIENTS * 320 + 64];
+		int jsonLen = 0;
+		pthread_mutex_lock(&gPlugIn_StateMutex);
+		if (gClientCount < MAX_CLIENTS) {
+			ClientEntry* entry = &gClients[gClientCount];
+			entry->clientID = inClientInfo->mClientID;
+			entry->pid = inClientInfo->mProcessID;
+			_CFStringToCString(inClientInfo->mBundleID, entry->bundleID, sizeof(entry->bundleID));
+			gClientCount++;
+			jsonLen = _BuildClientsJSON(jsonBuf, sizeof(jsonBuf));
+		}
+		pthread_mutex_unlock(&gPlugIn_StateMutex);
+		if (jsonLen > 0) {
+			_FlushClientsJSON(jsonBuf, jsonLen);
+		}
+	}
 
 Done:
 	return theAnswer;
@@ -858,17 +935,36 @@ Done:
 static OSStatus	CaptureAudio_RemoveDeviceClient(AudioServerPlugInDriverRef inDriver, AudioObjectID inDeviceObjectID, const AudioServerPlugInClientInfo* inClientInfo)
 {
 	//	This method is used to inform the driver about a client that is no longer using the given
-	//	device. This driver does not track clients, so we just check the arguments and return
-	//	successfully.
-	
-	#pragma unused(inClientInfo)
-	
+	//	device. We remove the client from our tracking list.
+
 	//	declare the local variables
 	OSStatus theAnswer = 0;
-	
+
 	//	check the arguments
 	FailWithAction(inDriver != gAudioServerPlugInDriverRef, theAnswer = kAudioHardwareBadObjectError, Done, "CaptureAudio_RemoveDeviceClient: bad driver reference");
 	FailWithAction(inDeviceObjectID != kObjectID_Device && inDeviceObjectID != kObjectID_Device2, theAnswer = kAudioHardwareBadObjectError, Done, "CaptureAudio_RemoveDeviceClient: bad device ID");
+
+	//	remove the client
+	if (inClientInfo != NULL) {
+		char jsonBuf[MAX_CLIENTS * 320 + 64];
+		int jsonLen = 0;
+		pthread_mutex_lock(&gPlugIn_StateMutex);
+		for (UInt32 i = 0; i < gClientCount; i++) {
+			if (gClients[i].clientID == inClientInfo->mClientID) {
+				//	shift remaining entries down
+				for (UInt32 j = i; j + 1 < gClientCount; j++) {
+					gClients[j] = gClients[j + 1];
+				}
+				gClientCount--;
+				jsonLen = _BuildClientsJSON(jsonBuf, sizeof(jsonBuf));
+				break;
+			}
+		}
+		pthread_mutex_unlock(&gPlugIn_StateMutex);
+		if (jsonLen > 0) {
+			_FlushClientsJSON(jsonBuf, jsonLen);
+		}
+	}
 
 Done:
 	return theAnswer;

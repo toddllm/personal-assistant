@@ -143,9 +143,23 @@ class MicrophoneSourceRunner(BaseSourceRunner):
             chunk = bytes(self._buffer[: self._segment_bytes])
             del self._buffer[: self._segment_step_bytes]
 
-            started_at = self._stream_started_at + timedelta(
+            # Hybrid timestamp: use segment-count math for monotonic spacing,
+            # but periodically resync against wall clock to prevent long-term
+            # drift from audio device clock skew (~0.4%, ~6 min/day).
+            calculated = self._stream_started_at + timedelta(
                 seconds=self._segments_emitted * self._segment_step_seconds
             )
+            now = datetime.now(tz=UTC)
+            bytes_per_second = self._sample_rate * self._channels * 2
+            remaining_buffer_seconds = len(self._buffer) / bytes_per_second
+            wall_estimate = now - timedelta(seconds=remaining_buffer_seconds) - timedelta(seconds=self._segment_seconds)
+            drift = (wall_estimate - calculated).total_seconds()
+            # If drift exceeds one step, resync to wall clock
+            if abs(drift) > self._segment_step_seconds:
+                self._stream_started_at += timedelta(seconds=drift)
+                started_at = wall_estimate
+            else:
+                started_at = calculated
             ended_at = started_at + timedelta(seconds=self._segment_seconds)
             self._segments_emitted += 1
 
@@ -273,7 +287,7 @@ class FFmpegSourceRunner(BaseSourceRunner):
     def _run(self) -> None:
         if self._process is None or self._process.stdout is None:
             return
-        start = datetime.now(tz=UTC)
+        stream_start = datetime.now(tz=UTC)
         segment_index = 0
         buffer = bytearray()
         while not self._stop_event.is_set():
@@ -285,7 +299,19 @@ class FFmpegSourceRunner(BaseSourceRunner):
             while len(buffer) >= self._segment_bytes:
                 seg = bytes(buffer[: self._segment_bytes])
                 del buffer[: self._segment_step_bytes]
-                started_at = start + timedelta(seconds=segment_index * self._segment_step_seconds)
+                # Hybrid: use segment-count math for monotonic spacing,
+                # resync against wall clock when drift exceeds one step.
+                calculated = stream_start + timedelta(seconds=segment_index * self._segment_step_seconds)
+                wall_now = datetime.now(tz=UTC)
+                bytes_per_second = self._sample_rate * self._channels * 2
+                remaining_buf_seconds = len(buffer) / bytes_per_second
+                wall_estimate = wall_now - timedelta(seconds=remaining_buf_seconds) - timedelta(seconds=self._segment_seconds)
+                drift = (wall_estimate - calculated).total_seconds()
+                if abs(drift) > self._segment_step_seconds:
+                    stream_start += timedelta(seconds=drift)
+                    started_at = wall_estimate
+                else:
+                    started_at = calculated
                 ended_at = started_at + timedelta(seconds=self._segment_seconds)
                 segment_index += 1
                 try:

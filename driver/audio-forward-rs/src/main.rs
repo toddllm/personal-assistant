@@ -14,6 +14,7 @@
 //!       → Physical speaker/headphone
 
 use coreaudio_sys::*;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw::c_void;
 use std::ptr;
@@ -30,6 +31,8 @@ const DEVICE_SCAN_INTERVAL_TICKS: i32 = 25; // 25 * 200ms = 5s
 const MAX_CALLBACK_FRAMES: usize = 4096;
 const PREFERRED_IO_FRAMES: u32 = 256; // request ~5.3ms IO buffers from CoreAudio
 const MAX_RING_LATENCY_FRAMES: u32 = 1024; // ~21ms — skip ahead if ring accumulates more
+
+const SETTINGS_CHECK_INTERVAL_TICKS: i32 = 5; // 5 * 200ms = 1s
 
 const EXCLUDED: &[&str] = &[
     "capturemic",
@@ -171,6 +174,11 @@ struct OutputSlot {
     needs_resample: bool,
     active: bool,
     underruns: AtomicU32,
+    /// Software volume: 0–1000 maps to 0.0–1.0. Loaded atomically in render callback.
+    volume: AtomicU32,
+    /// When false, input callback skips writing to this slot's ring buffer,
+    /// and scan_and_update_outputs tears down the output.
+    enabled: AtomicBool,
 }
 
 #[repr(C)]
@@ -406,6 +414,7 @@ unsafe extern "C" fn input_render_cb(
         let outputs = &*G_OUTPUTS;
         for slot in outputs.iter().take(G_OUTPUT_COUNT) {
             if !slot.active { continue; }
+            if !slot.enabled.load(Ordering::Relaxed) { continue; }
             if slot.ring.available_write() >= frames {
                 slot.ring.write(raw_buf.as_ptr(), frames);
             }
@@ -481,6 +490,17 @@ unsafe extern "C" fn output_render_cb(
             slot.underruns.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    // Apply software volume scaling (lock-free, real-time safe)
+    let vol_raw = slot.volume.load(Ordering::Relaxed);
+    if vol_raw < 1000 {
+        let vol = vol_raw as f32 / 1000.0;
+        let total_samples = (n_frames * out_ch) as usize;
+        for i in 0..total_samples {
+            *out.add(i) *= vol;
+        }
+    }
+
     0
 }
 
@@ -543,10 +563,16 @@ fn setup_output(slot: &mut OutputSlot) -> bool {
                 log_error!("[{}] AudioConverterNew failed", slot.name);
                 return false;
             }
-            let quality = kAudioConverterQuality_Medium;
+            // Use Low quality for minimum algorithmic delay (~0.6-1ms vs ~2-4ms for Medium)
+            let quality = kAudioConverterQuality_Low;
             AudioConverterSetProperty(slot.converter,
                 kAudioConverterSampleRateConverterQuality,
                 4, &quality as *const u32 as *const c_void);
+            // Skip priming to eliminate startup latency
+            let prime_method: u32 = 0; // kConverterPrimeMethod_None
+            AudioConverterSetProperty(slot.converter,
+                kAudioConverterPrimeMethod,
+                4, &prime_method as *const u32 as *const c_void);
         }
 
         let au_desc = AudioComponentDescription {
@@ -580,6 +606,36 @@ fn setup_output(slot: &mut OutputSlot) -> bool {
         AudioObjectSetPropertyData(
             slot.device_id, &buf_addr, 0, ptr::null(),
             4, &buf_frames as *const u32 as *const c_void);
+        // Read back what the device actually accepted
+        let mut actual_buf: u32 = 0;
+        let mut sz = 4u32;
+        AudioObjectGetPropertyData(
+            slot.device_id, &buf_addr, 0, ptr::null(),
+            &mut sz, &mut actual_buf as *mut u32 as *mut c_void);
+        // Query device-reported latency components
+        let mut dev_latency: u32 = 0;
+        let mut safety_offset: u32 = 0;
+        let lat_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyLatency,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        sz = 4;
+        AudioObjectGetPropertyData(
+            slot.device_id, &lat_addr, 0, ptr::null(),
+            &mut sz, &mut dev_latency as *mut u32 as *mut c_void);
+        let safe_addr = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertySafetyOffset,
+            mScope: kAudioDevicePropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+        sz = 4;
+        AudioObjectGetPropertyData(
+            slot.device_id, &safe_addr, 0, ptr::null(),
+            &mut sz, &mut safety_offset as *mut u32 as *mut c_void);
+        let hw_latency_ms = (dev_latency + safety_offset + actual_buf) as f64 / slot.device_rate * 1000.0;
+        log_info!("[{}] io_buf={}frames latency={}frames safety={}frames hw_total={:.1}ms",
+            slot.name, actual_buf, dev_latency, safety_offset, hw_latency_ms);
 
         let fmt = make_pcm_format(slot.device_rate, slot.device_channels);
         AudioUnitSetProperty(slot.output_au, kAudioUnitProperty_StreamFormat,
@@ -623,6 +679,34 @@ fn setup_input(source_device: &str) -> bool {
         log_warn!("source '{}' not found", source_device);
         return false;
     };
+    // Force the source device to our expected sample rate.  macOS can change a
+    // virtual device's rate when the default output switches (e.g. to a 44.1kHz
+    // Bluetooth device).  If the rate doesn't match, the AUHAL won't fire
+    // callbacks and audio-forward silently produces no output.
+    let current_rate = get_device_sample_rate(device_id).unwrap_or(0.0);
+    if (current_rate as u32) != SOURCE_RATE {
+        log_warn!("source device rate is {} Hz, resetting to {} Hz",
+            current_rate as u32, SOURCE_RATE);
+        unsafe {
+            let desired_rate: f64 = SOURCE_RATE as f64;
+            let rate_addr = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            AudioObjectSetPropertyData(
+                device_id, &rate_addr, 0, ptr::null(),
+                std::mem::size_of::<f64>() as u32,
+                &desired_rate as *const f64 as *const c_void,
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let new_rate = get_device_sample_rate(device_id).unwrap_or(0.0);
+        if (new_rate as u32) != SOURCE_RATE {
+            log_error!("failed to set source rate to {} Hz (still {} Hz)",
+                SOURCE_RATE, new_rate as u32);
+        }
+    }
     unsafe {
         let au_desc = AudioComponentDescription {
             componentType: kAudioUnitType_Output,
@@ -655,6 +739,13 @@ fn setup_input(source_device: &str) -> bool {
         AudioObjectSetPropertyData(
             device_id, &buf_addr, 0, ptr::null(),
             4, &buf_frames as *const u32 as *const c_void);
+        let mut actual_buf: u32 = 0;
+        let mut sz = 4u32;
+        AudioObjectGetPropertyData(
+            device_id, &buf_addr, 0, ptr::null(),
+            &mut sz, &mut actual_buf as *mut u32 as *mut c_void);
+        log_info!("input io_buf={}frames ({:.1}ms)", actual_buf,
+            actual_buf as f64 / SOURCE_RATE as f64 * 1000.0);
 
         let fmt = make_pcm_format(SOURCE_RATE as f64, SOURCE_CHANNELS);
         AudioUnitSetProperty(G_INPUT_AU, kAudioUnitProperty_StreamFormat,
@@ -718,18 +809,27 @@ fn remove_hotplug_listener() {
 
 // ──────────────── Device Scan & Output Management ───────────────────────
 
-fn scan_and_update_outputs(outputs: &mut Vec<OutputSlot>) {
+fn scan_and_update_outputs(outputs: &mut Vec<OutputSlot>, settings: &HashMap<String, DeviceSettings>) {
     let discovered = discover_output_devices();
 
     for slot in outputs.iter_mut() {
         if !slot.active { continue; }
-        if !discovered.iter().any(|(id, _)| *id == slot.device_id) {
+        let disappeared = !discovered.iter().any(|(id, _)| *id == slot.device_id);
+        let slug = slugify(&slot.name);
+        let disabled = settings.get(&slug).map_or(false, |s| !s.enabled);
+        if disappeared {
             log_info!("[{}] device disappeared", slot.name);
+            teardown_output(slot);
+        } else if disabled {
+            log_info!("[{}] disabled via settings", slot.name);
             teardown_output(slot);
         }
     }
 
     for (dev_id, dev_name) in &discovered {
+        let slug = slugify(dev_name);
+        let disabled = settings.get(&slug).map_or(false, |s| !s.enabled);
+        if disabled { continue; }
         if outputs.iter().any(|s| s.device_id == *dev_id && s.active) { continue; }
 
         let reuse_idx = if outputs.len() >= MAX_OUTPUTS {
@@ -746,6 +846,7 @@ fn scan_and_update_outputs(outputs: &mut Vec<OutputSlot>) {
                 converter: ptr::null_mut(), ring: Box::new(RingBuffer::new(RING_BUF_FRAMES)),
                 device_rate: 0.0, device_channels: 0, needs_resample: false,
                 active: false, underruns: AtomicU32::new(0),
+                volume: AtomicU32::new(1000), enabled: AtomicBool::new(true),
             });
             outputs.len() - 1
         } else {
@@ -756,6 +857,12 @@ fn scan_and_update_outputs(outputs: &mut Vec<OutputSlot>) {
         outputs[idx].device_id = *dev_id;
         outputs[idx].ring = Box::new(RingBuffer::new(RING_BUF_FRAMES));
         outputs[idx].underruns = AtomicU32::new(0);
+        // Apply settings for this device
+        let s = settings.get(&slug);
+        let vol = s.map_or(1000, |s| s.volume);
+        let en = s.map_or(true, |s| s.enabled);
+        outputs[idx].volume = AtomicU32::new(vol);
+        outputs[idx].enabled = AtomicBool::new(en);
 
         if !setup_output(&mut outputs[idx]) {
             outputs[idx].active = false;
@@ -763,6 +870,76 @@ fn scan_and_update_outputs(outputs: &mut Vec<OutputSlot>) {
     }
 
     unsafe { G_OUTPUT_COUNT = outputs.len(); }
+}
+
+// ──────────── Speaker Settings (speaker-settings.json) ──────────────────
+
+/// Per-device settings read from speaker-settings.json
+struct DeviceSettings {
+    volume: u32, // 0–1000 fixed-point (maps 0–100% → 0–1000)
+    enabled: bool,
+}
+
+fn slugify(name: &str) -> String {
+    name.to_lowercase().replace(' ', "-")
+}
+
+/// Find the project data dir: look for data/speaker-settings.json relative to the binary,
+/// or fall back to AUDIO_ASSIST_PROJECT_ROOT env var, or CWD.
+fn find_settings_path() -> std::path::PathBuf {
+    // Try env var first
+    if let Ok(root) = std::env::var("AUDIO_ASSIST_PROJECT_ROOT") {
+        let p = std::path::PathBuf::from(root).join("data/speaker-settings.json");
+        if p.exists() { return p; }
+    }
+    // Try relative to binary: binary is at driver/audio-forward-rs/target/release/audio-forward
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent()  // release/
+            .and_then(|p| p.parent())     // target/
+            .and_then(|p| p.parent())     // audio-forward-rs/
+            .and_then(|p| p.parent())     // driver/
+            .and_then(|p| p.parent())     // project root
+        {
+            let p = root.join("data/speaker-settings.json");
+            if p.exists() { return p; }
+        }
+    }
+    // Fallback: CWD
+    std::path::PathBuf::from("data/speaker-settings.json")
+}
+
+fn read_speaker_settings(path: &std::path::Path) -> HashMap<String, DeviceSettings> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&text) else {
+        return HashMap::new();
+    };
+    let mut result = HashMap::new();
+    for (slug, obj) in parsed {
+        let enabled = obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+        let volume_pct = obj.get("volume").and_then(|v| v.as_u64()).unwrap_or(100) as u32;
+        // Convert 0–100 percentage to 0–1000 fixed-point for atomic use
+        let volume = (volume_pct.min(100) * 10).min(1000);
+        result.insert(slug, DeviceSettings { volume, enabled });
+    }
+    result
+}
+
+/// Apply settings to existing active output slots (volume + enabled atomics).
+fn apply_settings_to_outputs(outputs: &[OutputSlot], settings: &HashMap<String, DeviceSettings>) {
+    for slot in outputs.iter() {
+        if !slot.active { continue; }
+        let slug = slugify(&slot.name);
+        if let Some(s) = settings.get(&slug) {
+            slot.volume.store(s.volume, Ordering::Relaxed);
+            slot.enabled.store(s.enabled, Ordering::Relaxed);
+        } else {
+            // No settings entry → full volume, enabled
+            slot.volume.store(1000, Ordering::Relaxed);
+            slot.enabled.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 // ──────────────────────────── Main ───────────────────────────────────────
@@ -778,6 +955,9 @@ fn main() {
     log_info!("audio-forward (Rust) starting");
     log_info!("  source: {} ({}ch @ {} Hz)", source_device, SOURCE_CHANNELS, SOURCE_RATE);
 
+    let settings_path = find_settings_path();
+    log_info!("  settings: {}", settings_path.display());
+
     unsafe {
         libc_ffi::signal(libc_ffi::SIGTERM, sig_handler as usize);
         libc_ffi::signal(libc_ffi::SIGINT, sig_handler as usize);
@@ -790,6 +970,8 @@ fn main() {
 
     let mut input_active = false;
     let mut scan_countdown: i32 = 0;
+    let mut settings_countdown: i32 = 0;
+    let mut settings = read_speaker_settings(&settings_path);
 
     while !SHUTDOWN.load(Ordering::Relaxed) {
         if !input_active {
@@ -803,9 +985,56 @@ fn main() {
             }
         }
 
+        // Reload speaker settings periodically (~1s)
+        if settings_countdown <= 0 {
+            settings = read_speaker_settings(&settings_path);
+            apply_settings_to_outputs(&outputs, &settings);
+            settings_countdown = SETTINGS_CHECK_INTERVAL_TICKS;
+        }
+
         if scan_countdown <= 0 || DEVICE_CHANGED.load(Ordering::Relaxed) {
+            let was_device_change = DEVICE_CHANGED.load(Ordering::Relaxed);
             DEVICE_CHANGED.store(false, Ordering::Relaxed);
-            scan_and_update_outputs(&mut outputs);
+
+            // On device change, reinitialize the input AUHAL.  CoreAudio can
+            // reassign device IDs when any device (e.g. Bluetooth) connects or
+            // disconnects — the old input AUHAL ends up pointing at a stale ID
+            // and its IO thread blocks forever on a dead semaphore.
+            if was_device_change && input_active {
+                let new_id = find_device_by_name(&source_device, true);
+                let old_id = unsafe {
+                    if G_INPUT_AU.is_null() { None }
+                    else {
+                        let mut dev: AudioDeviceID = 0;
+                        let mut sz = std::mem::size_of::<AudioDeviceID>() as u32;
+                        let err = AudioUnitGetProperty(
+                            G_INPUT_AU,
+                            kAudioOutputUnitProperty_CurrentDevice,
+                            kAudioUnitScope_Global, 0,
+                            &mut dev as *mut _ as *mut c_void, &mut sz,
+                        );
+                        if err == 0 { Some(dev) } else { None }
+                    }
+                };
+                let need_reinit = match (new_id, old_id) {
+                    (Some(n), Some(o)) => n != o,
+                    (None, _) => true,   // device disappeared
+                    (_, None) => true,   // couldn't query old device
+                };
+                if need_reinit {
+                    log_info!("device change: reinitializing input (old={:?}, new={:?})",
+                        old_id, new_id);
+                    teardown_input();
+                    input_active = false;
+                    // Re-setup immediately
+                    input_active = setup_input(&source_device);
+                    if !input_active {
+                        log_warn!("input reinit failed, will retry");
+                    }
+                }
+            }
+
+            scan_and_update_outputs(&mut outputs, &settings);
             scan_countdown = DEVICE_SCAN_INTERVAL_TICKS;
         }
 
@@ -814,6 +1043,7 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         scan_countdown -= 1;
+        settings_countdown -= 1;
     }
 
     log_info!("audio-forward shutting down");

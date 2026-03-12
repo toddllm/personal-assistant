@@ -57,7 +57,12 @@ from audio_assist.schemas import (
     TranscriptTranslateRequest,
     TranscriptTranslateResult,
 )
-from audio_assist.sources import SourceManager, SourceRuntime
+from audio_assist.sources import (
+    FFmpegSourceRunner,
+    MicrophoneSourceRunner,
+    SourceManager,
+    SourceRuntime,
+)
 from audio_assist.storage import SessionRecord, TranscriptRecord, TranscriptStore
 from audio_assist.transcriber import AudioSegment, TranscriptionWorker
 from audio_assist.tts_client import TTSClient
@@ -379,6 +384,8 @@ def create_app(settings: Settings) -> FastAPI:
         max_gap_seconds=settings.calendar_match_max_gap_seconds,
     )
     google_sync_process: subprocess.Popen[bytes] | None = None
+    suppressed_capture_sources: set[str] = set()
+    suppressed_capture_sources_lock = Lock()
 
     def google_sync_base_url() -> str:
         return settings.google_sync_service_url.rstrip("/")
@@ -833,8 +840,42 @@ def create_app(settings: Settings) -> FastAPI:
                 runtime.session_id,
             )
 
+    def suppress_capture_source(source_id: str) -> None:
+        with suppressed_capture_sources_lock:
+            suppressed_capture_sources.add(source_id)
+
+    def unsuppress_capture_source(source_id: str) -> None:
+        with suppressed_capture_sources_lock:
+            suppressed_capture_sources.discard(source_id)
+
+    def is_capture_source_suppressed(source_id: str) -> bool:
+        with suppressed_capture_sources_lock:
+            return source_id in suppressed_capture_sources
+
+    def default_capture_source_ids() -> set[str]:
+        source_ids: set[str] = set()
+        if settings.capture_autostart_mic_enabled:
+            source_ids.add(str(settings.capture_autostart_mic_source_id or settings.mic_source_id).strip() or "desk-mic")
+        if settings.capture_autostart_system_audio_enabled:
+            source_ids.add(str(settings.capture_autostart_system_audio_source_id or "system-audio").strip() or "system-audio")
+        if settings.capture_autostart_app_audio_enabled:
+            source_ids.add(str(settings.capture_autostart_app_audio_source_id or "app-audio").strip() or "app-audio")
+        if settings.capture_autostart_bose_mic_enabled:
+            source_ids.add(str(settings.capture_autostart_bose_mic_source_id or "bose-mic").strip() or "bose-mic")
+        return source_ids
+
+    def clear_default_capture_suppressions() -> None:
+        defaults = default_capture_source_ids()
+        if not defaults:
+            return
+        with suppressed_capture_sources_lock:
+            for source_id in defaults:
+                suppressed_capture_sources.discard(source_id)
+
     def persist_runtime_session(runtime: SourceRuntime) -> None:
-        initial_speaker = settings.mic_speaker_name if runtime.source_id == settings.mic_source_id else None
+        initial_speaker = None
+        if runtime.source_id == settings.mic_source_id and not speaker_client.is_enabled():
+            initial_speaker = settings.mic_speaker_name
         try:
             store.open_session(
                 session_id=runtime.session_id,
@@ -849,6 +890,50 @@ def create_app(settings: Settings) -> FastAPI:
                 runtime.source_id,
                 runtime.session_id,
             )
+
+    def source_status_for_runtime(runtime: SourceRuntime) -> SourceStatus:
+        hint = transcriber.language_hint_for_source(runtime.source_id)
+        details: dict[str, str] = {}
+        if hint:
+            details["language_hint"] = hint
+        if is_capture_source_suppressed(runtime.source_id):
+            details["suppressed"] = "true"
+        return SourceStatus(
+            source_id=runtime.source_id,
+            source_type=runtime.source_type,
+            source_role=runtime.source_role,
+            running=runtime.runner.is_running(),
+            started_at=runtime.started_at,
+            details=details,
+        )
+
+    def restart_runtime_source(runtime: SourceRuntime) -> SourceRuntime:
+        if runtime.source_type == "mic":
+            runner = runtime.runner
+            if not isinstance(runner, MicrophoneSourceRunner):
+                raise RuntimeError(
+                    f"Source '{runtime.source_id}' is not backed by a microphone runner."
+                )
+            return source_manager.start_mic(
+                source_id=runtime.source_id,
+                device=runner._device,
+                channels=runner._channels,
+                source_role=runtime.source_role,
+            )
+        if runtime.source_type == "ffmpeg":
+            runner = runtime.runner
+            if not isinstance(runner, FFmpegSourceRunner):
+                raise RuntimeError(
+                    f"Source '{runtime.source_id}' is not backed by an ffmpeg runner."
+                )
+            return source_manager.start_ffmpeg(
+                source_id=runtime.source_id,
+                ffmpeg_input=runner._ffmpeg_input,
+                ffmpeg_input_format=runner._ffmpeg_input_format,
+                ffmpeg_extra_args=list(runner._ffmpeg_extra_args),
+                source_role=runtime.source_role,
+            )
+        raise RuntimeError(f"Unsupported source_type={runtime.source_type}")
 
     def ensure_capture_sources_running() -> dict[str, object]:
         if not settings.capture_autostart_enabled:
@@ -875,6 +960,18 @@ def create_app(settings: Settings) -> FastAPI:
             role: str,
             channels: int | None = None,
         ) -> None:
+            if is_capture_source_suppressed(source_id):
+                report.append(
+                    {
+                        "source_id": source_id,
+                        "source_type": "mic",
+                        "role": role,
+                        "started": False,
+                        "running": False,
+                        "reason": "manually-suppressed",
+                    }
+                )
+                return
             retry_after = float(capture_retry_after_seconds.get(source_id, 0.0))
             if retry_after > now_monotonic:
                 wait_seconds = max(0.0, retry_after - now_monotonic)
@@ -947,6 +1044,18 @@ def create_app(settings: Settings) -> FastAPI:
             ffmpeg_input_format: str | None,
             role: str,
         ) -> None:
+            if is_capture_source_suppressed(source_id):
+                report.append(
+                    {
+                        "source_id": source_id,
+                        "source_type": "ffmpeg",
+                        "role": role,
+                        "started": False,
+                        "running": False,
+                        "reason": "manually-suppressed",
+                    }
+                )
+                return
             retry_after = float(capture_retry_after_seconds.get(source_id, 0.0))
             if retry_after > now_monotonic:
                 wait_seconds = max(0.0, retry_after - now_monotonic)
@@ -1543,26 +1652,11 @@ def create_app(settings: Settings) -> FastAPI:
 
     @app.get("/v1/sources", response_model=list[SourceStatus])
     def list_sources() -> list[SourceStatus]:
-        statuses = []
-        for runtime in source_manager.statuses():
-            hint = transcriber.language_hint_for_source(runtime.source_id)
-            details: dict[str, str] = {}
-            if hint:
-                details["language_hint"] = hint
-            statuses.append(
-                SourceStatus(
-                    source_id=runtime.source_id,
-                    source_type=runtime.source_type,
-                    source_role=runtime.source_role,
-                    running=runtime.runner.is_running(),
-                    started_at=runtime.started_at,
-                    details=details,
-                )
-            )
-        return statuses
+        return [source_status_for_runtime(runtime) for runtime in source_manager.statuses()]
 
     @app.post("/v1/sources/ensure")
     def ensure_sources() -> dict[str, object]:
+        clear_default_capture_suppressions()
         payload = ensure_capture_sources_running()
         return payload
 
@@ -1762,7 +1856,27 @@ def create_app(settings: Settings) -> FastAPI:
             summary = f"{len(warning_issues)} warning(s); capture is running but needs attention."
         else:
             status = "ready"
-            summary = f"Capture healthy. {len(running_ids)} source(s) running with recent transcript activity."
+            active_signal_count = sum(
+                1
+                for source_id in running_ids
+                if (snapshot := level_map.get(source_id)) is not None
+                and snapshot.age_seconds <= safe_level_stale_seconds
+                and not snapshot.silent
+                and snapshot.level_dbfs >= safe_active_level_dbfs
+            )
+            if total_recent_count > 0:
+                summary = (
+                    f"Capture healthy. {len(running_ids)} source(s) running with recent transcript activity."
+                )
+            elif active_signal_count > 0:
+                summary = (
+                    f"Capture healthy. {len(running_ids)} source(s) running with active signal, "
+                    "but no recent transcript rows yet."
+                )
+            else:
+                summary = (
+                    f"Capture healthy but idle. {len(running_ids)} source(s) running; current levels are silent."
+                )
 
         levels_payload: list[dict[str, object]] = []
         for source_id in sorted(set(running_ids) | {mic_source_id, system_source_id}):
@@ -2015,6 +2129,8 @@ def create_app(settings: Settings) -> FastAPI:
     def start_source(req: SourceStartRequest) -> SourceStatus:
         try:
             if req.source_id:
+                unsuppress_capture_source(req.source_id)
+            if req.source_id:
                 existing = source_manager.get(req.source_id)
                 if existing is not None and not existing.runner.is_running():
                     close_stale_session(existing)
@@ -2039,14 +2155,35 @@ def create_app(settings: Settings) -> FastAPI:
         applied_hint = transcriber.set_source_language_hint(runtime.source_id, req.language_hint)
         persist_runtime_session(runtime)
 
-        return SourceStatus(
-            source_id=runtime.source_id,
-            source_type=runtime.source_type,
-            source_role=runtime.source_role,
-            running=runtime.runner.is_running(),
-            started_at=runtime.started_at,
-            details={"language_hint": applied_hint} if applied_hint else {},
-        )
+        status = source_status_for_runtime(runtime)
+        if applied_hint:
+            status.details["language_hint"] = applied_hint
+        return status
+
+    @app.post("/v1/sources/resume/{source_id}", response_model=SourceStatus)
+    def resume_source(source_id: str) -> SourceStatus:
+        runtime = source_manager.get(source_id)
+        if runtime is None and source_id not in default_capture_source_ids():
+            raise HTTPException(status_code=404, detail=f"Unknown source_id={source_id}")
+        try:
+            unsuppress_capture_source(source_id)
+            if source_id in default_capture_source_ids():
+                ensure_capture_sources_running()
+                runtime = source_manager.get(source_id)
+                if runtime is not None and runtime.runner.is_running():
+                    return source_status_for_runtime(runtime)
+            if runtime is None:
+                raise HTTPException(status_code=404, detail=f"Unknown source_id={source_id}")
+            if runtime.runner.is_running():
+                return source_status_for_runtime(runtime)
+            close_stale_session(runtime)
+            restarted = restart_runtime_source(runtime)
+            persist_runtime_session(restarted)
+            return source_status_for_runtime(restarted)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/v1/sources/language", response_model=SourceStatus)
     def update_source_language(req: SourceLanguageHintRequest) -> SourceStatus:
@@ -2054,20 +2191,17 @@ def create_app(settings: Settings) -> FastAPI:
         if runtime is None:
             raise HTTPException(status_code=404, detail=f"Unknown source_id={req.source_id}")
         applied_hint = transcriber.set_source_language_hint(runtime.source_id, req.language_hint)
-        return SourceStatus(
-            source_id=runtime.source_id,
-            source_type=runtime.source_type,
-            source_role=runtime.source_role,
-            running=runtime.runner.is_running(),
-            started_at=runtime.started_at,
-            details={"language_hint": applied_hint} if applied_hint else {},
-        )
+        status = source_status_for_runtime(runtime)
+        if applied_hint:
+            status.details["language_hint"] = applied_hint
+        return status
 
     @app.post("/v1/sources/stop/{source_id}")
     def stop_source(source_id: str) -> dict[str, bool]:
         runtime = source_manager.get(source_id)
         if runtime is None:
             raise HTTPException(status_code=404, detail=f"Unknown source_id={source_id}")
+        suppress_capture_source(source_id)
         stopped = source_manager.stop(source_id)
         if not stopped:
             raise HTTPException(status_code=404, detail=f"Unknown source_id={source_id}")
@@ -2084,7 +2218,7 @@ def create_app(settings: Settings) -> FastAPI:
     @app.post("/v1/ingest/transcript", response_model=TranscriptItem)
     def ingest_transcript(req: TranscriptIngestRequest) -> TranscriptItem:
         speaker = req.speaker
-        if speaker is None and req.source_id == settings.mic_source_id:
+        if speaker is None and req.source_id == settings.mic_source_id and not speaker_client.is_enabled():
             speaker = settings.mic_speaker_name
         source_type = req.source_type
         if source_type is None and req.source_id == settings.mic_source_id:

@@ -290,9 +290,10 @@ def _load_mic_settings() -> dict[str, dict]:
     """Load mic settings from JSON file, returning {slug: {volume, enabled}}."""
     try:
         with open(MIC_SETTINGS_PATH) as f:
-            return json.load(f)
+            raw = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    return {slug: _normalize_mic_setting(slug, value) for slug, value in raw.items()}
 
 
 def _load_speaker_settings() -> dict[str, dict]:
@@ -324,10 +325,11 @@ def _save_speaker_settings(data: dict[str, dict]) -> None:
 def _save_mic_settings(settings: dict[str, dict]) -> None:
     """Atomically write mic settings to JSON file."""
     os.makedirs(os.path.dirname(MIC_SETTINGS_PATH), exist_ok=True)
+    normalized = {slug: _normalize_mic_setting(slug, value) for slug, value in settings.items()}
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(MIC_SETTINGS_PATH), suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(settings, f, indent=2)
+            json.dump(normalized, f, indent=2)
             f.write("\n")
         os.replace(tmp, MIC_SETTINGS_PATH)
     except Exception:
@@ -336,6 +338,32 @@ def _save_mic_settings(settings: dict[str, dict]) -> None:
         except OSError:
             pass
         raise
+
+
+def _update_speaker_volume(slug: str, volume: int) -> None:
+    """Update the volume field in speaker-settings.json for audio-forward."""
+    spk = _load_speaker_settings()
+    if slug not in spk:
+        spk[slug] = {"enabled": True}
+    spk[slug]["volume"] = max(0, min(100, volume))
+    _save_speaker_settings(spk)
+
+
+PROTECTED_MIC_SLUGS = {"bose-qc45"}
+
+
+def _normalize_mic_setting(slug: str, data: dict | None = None) -> dict:
+    normalized = dict(data or {})
+    if slug in PROTECTED_MIC_SLUGS:
+        current_volume = normalized.get("volume", 0)
+        if isinstance(current_volume, (int, float)) and current_volume > 0:
+            normalized.setdefault("pre_disable_gain", int(current_volume))
+        normalized["volume"] = 0
+        normalized["enabled"] = False
+        return normalized
+    normalized["volume"] = int(normalized.get("volume", 100))
+    normalized["enabled"] = bool(normalized.get("enabled", True))
+    return normalized
 
 
 def _resolve_device(slug: str) -> dict | None:
@@ -440,11 +468,25 @@ HTML = """<!DOCTYPE html>
     transition: width 0.15s; }
   .level-bar.hot { background: #c33; }
   .mic-vol { font-size: 14px; text-align: center; color: #aaa; margin: 4px 0; }
+  .scenes-bar {
+    width: 100%; display: flex; gap: 8px; justify-content: center;
+    flex-wrap: wrap; margin: 6px 0 10px;
+  }
+  .scenes-bar button {
+    padding: 8px 18px; font-size: 13px; font-weight: 600;
+    border: 1px solid #444; border-radius: 10px;
+    background: #2a2a2a; color: #aaa; cursor: pointer;
+    transition: all 0.15s;
+  }
+  .scenes-bar button:hover { background: #383838; color: #fff; border-color: #4af; }
+  .scenes-bar button.active { background: #1a3a5a; color: #4af; border-color: #4af; }
   .keys { text-align: center; color: #444; font-size: 10px; margin-top: 24px; width: 100%; }
   kbd { background: #333; padding: 2px 6px; border-radius: 3px; font-size: 10px; }
 </style>
 </head>
 <body>
+<div class="section-title" id="scenes-title">Scenes</div>
+<div class="scenes-bar" id="scenes-bar"></div>
 <div class="section-title" id="speakers-title">Speakers</div>
 <div id="speakers-container" style="display:flex;gap:20px;flex-wrap:wrap;justify-content:center;width:100%"></div>
 <div class="section-title" id="mics-title">Microphones</div>
@@ -454,6 +496,42 @@ HTML = """<!DOCTYPE html>
 let deviceSlugs = [];
 const state = {};
 let speakerSettings = {};
+let activeScene = null;
+const AUDIO_CONTROL_BASE = 'http://127.0.0.1:8789';
+
+async function refreshScenes() {
+  try {
+    const r = await fetch(AUDIO_CONTROL_BASE + '/api/state');
+    if (!r.ok) return;
+    const data = await r.json();
+    const bar = document.getElementById('scenes-bar');
+    const scenes = data.scenes || [];
+    activeScene = data.active_scene;
+    bar.innerHTML = '';
+    scenes.forEach(name => {
+      const btn = document.createElement('button');
+      btn.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+      if (name === activeScene) btn.classList.add('active');
+      btn.onclick = () => applyScene(name);
+      bar.appendChild(btn);
+    });
+  } catch(e) {
+    // audio-control service may not be running
+  }
+}
+
+async function applyScene(name) {
+  try {
+    await fetch(AUDIO_CONTROL_BASE + '/api/scenes/' + name + '/apply', {method: 'POST'});
+    activeScene = name;
+    // Update button states
+    document.querySelectorAll('.scenes-bar button').forEach(btn => {
+      btn.classList.toggle('active', btn.textContent.toLowerCase() === name);
+    });
+    // Refresh device states after scene change
+    refreshDevices();
+  } catch(e) {}
+}
 
 function createCard(dev, container) {
   if (document.getElementById('card-' + dev.slug)) return;
@@ -704,7 +782,9 @@ document.addEventListener('keydown', (e) => {
 
 // Initial load + periodic refresh
 refreshDevices();
+refreshScenes();
 setInterval(refreshDevices, 10000);
+setInterval(refreshScenes, 10000);
 setInterval(() => deviceSlugs.forEach(s => fetchVol(s)), 1000);
 setInterval(fetchMicLevels, 200);
 </script>
@@ -830,6 +910,8 @@ class Handler(BaseHTTPRequestHandler):
                 _set_mute(dev["device_id"], True)
             else:
                 _set_mute(dev["device_id"], False)
+            # Persist to speaker-settings.json so audio-forward applies software volume
+            _update_speaker_volume(slug, target)
             vol = _get_volume(dev["device_id"], dev["channels"])
             self._json(200, {"volume": vol, "ok": True})
         elif self.path == "/api/volume-step":
@@ -855,6 +937,8 @@ class Handler(BaseHTTPRequestHandler):
                 _set_volume(dev["device_id"], dev["channels"], new_vol)
                 if new_vol == 0:
                     _set_mute(dev["device_id"], True)
+                # Persist to speaker-settings.json so audio-forward applies software volume
+                _update_speaker_volume(slug, new_vol)
                 results[slug] = {"volume": new_vol}
             self._json(200, {"ok": True, "step": step, "devices": results})
         elif self.path.startswith("/api/speaker/") and self.path.endswith("/enable"):
@@ -885,8 +969,14 @@ class Handler(BaseHTTPRequestHandler):
             enabled = vol > 0
             mic_settings = _load_mic_settings()
             mic_settings[slug] = {"volume": vol, "enabled": enabled}
+            mic_settings[slug] = _normalize_mic_setting(slug, mic_settings[slug])
             _save_mic_settings(mic_settings)
-            self._json(200, {"slug": slug, "volume": vol, "enabled": enabled, "ok": True})
+            self._json(200, {
+                "slug": slug,
+                "volume": mic_settings[slug]["volume"],
+                "enabled": mic_settings[slug]["enabled"],
+                "ok": True,
+            })
         elif self.path == "/api/mic-test":
             global _mic_test_proc
             # Check if a test is already running

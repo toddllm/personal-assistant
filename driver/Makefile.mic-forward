@@ -1,0 +1,21 @@
+# mic-forward — Low-latency C daemon that forwards physical mic audio
+# to the CaptureMic 2ch virtual device via AUHAL AudioUnits.
+# Replaces the Python scripts/mic-forward.py.
+
+BUILD_DIR = build
+
+.PHONY: mic-forward clean
+
+mic-forward: $(BUILD_DIR)/mic-forward
+
+$(BUILD_DIR)/mic-forward: mic-forward.c
+	@mkdir -p $(BUILD_DIR)
+	clang -std=gnu11 -Os -Wall \
+	    -framework CoreAudio \
+	    -framework AudioToolbox \
+	    -framework CoreFoundation \
+	    -o $@ $<
+	@echo "==> Built: $@"
+
+clean:
+	rm -f $(BUILD_DIR)/mic-forward

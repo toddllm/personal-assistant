@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     capture_watchdog_enabled: bool = True
     capture_watchdog_interval_seconds: float = 20.0
 
-    speaker_enabled: bool = False
+    speaker_enabled: bool = True
     speaker_service_url: str = "http://127.0.0.1:8791"
     speaker_timeout_seconds: float = 1.8
     speaker_cooldown_seconds: float = 30.0

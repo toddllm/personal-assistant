@@ -1,21 +1,23 @@
-# CaptureAudio Virtual Audio Driver — Makefile
-# Forked from BlackHole (GPLv3). Builds an AudioServerPlugin bundle with clang.
+# CaptureMic Virtual Audio Driver — Makefile
+# Same AudioServerPlugin as CaptureAudio, configured as a virtual mic input.
+# Apps write mic audio to the output side; other apps (browser, etc.) read
+# from the input side as a mic source.
 
-DRIVER_NAME    = CaptureAudio2ch
+DRIVER_NAME    = CaptureMic2ch
 BUNDLE_NAME    = $(DRIVER_NAME).driver
 SRC            = CaptureAudio/CaptureAudio.c
-PLIST          = CaptureAudio/Info.plist
+PLIST          = CaptureMic/Info.plist
 INSTALL_DIR    = /Library/Audio/Plug-Ins/HAL
 BUILD_DIR      = build
 
-# Identity constants — override BlackHole defaults at compile time
+# Identity constants — same source, different identity
 CFLAGS = -std=gnu11 -Os -Wall -Wno-unused-label -Wno-format-extra-args -Wno-unused-but-set-variable \
     -DkNumber_Of_Channels=2 \
     -DkHas_Driver_Name_Format=false \
-    -DkDriver_Name='"CaptureAudio"' \
-    -DkPlugIn_BundleID='"com.tdeshane.CaptureAudio2ch"' \
-    -DkDevice_Name='"CaptureAudio 2ch"' \
-    -DkDevice2_Name='"CaptureAudio 2ch Mirror"' \
+    -DkDriver_Name='"CaptureMic"' \
+    -DkPlugIn_BundleID='"com.tdeshane.CaptureMic2ch"' \
+    -DkDevice_Name='"CaptureMic 2ch"' \
+    -DkDevice2_Name='"CaptureMic 2ch Mirror"' \
     -DkDevice2_IsHidden=true \
     -DkCanBeDefaultDevice=true \
     -DkCanBeDefaultSystemDevice=true \
@@ -28,9 +30,9 @@ LDFLAGS = -bundle \
 
 .PHONY: build install uninstall clean
 
-build: $(BUILD_DIR)/$(BUNDLE_NAME)/Contents/MacOS/CaptureAudio
+build: $(BUILD_DIR)/$(BUNDLE_NAME)/Contents/MacOS/CaptureMic
 
-$(BUILD_DIR)/$(BUNDLE_NAME)/Contents/MacOS/CaptureAudio: $(SRC) $(PLIST)
+$(BUILD_DIR)/$(BUNDLE_NAME)/Contents/MacOS/CaptureMic: $(SRC) $(PLIST)
 	@echo "==> Building $(DRIVER_NAME)..."
 	mkdir -p $(BUILD_DIR)/$(BUNDLE_NAME)/Contents/MacOS
 	cp $(PLIST) $(BUILD_DIR)/$(BUNDLE_NAME)/Contents/Info.plist
@@ -59,4 +61,4 @@ uninstall:
 	@echo "==> Uninstall complete."
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR)/$(BUNDLE_NAME)

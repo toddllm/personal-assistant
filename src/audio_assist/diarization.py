@@ -53,6 +53,9 @@ class SpeakerDiarizationClient:
             "base_url": self._base_url,
         }
 
+    def is_enabled(self) -> bool:
+        return self._enabled
+
     def detect(self, segment: AudioSegment) -> SpeakerDetection:
         if not self._enabled:
             return SpeakerDetection(speaker=None, confidence=None)
@@ -66,6 +69,7 @@ class SpeakerDiarizationClient:
             "source_id": segment.source_id,
             "session_id": segment.session_id,
             "sample_rate": segment.sample_rate,
+            "channels": segment.channels,
             "started_at": segment.started_at.astimezone(UTC).isoformat(),
             "ended_at": segment.ended_at.astimezone(UTC).isoformat(),
             "pcm_s16le_base64": base64.b64encode(segment.pcm_s16le).decode("ascii"),

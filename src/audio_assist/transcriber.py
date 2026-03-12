@@ -535,7 +535,11 @@ class TranscriptionWorker:
             }
 
     def _owner_speaker_for_segment(self, segment: AudioSegment) -> str | None:
-        if self._mic_speaker_name and segment.source_id == self._mic_source_id:
+        if (
+            self._mic_speaker_name
+            and segment.source_id == self._mic_source_id
+            and (self._speaker_client is None or not self._speaker_client.is_enabled())
+        ):
             return self._mic_speaker_name
         return None
 
@@ -653,7 +657,11 @@ class TranscriptionWorker:
 
         records = self._store.recent_unlabeled(limit=batch_limit, since_seconds=since)
         for record in records:
-            if record.source_id == self._mic_source_id and self._mic_speaker_name:
+            if (
+                record.source_id == self._mic_source_id
+                and self._mic_speaker_name
+                and (self._speaker_client is None or not self._speaker_client.is_enabled())
+            ):
                 continue
             loaded = self._archiver.load_segment(
                 source_id=record.source_id,
