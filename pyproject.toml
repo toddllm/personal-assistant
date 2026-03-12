@@ -34,6 +34,15 @@ screen-capture = [
   "mss>=10.0.0,<11.0.0",
   "Pillow>=10.0.0,<12.0.0",
 ]
+zoom-bot = [
+  "websockets>=12.0,<14.0",
+  "playwright>=1.40.0,<2.0.0",
+]
+discord-bot = [
+  "py-cord[voice]>=2.6.0,<3.0.0",
+  "PyNaCl>=1.5.0,<2.0.0",
+  "websockets>=12.0,<14.0",
+]
 
 [project.scripts]
 audio-assist = "audio_assist.main:main"
@@ -44,6 +53,7 @@ google-sync-connect = "google_sync_service.cli:main"
 email-service = "email_service.main:main"
 speaker-enroll = "audio_assist.enroll:main"
 screen-capture-service = "screen_capture.main:main"
+discord-bot = "discord_bot.main:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

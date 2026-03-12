@@ -10,5 +10,20 @@ data/
 openclaw/
 manus-git-ignore-this/
 
+# Environment files (secrets)
+.env
+.env.*
+!.env.example
+
+# Local secret material
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+id_rsa
+id_ed25519
+
 # Local Google OAuth client secrets
 google/client_secret_*.apps.googleusercontent.com.json
