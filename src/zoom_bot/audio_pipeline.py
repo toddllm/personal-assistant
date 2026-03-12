@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import struct
 import time
 from collections import deque
@@ -25,42 +24,55 @@ logger = logging.getLogger(__name__)
 SDK_SAMPLE_RATE = 32000
 STT_SAMPLE_RATE = 16000
 
+# Try Rust-accelerated resampling
+try:
+    from pipeline_core import resample_32k_to_16k, resample_to_32k
+    logger.info("Using Rust-accelerated resampling in audio_pipeline")
+except ImportError:
+    logger.warning("pipeline_core not available, using Python fallback for audio_pipeline resampling")
 
-def resample_32k_to_16k(pcm_32k: bytes) -> bytes:
-    """Downsample 32kHz mono 16-bit PCM to 16kHz by taking every other sample."""
-    samples = struct.unpack(f"<{len(pcm_32k) // 2}h", pcm_32k)
-    downsampled = samples[::2]
-    return struct.pack(f"<{len(downsampled)}h", *downsampled)
+    def resample_32k_to_16k(pcm_32k: bytes) -> bytes:
+        """Downsample 32kHz mono 16-bit PCM to 16kHz by taking every other sample."""
+        samples = struct.unpack(f"<{len(pcm_32k) // 2}h", pcm_32k)
+        downsampled = samples[::2]
+        return struct.pack(f"<{len(downsampled)}h", *downsampled)
 
+    def resample_to_32k(pcm_data: bytes, source_rate: int) -> bytes:
+        """Resample PCM to 32kHz via linear interpolation."""
+        if source_rate == SDK_SAMPLE_RATE:
+            return pcm_data
 
-def resample_to_32k(pcm_data: bytes, source_rate: int) -> bytes:
-    """Resample PCM to 32kHz via linear interpolation."""
-    if source_rate == SDK_SAMPLE_RATE:
-        return pcm_data
+        # Ensure even length for 16-bit samples
+        if len(pcm_data) % 2:
+            pcm_data = pcm_data[:-1]
+        samples = struct.unpack(f"<{len(pcm_data) // 2}h", pcm_data)
+        ratio = SDK_SAMPLE_RATE / source_rate
+        out_len = int(len(samples) * ratio)
+        result = []
+        for i in range(out_len):
+            src_idx = i / ratio
+            idx = int(src_idx)
+            frac = src_idx - idx
+            if idx + 1 < len(samples):
+                val = samples[idx] * (1 - frac) + samples[idx + 1] * frac
+            else:
+                val = samples[idx] if idx < len(samples) else 0
+            result.append(max(-32768, min(32767, int(val))))
+        return struct.pack(f"<{len(result)}h", *result)
 
-    # Ensure even length for 16-bit samples
-    if len(pcm_data) % 2:
-        pcm_data = pcm_data[:-1]
-    samples = struct.unpack(f"<{len(pcm_data) // 2}h", pcm_data)
-    ratio = SDK_SAMPLE_RATE / source_rate
-    out_len = int(len(samples) * ratio)
-    result = []
-    for i in range(out_len):
-        src_idx = i / ratio
-        idx = int(src_idx)
-        frac = src_idx - idx
-        if idx + 1 < len(samples):
-            val = samples[idx] * (1 - frac) + samples[idx + 1] * frac
-        else:
-            val = samples[idx] if idx < len(samples) else 0
-        result.append(max(-32768, min(32767, int(val))))
-    return struct.pack(f"<{len(result)}h", *result)
+# Try Rust-accelerated echo detection
+try:
+    from pipeline_core import EchoDetector as _RustEchoDetector
+    logger.info("Using Rust-accelerated EchoDetector")
+except ImportError:
+    _RustEchoDetector = None
 
 
 class AudioPipeline:
     """Manages the STT -> LLM -> TTS pipeline for a meeting session.
 
     Provider-pluggable: accepts any STTProvider, LLMProvider, TTSProvider.
+    Features: echo suppression, puppet master controls.
     """
 
     def __init__(
@@ -74,6 +86,12 @@ class AudioPipeline:
         max_conversation_turns: int = 20,
         llm_max_tokens: int = 80,
         llm_temperature: float = 0.5,
+        # Echo suppression
+        post_speech_cooldown: float = 2.0,
+        echo_similarity_threshold: float = 0.6,
+        # Puppet master
+        default_response_mode: str = "auto",
+        trigger_keyword: str = "hey bot",
     ):
         self._stt = stt
         self._llm = llm
@@ -92,23 +110,29 @@ class AudioPipeline:
         self._audio_buffer: deque[bytes] = deque(maxlen=500)  # ~10s of 20ms chunks
         self._running = False
         self._tasks: list[asyncio.Task] = []
-        self._is_speaking = False
+        self._responding = False
         self._last_transcript_time = 0.0
         self._pending_text: list[str] = []
         self._debounce_task: asyncio.Task | None = None
 
-        # Pre-cached filler audio (PCM 32kHz) for instant acknowledgment
-        self._filler_cache: list[bytes] = []
-        self._filler_phrases = [
-            "Hmm.",
-            "Oh.",
-            "Hmm, let me think.",
-            "Ooh, interesting.",
-            "Oh yeah.",
-            "Hmm, okay.",
-            "Huh.",
-            "Right.",
-        ]
+        # Echo suppression state
+        self._post_speech_cooldown = post_speech_cooldown
+        self._echo_similarity_threshold = echo_similarity_threshold
+        self._playback_end_time = 0.0
+        self._get_playback_remaining: Callable[[], float] | None = None
+        self._echo_detector = None
+        if _RustEchoDetector is not None:
+            self._echo_detector = _RustEchoDetector(window_seconds=30.0)
+
+        # Puppet master state
+        self._muted = False
+        self._response_mode = default_response_mode  # "auto" | "keyword" | "manual"
+        self._trigger_keyword = trigger_keyword.lower()
+        self._current_response_task: asyncio.Task | None = None
+        self._nudge_hint: str | None = None
+
+        # Audio recording callback (set externally, e.g. by discord_bot)
+        self._audio_recorder: Callable[..., dict] | None = None
 
     def set_event_callback(self, cb: Callable[[str, dict], None]) -> None:
         """Set a callback for pipeline events (transcript, llm_response, tts, etc.)."""
@@ -126,6 +150,14 @@ class AudioPipeline:
         """Return the current conversation history."""
         return list(self._conversation)
 
+    @property
+    def muted(self) -> bool:
+        return self._muted
+
+    @property
+    def response_mode(self) -> str:
+        return self._response_mode
+
     async def start(self) -> None:
         """Start the pipeline (STT provider + audio sender loop)."""
         self._running = True
@@ -136,28 +168,14 @@ class AudioPipeline:
 
         self._tasks.append(asyncio.create_task(self._audio_sender_loop()))
 
-        # Pre-cache filler audio in the background
-        self._tasks.append(asyncio.create_task(self._precache_fillers()))
-
-        logger.info("Audio pipeline started")
-
-    async def _precache_fillers(self) -> None:
-        """Pre-generate TTS for filler phrases so they can play instantly."""
-        logger.info("Pre-caching %d filler phrases...", len(self._filler_phrases))
-        for phrase in self._filler_phrases:
-            try:
-                result = await self._tts.synthesize(phrase)
-                if result:
-                    pcm, rate = result
-                    pcm_32k = resample_to_32k(pcm, rate)
-                    self._filler_cache.append(pcm_32k)
-            except Exception:
-                logger.debug("Failed to cache filler: %s", phrase)
-        logger.info("Cached %d/%d filler clips", len(self._filler_cache), len(self._filler_phrases))
+        logger.info("Audio pipeline started (echo_detector=%s)", self._echo_detector is not None)
 
     async def stop(self) -> None:
         """Stop the pipeline and clean up."""
         self._running = False
+
+        if self._current_response_task and not self._current_response_task.done():
+            self._current_response_task.cancel()
 
         for task in self._tasks:
             task.cancel()
@@ -193,12 +211,35 @@ class AudioPipeline:
                 await asyncio.sleep(0.01)
 
     def _on_transcript(self, transcript: str) -> None:
-        """Called by STT provider when a final transcript is ready."""
+        """Called by STT provider when a final transcript is ready.
+
+        Three-layer echo suppression:
+        1. Responding flag (LLM/TTS in flight)
+        2. Playback still active + cooldown
+        3. Text echo detection (word-overlap ratio)
+        """
         self._last_transcript_time = time.time()
 
-        # Don't process if we're currently speaking (avoid echo)
-        if self._is_speaking:
-            logger.debug("Ignoring transcript while speaking")
+        # Layer 1: responding flag (LLM/TTS in flight)
+        if self._responding:
+            logger.debug("Ignoring transcript while responding")
+            return
+
+        # Layer 2: playback still active + cooldown
+        if self._get_playback_remaining and self._get_playback_remaining() > 0:
+            logger.debug("Ignoring transcript during playback (%.0fms remaining)",
+                         self._get_playback_remaining())
+            return
+        if time.monotonic() - self._playback_end_time < self._post_speech_cooldown:
+            logger.debug("Ignoring transcript during post-speech cooldown")
+            return
+
+        # Layer 3: text echo detection
+        if self._echo_detector and self._echo_detector.is_echo(
+            transcript, self._echo_similarity_threshold
+        ):
+            logger.info("Suppressed echo: %s", transcript[:60])
+            self._emit("echo_suppressed", {"text": transcript[:200]})
             return
 
         # Accumulate transcript segments and debounce
@@ -221,7 +262,16 @@ class AudioPipeline:
             return
 
         logger.info("Combined transcript: %s", combined)
-        self._emit("transcript", {"text": combined})
+
+        # Save audio snapshot for debugging
+        recording = None
+        if self._audio_recorder:
+            try:
+                recording = self._audio_recorder(combined)
+            except Exception:
+                logger.debug("Failed to save audio recording")
+
+        self._emit("transcript", {"text": combined, **({"recording": recording} if recording else {})})
 
         self._conversation.append({"role": "user", "content": combined})
 
@@ -229,41 +279,54 @@ class AudioPipeline:
         if len(self._conversation) > self._max_turns + 1:
             self._conversation = [self._conversation[0]] + self._conversation[-self._max_turns:]
 
-        await self._respond()
-
-    def _play_filler(self) -> None:
-        """Play a random pre-cached filler clip instantly."""
-        if not self._filler_cache or not self._on_tts_audio:
+        # Puppet master: check mute and response mode
+        if self._muted:
+            logger.info("Muted — transcript recorded but not responding")
+            self._emit("muted_transcript", {"text": combined})
             return
-        clip = random.choice(self._filler_cache)
-        logger.info("Playing filler clip (%d bytes)", len(clip))
-        self._on_tts_audio(clip)
+
+        if self._response_mode == "manual":
+            logger.info("Manual mode — transcript recorded, awaiting operator")
+            self._emit("awaiting_operator", {"text": combined})
+            return
+
+        if self._response_mode == "keyword":
+            if self._trigger_keyword not in combined.lower():
+                logger.debug("Keyword mode — trigger '%s' not found", self._trigger_keyword)
+                self._emit("keyword_miss", {"text": combined, "keyword": self._trigger_keyword})
+                return
+
+        self._current_response_task = asyncio.create_task(self._respond())
 
     async def _respond(self) -> None:
         """Generate LLM response and synthesize speech."""
         try:
-            self._is_speaking = True
+            self._responding = True
             self._emit("responding", {"stage": "start"})
+            t_start = time.time()
 
-            # Play a filler immediately so the user hears something fast
-            self._play_filler()
+            # Inject one-shot nudge hint if set
+            nudge = self._nudge_hint
+            self._nudge_hint = None
+            if nudge:
+                self._conversation.append({"role": "system", "content": f"[Operator hint]: {nudge}"})
 
-            # Step 1: LLM (runs while filler is playing)
-            t0 = time.time()
+            # Step 1: LLM
+            llm_coro = self._llm.chat(
+                self._conversation,
+                max_tokens=self._llm_max_tokens,
+                temperature=self._llm_temperature,
+            )
+            llm_task = asyncio.create_task(llm_coro)
+
             try:
-                llm_response = await asyncio.wait_for(
-                    self._llm.chat(
-                        self._conversation,
-                        max_tokens=self._llm_max_tokens,
-                        temperature=self._llm_temperature,
-                    ),
-                    timeout=60.0,
-                )
+                llm_response = await asyncio.wait_for(llm_task, timeout=60.0)
             except asyncio.TimeoutError:
                 logger.error("LLM timed out after 60s")
                 self._emit("error", {"stage": "llm", "error": "timeout"})
                 return
-            llm_elapsed = time.time() - t0
+
+            llm_elapsed = time.time() - t_start
 
             if not llm_response:
                 logger.warning("LLM returned empty response")
@@ -274,15 +337,19 @@ class AudioPipeline:
             self._emit("llm_response", {"text": llm_response, "elapsed_s": round(llm_elapsed, 1)})
             self._conversation.append({"role": "assistant", "content": llm_response})
 
+            # Record spoken text for echo detection
+            if self._echo_detector:
+                self._echo_detector.record_spoken(llm_response)
+
             # Step 2: TTS
             t0 = time.time()
             try:
                 tts_result = await asyncio.wait_for(
                     self._tts.synthesize(llm_response),
-                    timeout=90.0,
+                    timeout=20.0,
                 )
             except asyncio.TimeoutError:
-                logger.error("TTS timed out after 90s")
+                logger.error("TTS timed out after 20s")
                 self._emit("error", {"stage": "tts", "error": "timeout"})
                 return
             tts_elapsed = time.time() - t0
@@ -294,32 +361,44 @@ class AudioPipeline:
 
             tts_audio, sample_rate = tts_result
 
-            # Step 3: Send TTS audio to meeting (queues after filler).
+            # Step 3: Send TTS audio to meeting
             if self._on_tts_audio:
                 pcm_32k = resample_to_32k(tts_audio, sample_rate)
                 duration_s = len(pcm_32k) / (32000 * 2)
-                logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz, synth %.1fs)",
-                            len(pcm_32k), duration_s, tts_elapsed)
+                total_elapsed = time.time() - t_start
+                logger.info("Sending TTS audio: %d bytes (%.1fs at 32kHz, synth %.1fs, total %.1fs)",
+                            len(pcm_32k), duration_s, tts_elapsed, total_elapsed)
                 self._emit("tts_audio", {
                     "bytes": len(pcm_32k), "duration_s": round(duration_s, 1),
                     "text": llm_response[:200], "synth_s": round(tts_elapsed, 1),
+                    "llm_s": round(llm_elapsed, 1), "total_s": round(total_elapsed, 1),
                 })
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._on_tts_audio, pcm_32k)
 
+        except asyncio.CancelledError:
+            logger.info("Response cancelled")
+            self._emit("cancelled", {"stage": "response"})
         except Exception:
             logger.exception("Error in response pipeline")
             self._emit("error", {"stage": "pipeline", "error": "exception"})
         finally:
-            self._is_speaking = False
+            self._responding = False
+            self._playback_end_time = time.monotonic()
 
     async def send_tts(self, text: str) -> None:
         """Synthesize and send speech directly, bypassing the LLM."""
         try:
-            self._is_speaking = True
+            self._responding = True
             logger.info("Sending direct TTS: %s", text)
 
-            tts_result = await self._tts.synthesize(text)
+            # Record for echo detection
+            if self._echo_detector:
+                self._echo_detector.record_spoken(text)
+
+            tts_result = await asyncio.wait_for(
+                self._tts.synthesize(text), timeout=20.0,
+            )
             if tts_result and self._on_tts_audio:
                 tts_audio, sample_rate = tts_result
                 pcm_32k = resample_to_32k(tts_audio, sample_rate)
@@ -332,4 +411,53 @@ class AudioPipeline:
         except Exception:
             logger.exception("Error in direct TTS")
         finally:
-            self._is_speaking = False
+            self._responding = False
+            self._playback_end_time = time.monotonic()
+
+    # --- Puppet Master Controls ---
+
+    async def speak(self, text: str) -> None:
+        """Operator command: synthesize and play text as the bot."""
+        await self.send_tts(text)
+
+    def inject(self, text: str, role: str = "system") -> None:
+        """Operator command: add context to conversation silently."""
+        self._conversation.append({"role": role, "content": text})
+        logger.info("Injected %s message: %s", role, text[:80])
+        self._emit("inject", {"role": role, "text": text[:200]})
+
+    def nudge(self, hint: str) -> None:
+        """Operator command: queue a one-shot system hint for the next response."""
+        self._nudge_hint = hint
+        logger.info("Nudge queued: %s", hint[:80])
+        self._emit("nudge", {"hint": hint[:200]})
+
+    def mute(self) -> None:
+        """Operator command: pause auto-responding."""
+        self._muted = True
+        logger.info("Bot muted")
+        self._emit("muted", {})
+
+    def unmute(self) -> None:
+        """Operator command: resume auto-responding."""
+        self._muted = False
+        logger.info("Bot unmuted")
+        self._emit("unmuted", {})
+
+    async def cancel(self) -> None:
+        """Operator command: abort in-flight response and clear audio buffer."""
+        if self._current_response_task and not self._current_response_task.done():
+            self._current_response_task.cancel()
+            logger.info("Cancelled in-flight response")
+        self._responding = False
+        self._emit("cancelled", {"stage": "operator"})
+
+    def set_response_mode(self, mode: str, keyword: str = "") -> None:
+        """Operator command: set response mode (auto/keyword/manual)."""
+        if mode not in ("auto", "keyword", "manual"):
+            raise ValueError(f"Invalid response mode: {mode}")
+        self._response_mode = mode
+        if keyword:
+            self._trigger_keyword = keyword.lower()
+        logger.info("Response mode set to '%s' (keyword='%s')", mode, self._trigger_keyword)
+        self._emit("response_mode", {"mode": mode, "keyword": self._trigger_keyword})

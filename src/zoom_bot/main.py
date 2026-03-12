@@ -53,9 +53,9 @@ def _load_env() -> None:
 _load_env()
 
 DEFAULT_PROMPT = (
-    "You are a friendly, helpful AI assistant who has joined a Zoom meeting. "
-    "Have a natural conversation. Be concise — keep responses to 1-2 sentences. "
-    "Listen carefully and respond naturally. "
+    "You are a friendly AI assistant in a Zoom meeting. "
+    "IMPORTANT: Keep every response to ONE short sentence (under 15 words). "
+    "Be conversational and natural. Never give long explanations. "
     "If asked who you are, say you're an AI assistant here to help."
 )
 
@@ -263,7 +263,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Zoom AI Bot",
-    description="Native Zoom Meeting SDK bot with Deepgram STT + Groq LLM + ElevenLabs TTS",
+    description="Zoom AI bot with pluggable STT/LLM/TTS providers (cloud or local)",
     version="0.1.0",
     lifespan=lifespan,
 )
@@ -292,23 +292,36 @@ async def join(req: JoinRequest):
     if state == BotState.JOINING:
         raise HTTPException(400, "Already joining a meeting.")
 
-    # Validate credentials (chrome mode doesn't need Zoom SDK keys)
+    # Validate credentials — only check keys needed by the active providers.
+    # Provider selection is configured via ZOOM_BOT_* env vars.
     bot_mode = req.mode or BOT_MODE
-    if bot_mode == "chrome":
-        required_keys = [
-            "DEEPGRAM_API_KEY",
-            "GROQ_API_KEY",
-            "ELEVENLABS_API_KEY",
-        ]
-    else:
-        required_keys = [
-            "ZOOM_APP_CLIENT_ID",
-            "ZOOM_APP_CLIENT_SECRET",
-            "DEEPGRAM_API_KEY",
-            "GROQ_API_KEY",
-            "ELEVENLABS_API_KEY",
-        ]
-    missing = [k for k in required_keys if not os.environ.get(k)]
+    required_keys: list[str] = []
+    if bot_mode != "chrome":
+        required_keys.extend(["ZOOM_APP_CLIENT_ID", "ZOOM_APP_CLIENT_SECRET"])
+    stt_prov = os.environ.get("ZOOM_BOT_STT_PROVIDER", "deepgram").lower()
+    llm_prov = os.environ.get("ZOOM_BOT_LLM_PROVIDER", "groq").lower()
+    tts_prov = os.environ.get("ZOOM_BOT_TTS_PROVIDER", "elevenlabs").lower()
+    if stt_prov == "deepgram":
+        required_keys.append("ZOOM_BOT_DEEPGRAM_API_KEY")
+    if llm_prov == "groq":
+        required_keys.append("ZOOM_BOT_GROQ_API_KEY")
+    if tts_prov == "elevenlabs":
+        required_keys.append("ZOOM_BOT_ELEVENLABS_API_KEY")
+    # Also accept legacy env var names as fallback
+    missing = []
+    legacy_map = {
+        "ZOOM_BOT_DEEPGRAM_API_KEY": "DEEPGRAM_API_KEY",
+        "ZOOM_BOT_GROQ_API_KEY": "GROQ_API_KEY",
+        "ZOOM_BOT_ELEVENLABS_API_KEY": "ELEVENLABS_API_KEY",
+    }
+    for k in required_keys:
+        if os.environ.get(k):
+            continue
+        fallback = legacy_map.get(k)
+        if fallback and os.environ.get(fallback):
+            os.environ[k] = os.environ[fallback]
+            continue
+        missing.append(k)
     if missing:
         raise HTTPException(500, f"Missing credentials: {', '.join(missing)}")
 

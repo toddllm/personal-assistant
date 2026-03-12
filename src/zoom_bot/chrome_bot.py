@@ -80,6 +80,10 @@ class AudioWebSocketServer:
 
     async def start(self):
         import websockets
+
+        # Suppress noisy 426 errors from Chrome's service worker probing
+        logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+
         self._server = await websockets.serve(
             self._handler, "127.0.0.1", self._port,
         )
@@ -199,8 +203,13 @@ async def main():
     await audio_ws.start()
     loop = asyncio.get_event_loop()
 
-    # ---- Audio pipeline ----
+    # ---- Audio pipeline (provider-pluggable) ----
     from zoom_bot.audio_pipeline import AudioPipeline
+    from zoom_bot.bot_config import ZoomBotSettings
+    from zoom_bot.provider_factory import create_providers
+
+    settings = ZoomBotSettings()
+    stt, llm, tts = create_providers(settings)
 
     _tts_debug_count = 0
 
@@ -225,16 +234,15 @@ async def main():
             logger.warning("No WebSocket clients connected — TTS audio dropped")
 
     pipeline = AudioPipeline(
-        deepgram_api_key=os.environ.get("DEEPGRAM_API_KEY", ""),
-        groq_api_key=os.environ.get("GROQ_API_KEY", ""),
-        elevenlabs_api_key=os.environ.get("ELEVENLABS_API_KEY", ""),
-        system_prompt=args.prompt or (
-            "You are a friendly, helpful AI assistant who has joined a Zoom meeting. "
-            "Have a natural conversation. Be concise — keep responses to 1-2 sentences. "
-            "Listen carefully and respond naturally. "
-            "If asked who you are, say you're an AI assistant here to help."
-        ),
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        system_prompt=args.prompt or settings.system_prompt,
         on_tts_audio=on_tts_audio,
+        debounce_seconds=settings.debounce_seconds,
+        max_conversation_turns=settings.max_conversation_turns,
+        llm_max_tokens=settings.llm_max_tokens,
+        llm_temperature=settings.llm_temperature,
     )
     await pipeline.start()
 
@@ -252,6 +260,14 @@ async def main():
     primer_wav_path = "/tmp/bot-primer.wav"
     _generate_primer_wav(primer_wav_path, duration_s=120, sample_rate=48000)
     logger.info("Generated primer WAV: %s", primer_wav_path)
+
+    # ---- Generate black frame Y4M for Chrome's fake video capture ----
+    # Without this, --use-fake-device-for-media-stream shows a green
+    # spinning triangle animation as the video tile. This replaces it
+    # with a static black frame.
+    black_video_path = "/tmp/bot-black-video.y4m"
+    _generate_black_y4m(black_video_path)
+    logger.info("Generated black video: %s", black_video_path)
 
     # ---- Launch Chromium via Playwright ----
     try:
@@ -276,6 +292,7 @@ async def main():
                     "--disable-dev-shm-usage",
                     "--use-fake-device-for-media-stream",   # bypass APM
                     f"--use-file-for-fake-audio-capture={primer_wav_path}",  # primer to start WebRTC
+                    f"--use-file-for-fake-video-capture={black_video_path}",  # black frame instead of green animation
                     "--use-fake-ui-for-media-stream",       # auto-grant mic/camera permissions
                     "--autoplay-policy=no-user-gesture-required",
                 ],
@@ -448,47 +465,35 @@ async def main():
             _write_state("in_meeting", args.meeting_id)
             logger.info("Successfully joined meeting %s via Chrome", args.meeting_id)
 
+            # Turn off video — even with black Y4M, clicking Stop Video
+            # removes the video tile entirely so bot shows as audio-only.
+            for video_sel in [
+                'button[aria-label="Stop Video"]',
+                'button:has-text("Stop Video")',
+                '.send-video-container button',
+            ]:
+                try:
+                    btn = page.locator(video_sel).first
+                    if await btn.is_visible(timeout=2000):
+                        await btn.click()
+                        logger.info("Clicked Stop Video button: %s", video_sel)
+                        break
+                except Exception:
+                    pass
+
             # Start the browser-side WebSocket connection to our audio server
             await page.evaluate("window.__botStartAudioWS()")
             logger.info("Browser WebSocket audio receiver started")
 
-            # ---- TARGETED POST-JOIN TRACK REPLACEMENT (with retry) ----
-            # WebRTC audio sender only starts after "Join Audio by Computer" is clicked.
-            # First wait for at least one audio sender to appear, then replace.
+            # ---- TARGETED POST-JOIN TRACK REPLACEMENT ----
+            # IMPORTANT: Don't replace the track until we confirm bytesSent > 0.
+            # The primer WAV makes Chrome transmit audio. If we replace the track
+            # before Chrome starts transmitting, bytesSent will never increase
+            # (our silent MediaStreamDestination triggers DTX — no packets sent).
             track_replaced = False
 
-            # Phase 1: Wait for at least one audio sender to exist (up to 20s)
-            for wait_attempt in range(10):
-                sender_count = await page.evaluate("window.__audioSenderCount || 0")
-                pc_count = await page.evaluate("(window.__rtcPCs || []).length")
-                logger.info("Waiting for audio senders: PCs=%d, audioSenders=%d (attempt %d)",
-                            pc_count, sender_count, wait_attempt)
-
-                if sender_count > 0:
-                    logger.info("Audio sender detected, proceeding to track replacement")
-                    break
-
-                # Click audio buttons each iteration (they may appear late)
-                for audio_sel in [
-                    'button:has-text("Join Audio by Computer")',
-                    'button:has-text("Join Audio")',
-                    'button:has-text("Computer Audio")',
-                    '.join-audio-by-voip',
-                ]:
-                    try:
-                        btn = page.locator(audio_sel).first
-                        if await btn.is_visible(timeout=500):
-                            await btn.click()
-                            logger.info("Clicked audio button: '%s' (wait phase)", audio_sel)
-                            await asyncio.sleep(1)
-                    except Exception:
-                        pass
-
-                await asyncio.sleep(2)
-
-            # Phase 2: Retry track replacement (up to 15 attempts / 30s)
-            for attempt in range(15):
-                # Click audio buttons each attempt (they may reappear)
+            for attempt in range(30):  # up to ~60s
+                # Click audio buttons each attempt (they may appear/reappear)
                 for audio_sel in [
                     'button:has-text("Join Audio by Computer")',
                     'button:has-text("Join Audio")',
@@ -506,19 +511,42 @@ async def main():
 
                 await asyncio.sleep(2)
 
-                replace_result = await _replace_transmitting_track(page)
-                logger.info("Track replacement attempt %d: %s", attempt, replace_result)
+                # Phase 1: SCAN ONLY — don't replace yet, just check bytesSent
+                scan_result = await _scan_webrtc_senders(page)
+                logger.info("Scan attempt %d: %s", attempt, scan_result)
 
                 try:
-                    result_data = json.loads(replace_result)
-                    if result_data.get("success"):
-                        track_replaced = True
-                        break
+                    scan_data = json.loads(scan_result)
+                    best_pc = scan_data.get("bestPC", -1)
+                    best_bytes = scan_data.get("bestBytesSent", 0)
+
+                    if best_bytes > 0:
+                        # Found transmitting PC — NOW replace the track
+                        logger.info("Found transmitting PC#%d (bytesSent=%d), replacing track...",
+                                    best_pc, best_bytes)
+                        replace_result = await _replace_transmitting_track(page)
+                        result_data = json.loads(replace_result)
+                        if result_data.get("success"):
+                            track_replaced = True
+                            logger.info("Track replaced on PC#%d (bytesSent=%d)",
+                                        result_data.get("pcIndex"), result_data.get("bytesSentBefore"))
+                            break
+                    elif attempt >= 20:
+                        # Fallback: no PC ever got bytesSent > 0 — just replace
+                        # on any PC with a live audio sender
+                        logger.warning("No transmitting PC after %d attempts, using fallback", attempt)
+                        replace_result = await _replace_transmitting_track(page)
+                        result_data = json.loads(replace_result)
+                        if result_data.get("success"):
+                            track_replaced = True
+                            logger.warning("Fallback track replacement on PC#%d",
+                                           result_data.get("pcIndex"))
+                            break
                 except (json.JSONDecodeError, TypeError):
                     pass
 
             if not track_replaced:
-                logger.error("Failed to replace audio track after 15 attempts")
+                logger.error("Failed to replace audio track after 30 attempts")
 
             # Phase 3: Verify replacement — check bytesSent is growing
             if track_replaced:
@@ -531,33 +559,16 @@ async def main():
                 except Exception:
                     pass
 
-            # Send test tone through the SAME path as TTS (32kHz → resample → WebSocket)
-            # This helps diagnose if the issue is resampling or something else
+            # Send a greeting through TTS so the user knows the bot is live
             await asyncio.sleep(2)
-            logger.info("Sending 3s test tone through TTS path (32kHz → 48kHz)...")
-            sample_rate = 32000  # same as TTS input rate
-            n = sample_rate * 3
-            tone_32k = struct.pack(f"<{n}h", *[
-                int(24000 * math.sin(2 * math.pi * 440 * i / sample_rate))
-                for i in range(n)
-            ])
-            on_tts_audio(tone_32k)  # goes through resample + WebSocket
-            logger.info("Test tone sent through TTS path (%d bytes at 32kHz)", len(tone_32k))
+            logger.info("Sending greeting via TTS...")
+            await pipeline.send_tts("Hello! I've joined the meeting.")
 
-            # Check WebRTC stats after test tone
+            # Check WebRTC stats after greeting
             await asyncio.sleep(4)
             try:
                 stats = await _get_webrtc_stats(page)
-                logger.info("WebRTC stats after test tone: %s", stats)
-            except Exception:
-                pass
-
-            # Also check browser-side audio state
-            try:
-                audio_state = await page.evaluate("""
-                    () => JSON.stringify(window.__botAudio, null, 2)
-                """)
-                logger.info("Browser audio state: %s", audio_state)
+                logger.info("WebRTC stats after greeting: %s", stats)
             except Exception:
                 pass
 
@@ -679,6 +690,21 @@ def _save_debug_wav(path: str, pcm_data: bytes, sample_rate: int):
         f.write(pcm_data)
 
 
+def _generate_black_y4m(path: str):
+    """Generate a single-frame black Y4M video for Chrome's fake video capture.
+
+    Replaces the default green spinning triangle animation that Chrome
+    generates with --use-fake-device-for-media-stream.
+    """
+    # YUV4MPEG2: 2x2 pixels, 1fps, 4:2:0 chroma subsampling
+    header = b"YUV4MPEG2 W2 H2 F1:1 Ip A1:1 C420\n"
+    # Y plane: 4 pixels at value 16 (black in limited-range YUV)
+    # U/V planes: 1 pixel each at value 128 (neutral chroma)
+    frame = b"FRAME\n" + bytes([16] * 4) + bytes([128]) + bytes([128])
+    with open(path, "wb") as f:
+        f.write(header + frame)
+
+
 def _generate_primer_wav(path: str, duration_s: int = 10, sample_rate: int = 48000):
     """Generate a WAV file with a low-volume tone for Chrome's fake audio capture.
 
@@ -715,6 +741,58 @@ def _generate_primer_wav(path: str, duration_s: int = 10, sample_rate: int = 480
         f.write(b"data")
         f.write(struct.pack("<I", data_size))
         f.write(pcm)
+
+
+async def _scan_webrtc_senders(page) -> str:
+    """Scan RTCPeerConnections for audio senders and their bytesSent.
+
+    Does NOT replace any tracks — just reports the current state.
+    Returns JSON with bestPC index and bestBytesSent.
+    """
+    return await page.evaluate("""
+    async () => {
+        const pcs = window.__rtcPCs || [];
+        let bestPC = -1;
+        let bestBytesSent = 0;
+        let totalAudioSenders = 0;
+        const pcSummary = [];
+
+        for (let pcIdx = 0; pcIdx < pcs.length; pcIdx++) {
+            const pc = pcs[pcIdx];
+            if (pc.signalingState === 'closed') continue;
+            try {
+                const senders = pc.getSenders();
+                const stats = await pc.getStats();
+                let pcBytesSent = 0;
+                stats.forEach(s => {
+                    if (s.type === 'outbound-rtp' && s.kind === 'audio') {
+                        pcBytesSent = s.bytesSent || 0;
+                    }
+                });
+                let hasAudio = false;
+                for (const sender of senders) {
+                    if (sender.track && sender.track.kind === 'audio') {
+                        hasAudio = true;
+                        totalAudioSenders++;
+                    }
+                }
+                if (hasAudio) {
+                    pcSummary.push('PC#' + pcIdx + ':bytes=' + pcBytesSent);
+                }
+                if (pcBytesSent > bestBytesSent) {
+                    bestPC = pcIdx;
+                    bestBytesSent = pcBytesSent;
+                }
+            } catch(e) {}
+        }
+        return JSON.stringify({
+            bestPC: bestPC,
+            bestBytesSent: bestBytesSent,
+            totalAudioSenders: totalAudioSenders,
+            summary: pcSummary.join(', '),
+        });
+    }
+    """)
 
 
 async def _replace_transmitting_track(page) -> str:
