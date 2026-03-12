@@ -27,3 +27,5 @@ id_ed25519
 
 # Local Google OAuth client secrets
 google/client_secret_*.apps.googleusercontent.com.json
+rust/*/target/
+driver/audio-forward-rs/target/
