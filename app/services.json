@@ -1,0 +1,101 @@
+[
+  {
+    "id": "audio-assist",
+    "label": "Audio Assist",
+    "port": 8787,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8787",
+    "script": "scripts/audio-assist-service.sh",
+    "logFile": "data/logs/audio-assist.log",
+    "autostart": true,
+    "group": "capture"
+  },
+  {
+    "id": "volume-control",
+    "label": "Volume Control",
+    "port": 8788,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8788",
+    "script": "scripts/volume-control-service.sh",
+    "logFile": "data/logs/volume-control.log",
+    "autostart": true,
+    "group": "capture"
+  },
+  {
+    "id": "tts-service",
+    "label": "Text-to-Speech",
+    "port": 8790,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8790",
+    "entrypoint": ".venv/bin/tts-service",
+    "logFile": "data/logs/tts-service.log",
+    "autostart": false,
+    "group": "voice"
+  },
+  {
+    "id": "speaker-service",
+    "label": "Speaker ID",
+    "port": 8791,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8791",
+    "entrypoint": ".venv/bin/speaker-service",
+    "logFile": "data/logs/speaker-service.log",
+    "autostart": false,
+    "group": "voice"
+  },
+  {
+    "id": "google-sync",
+    "label": "Google Sync",
+    "port": 8792,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8792",
+    "script": "scripts/google-sync-service.sh",
+    "logFile": "data/logs/google-sync-service.log",
+    "autostart": false,
+    "group": "integrations"
+  },
+  {
+    "id": "email-service",
+    "label": "Email",
+    "port": 8793,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8793",
+    "script": "scripts/email-service.sh",
+    "logFile": "data/logs/email-service.log",
+    "autostart": false,
+    "group": "integrations"
+  },
+  {
+    "id": "screen-capture",
+    "label": "Screen Capture",
+    "port": 8794,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8794",
+    "script": "scripts/screen-capture-service.sh",
+    "logFile": "data/logs/screen-capture.log",
+    "autostart": false,
+    "group": "capture"
+  },
+  {
+    "id": "voice-chat",
+    "label": "Voice Chat",
+    "port": 8797,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8797",
+    "script": "scripts/voice-chat-service.sh",
+    "logFile": "data/logs/voice-chat.log",
+    "autostart": false,
+    "group": "voice"
+  },
+  {
+    "id": "audio-control",
+    "label": "Audio Control",
+    "port": 8789,
+    "healthEndpoint": "/health",
+    "uiUrl": "http://localhost:8789",
+    "script": "scripts/audio-control-service.sh",
+    "logFile": "data/logs/audio-control.log",
+    "autostart": true,
+    "group": "capture"
+  }
+]

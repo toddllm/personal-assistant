@@ -1,18 +1,35 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   fetchVolumeDevices,
+  fetchSpeakerSettings,
   setVolume,
   fetchSourceLevels,
+  fetchSources,
+  ensureCaptureSources,
+  stopCaptureSource,
+  resumeCaptureSource,
+  fetchRecentTranscripts,
   fetchCaptureReadiness,
   fetchMicDevices,
   fetchMicLevels,
   setMicVolume,
   startMicTest,
+  fetchAudioRouteStatus,
+  restoreCaptureAudioDefaults,
   type VolumeDevice,
+  type SpeakerSetting,
   type SourceLevel,
+  type SourceStatus,
+  type TranscriptItem,
   type CaptureReadiness,
   type MicDevice,
   type MicLevel,
+  type AudioRouteStatus,
 } from "./api";
+import { checkHealth } from "./health";
+import { showLogPanel } from "./logs";
+import { ensureMicrophonePermission } from "./media-permissions";
+import type { HealthResult, HealthStatus, ServiceControlResult, ServiceDef } from "./services";
 
 let pollTimers: ReturnType<typeof setInterval>[] = [];
 
@@ -31,6 +48,35 @@ let micLocked = false;
 let micLockTimer: ReturnType<typeof setTimeout> | null = null;
 const preMuteMicVolume = new Map<string, number>();
 let micSliderDebounce: ReturnType<typeof setTimeout> | null = null;
+
+const AUDIO_ASSIST_SERVICE_ID = "audio-assist";
+const CAPTURE_STATUS_DEFAULT = "Loading recorder status...";
+const CAPTURE_OUTPUT_DEVICE = "CaptureAudio 2ch";
+const BOSE_OUTPUT_DEVICE = "Bose QC45";
+const BOSE_SLUG = "bose-qc45";
+let audioAssistService: ServiceDef | null = null;
+let audioAssistStatus: HealthStatus = "unknown";
+let audioAssistBusy = false;
+const captureSourceBusy = new Set<string>();
+let ensureCaptureBusy = false;
+let audioRouteBusy = false;
+let latestVolumeDevices: Record<string, VolumeDevice> = {};
+let latestSpeakerSettings: Record<string, SpeakerSetting> = {};
+let latestMicDevices: Record<string, MicDevice> = {};
+let latestAudioRouteStatus: AudioRouteStatus | null = null;
+let audioRouteError: string | null = null;
+let lastAudioAssistHealth: HealthResult | null = null;
+
+type AudioRouteAction = "restore-defaults" | "disable-bose-mic";
+
+interface AudioRouteBanner {
+  severity: "ok" | "warn" | "error";
+  badge: string;
+  title: string;
+  detail: string;
+  action?: AudioRouteAction;
+  actionLabel?: string;
+}
 
 function lockMicPoll(ms = 3000) {
   micLocked = true;
@@ -55,6 +101,9 @@ export function renderAudioPanel() {
     <div class="audio-grid-3">
       <div class="audio-card" id="volume-panel">
         <h3 class="audio-card-title">Volume</h3>
+        <div id="audio-route-status">
+          <span class="audio-unavailable">checking route...</span>
+        </div>
         <div id="volume-devices">
           <span class="audio-unavailable">loading...</span>
         </div>
@@ -71,9 +120,36 @@ export function renderAudioPanel() {
       </div>
       <div class="audio-card" id="sources-panel">
         <h3 class="audio-card-title">Sources &amp; Capture</h3>
+        <div class="capture-service-row">
+          <div class="capture-service-status">
+            <span class="status-dot unknown" id="audio-assist-dot"></span>
+            <div class="capture-service-text">
+              <div class="capture-service-label">Recorder</div>
+              <div class="capture-service-detail" id="audio-assist-detail">${CAPTURE_STATUS_DEFAULT}</div>
+            </div>
+          </div>
+          <div class="capture-service-actions">
+            <button class="capture-service-btn" id="audio-assist-toggle">Loading…</button>
+            <button class="capture-service-btn secondary" id="audio-assist-logs">Logs</button>
+          </div>
+        </div>
         <div id="capture-readiness"></div>
+        <div class="capture-subsection">
+          <div class="capture-subsection-header">
+            <span>Capture sources</span>
+            <button class="capture-service-btn secondary" id="audio-assist-ensure">Ensure defaults</button>
+          </div>
+          <div id="capture-sources">
+            <span class="audio-unavailable">loading...</span>
+          </div>
+        </div>
+        <div class="capture-subsection">
+          <div class="capture-subsection-header">
+            <span>Live levels</span>
+          </div>
         <div id="source-levels">
           <span class="audio-unavailable">loading...</span>
+        </div>
         </div>
       </div>
     </div>
@@ -81,6 +157,127 @@ export function renderAudioPanel() {
 }
 
 // --- Volume Panel ---
+
+function formatNameList(names: string[]): string {
+  if (names.length === 0) return "none";
+  if (names.length === 1) return names[0];
+  if (names.length === 2) return `${names[0]} and ${names[1]}`;
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+function audibleOutputDevices(): VolumeDevice[] {
+  return Object.values(latestVolumeDevices).filter((d) => !d.error && !d.muted && d.volume > 0);
+}
+
+function speakerRoutingEnabled(slug: string): boolean {
+  return latestSpeakerSettings[slug]?.enabled !== false;
+}
+
+function computeAudioRouteBanner(): AudioRouteBanner | null {
+  if (audioRouteError) {
+    return {
+      severity: "warn",
+      badge: "check",
+      title: "Routing status unavailable",
+      detail: "The dashboard could not read macOS output selection. Speaker controls still work, but default-output mismatches will not be flagged until this recovers.",
+    };
+  }
+
+  if (!latestAudioRouteStatus) {
+    return null;
+  }
+
+  const route = latestAudioRouteStatus;
+  const target = route.recommendedOutput || CAPTURE_OUTPUT_DEVICE;
+  const currentOutput = route.currentOutput ?? "unknown";
+  const currentSystemOutput = route.currentSystemOutput ?? "unknown";
+  if (currentOutput !== target || currentSystemOutput !== target) {
+    return {
+      severity: "error",
+      badge: "fix",
+      title: "Mac output is bypassing CaptureAudio",
+      detail: `Output is ${currentOutput}; system output is ${currentSystemOutput}. Set both back to ${target} so audio-forward can fan out to Bose and speakers.`,
+      action: "restore-defaults",
+      actionLabel: "Fix defaults",
+    };
+  }
+
+  const boseMic = latestMicDevices[BOSE_SLUG];
+  if (boseMic?.enabled) {
+    return {
+      severity: "error",
+      badge: "risk",
+      title: "Bose headset mic is enabled",
+      detail: "That can force the headset into the low-quality Bluetooth profile and kill playback. Disable the Bose mic in this panel.",
+      action: "disable-bose-mic",
+      actionLabel: "Disable Bose mic",
+    };
+  }
+
+  const audible = audibleOutputDevices();
+  const boseExpected = speakerRoutingEnabled(BOSE_SLUG);
+  const boseAvailable = route.availableOutputs.includes(BOSE_OUTPUT_DEVICE) || Boolean(latestVolumeDevices[BOSE_SLUG]);
+  if (boseExpected && !boseAvailable) {
+    if (audible.length === 0) {
+      return {
+        severity: "error",
+        badge: "down",
+        title: "No active speaker path",
+        detail: "Bose QC45 is missing and no connected speaker currently has audible volume. Reconnect or power-cycle Bose, or raise another output volume.",
+      };
+    }
+    return {
+      severity: "warn",
+      badge: "bose",
+      title: "Bose QC45 is unavailable",
+      detail: `Audio is currently only available on ${formatNameList(audible.map((d) => d.display))}. Reconnect or power-cycle Bose if you expected headset audio.`,
+    };
+  }
+
+  if (audible.length === 0) {
+    return {
+      severity: "error",
+      badge: "mute",
+      title: "All connected outputs are muted",
+      detail: "CaptureAudio is selected correctly, but every connected speaker is muted or set to zero volume.",
+    };
+  }
+
+  return {
+    severity: "ok",
+    badge: "ok",
+    title: "Output routing healthy",
+    detail: `Defaults point to ${target}. Audible outputs: ${formatNameList(audible.map((d) => d.display))}.`,
+  };
+}
+
+function renderAudioRouteBanner() {
+  const el = document.getElementById("audio-route-status");
+  if (!el) return;
+
+  const banner = computeAudioRouteBanner();
+  if (!banner) {
+    el.innerHTML = `<span class="audio-unavailable">checking route...</span>`;
+    return;
+  }
+
+  const actionLabel = audioRouteBusy
+    ? banner.action === "disable-bose-mic" ? "Disabling…" : "Fixing…"
+    : banner.actionLabel;
+
+  el.innerHTML = `
+    <div class="audio-route-banner ${banner.severity}">
+      <span class="audio-route-badge">${banner.badge}</span>
+      <div class="audio-route-body">
+        <div class="audio-route-title">${banner.title}</div>
+        <div class="audio-route-detail">${banner.detail}</div>
+      </div>
+      ${banner.action && actionLabel
+        ? `<button class="audio-route-action" data-route-action="${banner.action}" ${audioRouteBusy ? "disabled" : ""}>${actionLabel}</button>`
+        : ""}
+    </div>
+  `;
+}
 
 // Update existing slider/value DOM in place instead of replacing innerHTML.
 // Only do a full rebuild when the set of device slugs changes.
@@ -291,6 +488,86 @@ function renderSourceLevels(levels: SourceLevel[]) {
   }).join("");
 }
 
+function renderCaptureSources(statuses: SourceStatus[], levels: SourceLevel[], transcripts: TranscriptItem[]) {
+  const el = document.getElementById("capture-sources");
+  if (!el) return;
+
+  if (statuses.length === 0) {
+    el.innerHTML = `<span class="audio-unavailable">no capture sources</span>`;
+    return;
+  }
+
+  const levelBySource = new Map(levels.map((item) => [item.source_id, item]));
+  const transcriptCounts = new Map<string, number>();
+  const lastTranscript = new Map<string, TranscriptItem>();
+  for (const item of transcripts) {
+    transcriptCounts.set(item.source_id, (transcriptCounts.get(item.source_id) ?? 0) + 1);
+    if (!lastTranscript.has(item.source_id)) {
+      lastTranscript.set(item.source_id, item);
+    }
+  }
+
+  el.innerHTML = statuses.map((src) => {
+    const level = levelBySource.get(src.source_id);
+    const transcriptCount = transcriptCounts.get(src.source_id) ?? 0;
+    const latest = lastTranscript.get(src.source_id);
+    const suppressed = src.details?.suppressed === "true";
+    const levelText = level
+      ? `${level.level_dbfs.toFixed(0)} dB`
+      : "no level";
+    const transcriptText = transcriptCount > 0
+      ? `${transcriptCount} transcript chunk${transcriptCount === 1 ? "" : "s"} in recent window`
+      : "no recent transcript";
+    const latestText = latest
+      ? `latest ${new Date(latest.started_at).toLocaleTimeString()}`
+      : "no recent rows";
+    const runningClass = src.running ? "running" : "stopped";
+    const runningLabel = suppressed ? "suppressed" : src.running ? "running" : "stopped";
+    const warn = sourceWarning(src);
+    const sourceBusy = captureSourceBusy.has(src.source_id);
+
+    return `
+      <div class="capture-source-row ${runningClass}">
+        <div class="capture-source-main">
+          <div class="capture-source-title-row">
+            <span class="capture-source-id">${src.source_id}</span>
+            <span class="capture-source-badge ${suppressed ? "suppressed" : runningClass}">${runningLabel}</span>
+            <span class="capture-source-role">${src.source_role || src.source_type}</span>
+          </div>
+          <div class="capture-source-detail">${levelText} · ${transcriptText} · ${latestText}</div>
+          ${warn ? `<div class="capture-source-warning">${warn}</div>` : ""}
+        </div>
+        <div class="capture-source-actions">
+          ${src.running
+            ? `<button class="capture-source-btn" data-source-stop="${src.source_id}" ${sourceBusy ? "disabled" : ""}>${sourceBusy ? "Stopping…" : "Stop"}</button>`
+            : `<button class="capture-source-btn secondary" data-source-start="${src.source_id}" ${sourceBusy ? "disabled" : ""}>${sourceBusy ? "Starting…" : (suppressed ? "Start" : "Restart")}</button>`
+          }
+        </div>
+      </div>
+    `;
+  }).join("");
+
+  const ensureBtn = document.getElementById("audio-assist-ensure") as HTMLButtonElement | null;
+  if (ensureBtn) {
+    ensureBtn.disabled = ensureCaptureBusy;
+    ensureBtn.textContent = ensureCaptureBusy ? "Ensuring…" : "Ensure defaults";
+  }
+}
+
+function sourceWarning(src: SourceStatus): string {
+  const lowered = `${src.source_id} ${src.source_role}`.toLowerCase();
+  if (src.details?.suppressed === "true") {
+    return "Manually stopped. This source will stay off until you explicitly ensure defaults or restart it.";
+  }
+  if (lowered.includes("app-audio")) {
+    return "Captures app and desktop playback. Stop this source if background media should not be transcribed.";
+  }
+  if (lowered.includes("system-audio")) {
+    return "Captures routed system output. Verify loopback routing if remote audio should be transcribed.";
+  }
+  return "";
+}
+
 // --- Capture Readiness ---
 
 function renderCaptureReadiness(cr: CaptureReadiness) {
@@ -311,7 +588,206 @@ function renderCaptureReadiness(cr: CaptureReadiness) {
 
 function renderCaptureUnavailable() {
   const el = document.getElementById("capture-readiness");
-  if (el) el.innerHTML = "";
+  if (!el) return;
+  el.innerHTML = `
+    <div class="capture-banner">
+      <span class="capture-badge badge-down">down</span>
+      <span class="capture-summary">audio-assist is not reachable.</span>
+    </div>
+  `;
+}
+
+function setAudioAssistStatus(health: HealthResult | null, detailOverride?: string) {
+  const dot = document.getElementById("audio-assist-dot");
+  const detail = document.getElementById("audio-assist-detail");
+  const toggle = document.getElementById("audio-assist-toggle") as HTMLButtonElement | null;
+  const logsBtn = document.getElementById("audio-assist-logs") as HTMLButtonElement | null;
+
+  if (health) {
+    lastAudioAssistHealth = health;
+  }
+
+  if (logsBtn) {
+    logsBtn.disabled = !audioAssistService;
+  }
+
+  audioAssistStatus = health?.status ?? lastAudioAssistHealth?.status ?? "unknown";
+  const detailText = detailOverride ?? health?.detail ?? lastAudioAssistHealth?.detail ?? CAPTURE_STATUS_DEFAULT;
+
+  if (dot) {
+    dot.className = `status-dot ${audioAssistStatus}`;
+  }
+
+  if (detail) {
+    detail.textContent = detailText;
+  }
+
+  if (!toggle) return;
+
+  if (!audioAssistService) {
+    toggle.textContent = "Unavailable";
+    toggle.disabled = true;
+    return;
+  }
+
+  if (audioAssistBusy) {
+    toggle.textContent = "Working…";
+    toggle.disabled = true;
+    return;
+  }
+
+  const running = audioAssistStatus === "green" || audioAssistStatus === "yellow";
+  toggle.textContent = running ? "Stop recording" : "Start recording";
+  toggle.disabled = false;
+}
+
+function nextAudioAssistAction(): "start" | "stop" {
+  return audioAssistStatus === "green" || audioAssistStatus === "yellow"
+    ? "stop"
+    : "start";
+}
+
+async function refreshAudioAssistService() {
+  if (!audioAssistService) {
+    lastAudioAssistHealth = null;
+    setAudioAssistStatus(null, "Recorder service definition not loaded.");
+    return;
+  }
+
+  const health = await checkHealth(audioAssistService);
+  setAudioAssistStatus(health);
+}
+
+async function toggleAudioAssistService() {
+  if (!audioAssistService || audioAssistBusy) return;
+
+  const action = nextAudioAssistAction();
+  audioAssistBusy = true;
+  let stickyDetail: string | null = null;
+  let shouldRefresh = false;
+  setAudioAssistStatus(lastAudioAssistHealth, `${action === "start" ? "Starting" : "Stopping"} recorder…`);
+
+  try {
+    if (action === "start") {
+      setAudioAssistStatus(lastAudioAssistHealth, "Checking microphone access…");
+      try {
+        await ensureMicrophonePermission();
+      } catch (error) {
+        stickyDetail = error instanceof Error ? error.message : String(error);
+        return;
+      }
+      setAudioAssistStatus(lastAudioAssistHealth, "Starting recorder…");
+    }
+
+    const result = await invoke<ServiceControlResult>("service_control", {
+      serviceId: audioAssistService.id,
+      script: audioAssistService.script ?? null,
+      entrypoint: audioAssistService.entrypoint ?? null,
+      action,
+    });
+
+    if (!result.success) {
+      stickyDetail = result.output?.trim() || `${action} failed`;
+      return;
+    }
+
+    shouldRefresh = true;
+    await new Promise((resolve) => setTimeout(resolve, action === "start" ? 1800 : 800));
+    await Promise.allSettled([
+      refreshAudioAssistService(),
+      refreshLevels(),
+      refreshCapture(),
+      refreshCaptureSources(),
+    ]);
+  } finally {
+    audioAssistBusy = false;
+    if (stickyDetail) {
+      setAudioAssistStatus(lastAudioAssistHealth, stickyDetail);
+      return;
+    }
+    if (shouldRefresh) {
+      await refreshAudioAssistService();
+    } else {
+      setAudioAssistStatus(lastAudioAssistHealth);
+    }
+  }
+}
+
+export function bindAudioAssistService(services: ServiceDef[]) {
+  audioAssistService = services.find((svc) => svc.id === AUDIO_ASSIST_SERVICE_ID) ?? null;
+  void refreshAudioAssistService();
+}
+
+async function refreshCaptureSources() {
+  try {
+    const [statuses, levels, transcripts] = await Promise.all([
+      fetchSources(),
+      fetchSourceLevels(),
+      fetchRecentTranscripts(180, 30),
+    ]);
+    renderCaptureSources(statuses, levels, transcripts);
+  } catch {
+    const el = document.getElementById("capture-sources");
+    if (el) el.innerHTML = `<span class="audio-unavailable">capture sources unavailable</span>`;
+  }
+}
+
+async function stopCaptureSourceFromPanel(sourceId: string) {
+  if (captureSourceBusy.has(sourceId)) return;
+  captureSourceBusy.add(sourceId);
+  try {
+    await stopCaptureSource(sourceId);
+    await Promise.allSettled([
+      refreshCaptureSources(),
+      refreshLevels(),
+      refreshCapture(),
+    ]);
+  } finally {
+    captureSourceBusy.delete(sourceId);
+    await refreshCaptureSources();
+  }
+}
+
+async function resumeCaptureSourceFromPanel(sourceId: string) {
+  if (captureSourceBusy.has(sourceId)) return;
+  captureSourceBusy.add(sourceId);
+  try {
+    await resumeCaptureSource(sourceId);
+    await Promise.allSettled([
+      refreshCaptureSources(),
+      refreshLevels(),
+      refreshCapture(),
+    ]);
+  } finally {
+    captureSourceBusy.delete(sourceId);
+    await refreshCaptureSources();
+  }
+}
+
+async function ensureDefaultCaptureSources() {
+  if (ensureCaptureBusy) return;
+  ensureCaptureBusy = true;
+  try {
+    await ensureCaptureSources();
+    await Promise.allSettled([
+      refreshCaptureSources(),
+      refreshLevels(),
+      refreshCapture(),
+    ]);
+  } finally {
+    ensureCaptureBusy = false;
+    await refreshCaptureSources();
+  }
+}
+
+async function refreshAudioRouteStatus() {
+  try {
+    latestAudioRouteStatus = await fetchAudioRouteStatus();
+    audioRouteError = null;
+  } catch (err) {
+    audioRouteError = err instanceof Error ? err.message : String(err);
+  }
+  renderAudioRouteBanner();
 }
 
 // --- Events ---
@@ -319,6 +795,49 @@ function renderCaptureUnavailable() {
 export function setupAudioPanelEvents() {
   const container = document.getElementById("audio-panel");
   if (!container) return;
+
+  const recorderToggle = document.getElementById("audio-assist-toggle") as HTMLButtonElement | null;
+  recorderToggle?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await toggleAudioAssistService();
+  });
+
+  const recorderEnsure = document.getElementById("audio-assist-ensure") as HTMLButtonElement | null;
+  recorderEnsure?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await ensureDefaultCaptureSources();
+  });
+
+  const recorderLogs = document.getElementById("audio-assist-logs") as HTMLButtonElement | null;
+  recorderLogs?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    if (audioAssistService) {
+      showLogPanel(audioAssistService.id, audioAssistService.logFile);
+    }
+  });
+
+  const micTestBtn = document.getElementById("mic-test-btn") as HTMLButtonElement | null;
+  micTestBtn?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    const statusEl = document.getElementById("mic-test-status");
+    const seconds = 3;
+    micTestBtn.disabled = true;
+    micTestBtn.textContent = `Recording ${seconds}s...`;
+    if (statusEl) statusEl.textContent = "speak now";
+    try {
+      await startMicTest(seconds);
+      await new Promise((resolve) => setTimeout(resolve, seconds * 1000 + 200));
+      micTestBtn.textContent = "Playing back...";
+      if (statusEl) statusEl.textContent = "listen";
+      await new Promise((resolve) => setTimeout(resolve, seconds * 1000 + 500));
+    } catch (err) {
+      console.error("mic test failed:", err);
+      if (statusEl) statusEl.textContent = "error";
+    }
+    micTestBtn.disabled = false;
+    micTestBtn.textContent = "Test Mic";
+    if (statusEl) statusEl.textContent = "";
+  });
 
   // Lock poll while the user is dragging a volume slider
   container.addEventListener("mousedown", (e) => {
@@ -394,6 +913,51 @@ export function setupAudioPanelEvents() {
 
   // Mute toggle: optimistic UI update, then fire API call
   container.addEventListener("click", async (e) => {
+    const routeBtn = (e.target as HTMLElement).closest("[data-route-action]") as HTMLButtonElement | null;
+    if (routeBtn && !audioRouteBusy) {
+      const action = routeBtn.dataset.routeAction as AudioRouteAction | undefined;
+      if (!action) return;
+      audioRouteBusy = true;
+      renderAudioRouteBanner();
+      try {
+        if (action === "restore-defaults") {
+          latestAudioRouteStatus = await restoreCaptureAudioDefaults();
+          audioRouteError = null;
+        } else if (action === "disable-bose-mic") {
+          await setMicVolume(BOSE_SLUG, 0);
+        }
+        await Promise.allSettled([
+          refreshAudioRouteStatus(),
+          refreshVolume(),
+          refreshMics(),
+        ]);
+      } catch (err) {
+        audioRouteError = err instanceof Error ? err.message : String(err);
+      } finally {
+        audioRouteBusy = false;
+        renderAudioRouteBanner();
+      }
+      return;
+    }
+
+    const stopSourceBtn = (e.target as HTMLElement).closest("[data-source-stop]") as HTMLButtonElement | null;
+    if (stopSourceBtn) {
+      const sourceId = stopSourceBtn.dataset.sourceStop;
+      if (sourceId) {
+        await stopCaptureSourceFromPanel(sourceId);
+      }
+      return;
+    }
+
+    const startSourceBtn = (e.target as HTMLElement).closest("[data-source-start]") as HTMLButtonElement | null;
+    if (startSourceBtn) {
+      const sourceId = startSourceBtn.dataset.sourceStart;
+      if (sourceId) {
+        await resumeCaptureSourceFromPanel(sourceId);
+      }
+      return;
+    }
+
     // Volume mute
     const volBtn = (e.target as HTMLElement).closest(".vol-mute") as HTMLButtonElement | null;
     if (volBtn) {
@@ -437,31 +1001,6 @@ export function setupAudioPanelEvents() {
     }
 
     // Mic test
-    const testBtn = (e.target as HTMLElement).closest(".mic-test-btn") as HTMLButtonElement | null;
-    if (testBtn) {
-      const statusEl = document.getElementById("mic-test-status");
-      const seconds = 3;
-      testBtn.disabled = true;
-      testBtn.textContent = `Recording ${seconds}s...`;
-      if (statusEl) statusEl.textContent = "speak now";
-      try {
-        await startMicTest(seconds);
-        // Wait for recording phase
-        await new Promise((r) => setTimeout(r, seconds * 1000 + 200));
-        testBtn.textContent = "Playing back...";
-        if (statusEl) statusEl.textContent = "listen";
-        // Wait for playback phase
-        await new Promise((r) => setTimeout(r, seconds * 1000 + 500));
-      } catch (err) {
-        console.error("mic test failed:", err);
-        if (statusEl) statusEl.textContent = "error";
-      }
-      testBtn.disabled = false;
-      testBtn.textContent = "Test Mic";
-      if (statusEl) statusEl.textContent = "";
-      return;
-    }
-
     // Mic mute
     const micBtn = (e.target as HTMLElement).closest(".mic-mute") as HTMLButtonElement | null;
     if (micBtn) {
@@ -502,7 +1041,12 @@ export function setupAudioPanelEvents() {
 
 async function refreshVolume() {
   try {
-    const devices = await fetchVolumeDevices();
+    const [devices, speakerSettings] = await Promise.all([
+      fetchVolumeDevices(),
+      fetchSpeakerSettings(),
+    ]);
+    latestVolumeDevices = devices;
+    latestSpeakerSettings = speakerSettings;
     // Always track latest non-zero volume for unmute restore
     for (const [slug, d] of Object.entries(devices)) {
       if (d.volume > 0) {
@@ -510,9 +1054,12 @@ async function refreshVolume() {
       }
     }
     updateVolumeDevices(devices);
+    renderAudioRouteBanner();
   } catch {
+    latestVolumeDevices = {};
     const el = document.getElementById("volume-devices");
     if (el) el.innerHTML = `<span class="audio-unavailable">volume service unavailable</span>`;
+    renderAudioRouteBanner();
   }
 }
 
@@ -528,15 +1075,19 @@ async function refreshMicLevels() {
 async function refreshMics() {
   try {
     const devices = await fetchMicDevices();
+    latestMicDevices = devices;
     for (const [slug, d] of Object.entries(devices)) {
       if (d.volume > 0) {
         preMuteMicVolume.set(slug, d.volume);
       }
     }
     updateMicDevices(devices);
+    renderAudioRouteBanner();
   } catch {
+    latestMicDevices = {};
     const el = document.getElementById("mic-devices");
     if (el) el.innerHTML = `<span class="audio-unavailable">mic service unavailable</span>`;
+    renderAudioRouteBanner();
   }
 }
 
@@ -560,19 +1111,29 @@ async function refreshCapture() {
 }
 
 export function pollAudioPanel() {
+  if (pollTimers.length > 0) {
+    return;
+  }
+
   // Initial fetch
+  renderAudioRouteBanner();
   refreshVolume();
   refreshMics();
+  refreshAudioRouteStatus();
   refreshMicLevels();
   refreshLevels();
   refreshCapture();
+  refreshCaptureSources();
 
   // Staggered intervals — volume/mic poll skips when locked
   pollTimers.push(setInterval(() => { if (!volumeLocked) refreshVolume(); }, 1000));
   pollTimers.push(setInterval(() => { if (!micLocked) refreshMics(); }, 10000));
+  pollTimers.push(setInterval(refreshAudioRouteStatus, 5000));
   pollTimers.push(setInterval(refreshMicLevels, 500));  // fast poll for live meters
-  pollTimers.push(setInterval(refreshLevels, 2000));
+  pollTimers.push(setInterval(refreshLevels, 1000));
   pollTimers.push(setInterval(refreshCapture, 15000));
+  pollTimers.push(setInterval(refreshCaptureSources, 3000));
+  pollTimers.push(setInterval(refreshAudioAssistService, 5000));
 }
 
 export function stopAudioPanelPolling() {

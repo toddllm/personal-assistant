@@ -1,12 +1,32 @@
 mod commands;
 
 use tauri::{
+    Emitter,
+    include_image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+
+const WINDOW_VISIBILITY_EVENT: &str = "personal-assistant://window-visibility";
+
+fn hide_window(window: &tauri::Window) {
+    let _ = window.emit(WINDOW_VISIBILITY_EVENT, false);
+    let _ = window.hide();
+}
+
+fn hide_webview_window(window: &tauri::WebviewWindow) {
+    let _ = window.emit(WINDOW_VISIBILITY_EVENT, false);
+    let _ = window.hide();
+}
+
+fn show_webview_window(window: &tauri::WebviewWindow) {
+    let _ = window.show();
+    let _ = window.emit(WINDOW_VISIBILITY_EVENT, true);
+    let _ = window.set_focus();
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,10 +47,9 @@ pub fn run() {
                         if shortcut == &s {
                             if let Some(w) = app.get_webview_window("main") {
                                 if w.is_visible().unwrap_or(false) {
-                                    let _ = w.hide();
+                                    hide_webview_window(&w);
                                 } else {
-                                    let _ = w.show();
-                                    let _ = w.set_focus();
+                                    show_webview_window(&w);
                                 }
                             }
                         }
@@ -50,17 +69,15 @@ pub fn run() {
             let show_i = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
-
             // Build tray icon
             let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().unwrap())
+                .icon(include_image!("icons/tray-icon.png"))
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(w) = app.get_webview_window("main") {
-                            let _ = w.show();
-                            let _ = w.set_focus();
+                            show_webview_window(&w);
                         }
                     }
                     "quit" => {
@@ -78,10 +95,9 @@ pub fn run() {
                         let app = tray.app_handle();
                         if let Some(w) = app.get_webview_window("main") {
                             if w.is_visible().unwrap_or(false) {
-                                let _ = w.hide();
+                                hide_webview_window(&w);
                             } else {
-                                let _ = w.show();
-                                let _ = w.set_focus();
+                                show_webview_window(&w);
                             }
                         }
                     }
@@ -93,7 +109,7 @@ pub fn run() {
         // Close hides window instead of quitting
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let _ = window.hide();
+                hide_window(window);
                 api.prevent_close();
             }
         })
@@ -104,6 +120,10 @@ pub fn run() {
             commands::get_services,
             commands::get_monorepo_root,
             commands::fetch_local_api,
+            commands::get_audio_route_status,
+            commands::restore_capture_audio_defaults,
+            commands::get_microphone_permission_status,
+            commands::request_microphone_permission,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

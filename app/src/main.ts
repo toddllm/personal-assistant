@@ -1,47 +1,106 @@
 import { invoke } from "@tauri-apps/api/core";
+import { disposeAppState, initAppState, isAppActive, onAppActivityChange } from "./app-state";
 import type { ServiceDef } from "./services";
 import { renderServiceGrid, pollHealth, setupEventDelegation } from "./ui";
-import { renderAudioPanel, setupAudioPanelEvents, pollAudioPanel } from "./audio-panel";
-import { renderVoiceChatPanel, setupVoiceChatEvents, pollVoiceChatPanel } from "./voice-chat-panel";
-import { renderVoiceProfilePanel, setupVoiceProfileEvents, pollVoiceProfilePanel } from "./voice-profile-panel";
+import { bindAudioAssistService, renderAudioPanel, setupAudioPanelEvents, pollAudioPanel, stopAudioPanelPolling } from "./audio-panel";
+import { pauseLogPanelPolling, resumeLogPanelPolling } from "./logs";
+import { primeMicrophonePermission } from "./media-permissions";
+import { renderVoiceChatPanel, setupVoiceChatEvents, pollVoiceChatPanel, stopVoiceChatPolling } from "./voice-chat-panel";
+import { renderVoiceProfilePanel, setupVoiceProfileEvents, pollVoiceProfilePanel, stopVoiceProfilePolling } from "./voice-profile-panel";
 
 let services: ServiceDef[] = [];
+let healthTimer: ReturnType<typeof setInterval> | null = null;
+let clockTimer: ReturnType<typeof setInterval> | null = null;
+let dashboardPollingActive = false;
+let stopAppActivityListener: (() => void) | null = null;
 
 async function init() {
-  // Audio panel (independent of services.json)
   renderAudioPanel();
   setupAudioPanelEvents();
-  pollAudioPanel();
-
-  // Voice Chat panel
   renderVoiceChatPanel();
   setupVoiceChatEvents();
-  pollVoiceChatPanel();
-
-  // Voice Profile panel
   renderVoiceProfilePanel();
   setupVoiceProfileEvents();
-  pollVoiceProfilePanel();
 
   try {
     services = await invoke<ServiceDef[]>("get_services");
   } catch (e) {
     document.getElementById("service-grid")!.textContent = `Failed to load services: ${e}`;
-    return;
   }
 
-  renderServiceGrid(services);
-  setupEventDelegation(services);
+  bindAudioAssistService(services);
+  if (services.length > 0) {
+    renderServiceGrid(services);
+    setupEventDelegation(services);
+  }
 
-  // Initial health check
-  await pollHealth(services);
+  await initAppState();
+  stopAppActivityListener = onAppActivityChange((active) => {
+    if (active) {
+      void startDashboardPolling();
+    } else {
+      stopDashboardPolling();
+    }
+  });
 
-  // Poll every 5 seconds
-  setInterval(() => pollHealth(services), 5000);
+  if (isAppActive()) {
+    await startDashboardPolling();
+  }
 
-  // Clock
+  void primeMicrophonePermission();
+
+  window.addEventListener("beforeunload", handleBeforeUnload, { once: true });
+}
+
+async function startDashboardPolling() {
+  if (dashboardPollingActive) {
+    return;
+  }
+  dashboardPollingActive = true;
+
+  pollAudioPanel();
+  pollVoiceChatPanel();
+  pollVoiceProfilePanel();
+  resumeLogPanelPolling();
+
+  if (services.length > 0) {
+    await pollHealth(services);
+    healthTimer = setInterval(() => {
+      void pollHealth(services);
+    }, 5000);
+  }
+
   updateClock();
-  setInterval(updateClock, 1000);
+  clockTimer = setInterval(updateClock, 1000);
+}
+
+function stopDashboardPolling() {
+  if (!dashboardPollingActive) {
+    return;
+  }
+  dashboardPollingActive = false;
+
+  stopAudioPanelPolling();
+  stopVoiceChatPolling();
+  stopVoiceProfilePolling();
+  pauseLogPanelPolling();
+
+  if (healthTimer) {
+    clearInterval(healthTimer);
+    healthTimer = null;
+  }
+
+  if (clockTimer) {
+    clearInterval(clockTimer);
+    clockTimer = null;
+  }
+}
+
+function handleBeforeUnload() {
+  stopAppActivityListener?.();
+  stopAppActivityListener = null;
+  stopDashboardPolling();
+  disposeAppState();
 }
 
 function updateClock() {

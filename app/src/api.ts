@@ -11,6 +11,12 @@ export interface VolumeDevice {
   error?: string | null;
 }
 
+export interface SpeakerSetting {
+  enabled?: boolean;
+  volume?: number;
+  pre_mute_volume?: number;
+}
+
 export interface SourceLevel {
   source_id: string;
   level_dbfs: number;
@@ -24,6 +30,51 @@ export interface CaptureReadiness {
   status: "ready" | "degraded" | "down";
   summary: string;
   issues: { code: string; severity: string; message: string }[];
+  recommendations?: string[];
+  signals?: {
+    queue_size?: number;
+    queue_capacity?: number;
+    queue_ratio?: number;
+    processed?: number;
+    with_text?: number;
+    empty_text?: number;
+    transcriber?: {
+      queue_size?: number;
+      queue_capacity?: number;
+      queue_ratio?: number;
+      processed?: number;
+      with_text?: number;
+      empty_text?: number;
+    };
+    levels?: Array<{
+      source_id: string;
+      level_dbfs: number | null;
+      peak_dbfs: number | null;
+      age_seconds: number | null;
+      silent: boolean | null;
+      clipped: boolean | null;
+      updated_at: string | null;
+    }>;
+  };
+}
+
+export interface SourceStatus {
+  source_id: string;
+  source_type: string;
+  source_role: string;
+  running: boolean;
+  started_at: string | null;
+  details: Record<string, string>;
+}
+
+export interface TranscriptItem {
+  id: number;
+  source_id: string;
+  session_id: string | null;
+  started_at: string;
+  ended_at: string;
+  text: string;
+  speaker: string | null;
 }
 
 // --- Helpers ---
@@ -45,12 +96,31 @@ export async function fetchVolumeDevices(): Promise<Record<string, VolumeDevice>
   return getJson<Record<string, VolumeDevice>>(`${VOL_BASE}/api/devices`);
 }
 
+export async function fetchSpeakerSettings(): Promise<Record<string, SpeakerSetting>> {
+  return getJson<Record<string, SpeakerSetting>>(`${VOL_BASE}/api/speaker-settings`);
+}
+
 export async function setVolume(slug: string, volume: number): Promise<void> {
   await fetchLocal(
     `${VOL_BASE}/api/volume/${slug}`,
     "POST",
     JSON.stringify({ volume }),
   );
+}
+
+export interface AudioRouteStatus {
+  currentOutput: string | null;
+  currentSystemOutput: string | null;
+  availableOutputs: string[];
+  recommendedOutput: string;
+}
+
+export async function fetchAudioRouteStatus(): Promise<AudioRouteStatus> {
+  return invoke<AudioRouteStatus>("get_audio_route_status");
+}
+
+export async function restoreCaptureAudioDefaults(): Promise<AudioRouteStatus> {
+  return invoke<AudioRouteStatus>("restore_capture_audio_defaults");
 }
 
 // --- Mic Devices (port 8788 — digital gain) ---
@@ -87,18 +157,49 @@ export async function startMicTest(seconds = 3): Promise<{ ok: boolean; seconds:
   return JSON.parse(text);
 }
 
-// --- Audio Source Levels (port 8790) ---
+// --- Audio Assist (port 8787) ---
 
-const AUDIO_BASE = "http://127.0.0.1:8790";
+const AUDIO_BASE = "http://127.0.0.1:8787";
 
 export async function fetchSourceLevels(): Promise<SourceLevel[]> {
   return getJson<SourceLevel[]>(`${AUDIO_BASE}/v1/sources/levels`);
 }
 
-// --- Capture Readiness (port 8790) ---
+// --- Capture Readiness (port 8787) ---
 
 export async function fetchCaptureReadiness(): Promise<CaptureReadiness> {
   return getJson<CaptureReadiness>(`${AUDIO_BASE}/v1/capture/readiness`);
+}
+
+export async function fetchSources(): Promise<SourceStatus[]> {
+  return getJson<SourceStatus[]>(`${AUDIO_BASE}/v1/sources`);
+}
+
+export async function ensureCaptureSources(): Promise<Record<string, unknown>> {
+  const text = await fetchLocal(`${AUDIO_BASE}/v1/sources/ensure`, "POST", "{}");
+  return JSON.parse(text) as Record<string, unknown>;
+}
+
+export async function stopCaptureSource(sourceId: string): Promise<{ stopped: boolean }> {
+  const text = await fetchLocal(`${AUDIO_BASE}/v1/sources/stop/${encodeURIComponent(sourceId)}`, "POST");
+  return JSON.parse(text) as { stopped: boolean };
+}
+
+export async function resumeCaptureSource(sourceId: string): Promise<SourceStatus> {
+  const text = await fetchLocal(`${AUDIO_BASE}/v1/sources/resume/${encodeURIComponent(sourceId)}`, "POST");
+  return JSON.parse(text) as SourceStatus;
+}
+
+export async function fetchRecentTranscripts(
+  sinceSeconds = 180,
+  limit = 40,
+): Promise<TranscriptItem[]> {
+  const params = new URLSearchParams({
+    since_seconds: String(sinceSeconds),
+    limit: String(limit),
+    sessionized: "false",
+  });
+  return getJson<TranscriptItem[]>(`${AUDIO_BASE}/v1/transcripts/recent?${params.toString()}`);
 }
 
 // --- Voice Chat (port 8797) ---
@@ -217,4 +318,45 @@ export async function uploadProfilePhoto(name: string, photoBase64: string): Pro
     "POST",
     JSON.stringify({ photo_base64: photoBase64 }),
   );
+}
+
+// --- Speaker Profiles (port 8791) ---
+
+const SPEAKER_BASE = "http://127.0.0.1:8791";
+
+export interface SpeakerProfile {
+  id: number;
+  name: string;
+  embedding_dim: number;
+  enrolled_at: string;
+  sample_count: number;
+  is_owner: boolean;
+}
+
+export async function fetchSpeakerProfiles(): Promise<SpeakerProfile[]> {
+  return getJson<SpeakerProfile[]>(`${SPEAKER_BASE}/v1/profiles`);
+}
+
+export async function enrollSpeaker(
+  name: string,
+  sampleRate: number,
+  pcmBase64: string,
+  isOwner: boolean = false,
+): Promise<SpeakerProfile> {
+  const text = await fetchLocal(
+    `${SPEAKER_BASE}/v1/enroll`,
+    "POST",
+    JSON.stringify({
+      name,
+      sample_rate: sampleRate,
+      channels: 1,
+      pcm_s16le_base64: pcmBase64,
+      is_owner: isOwner,
+    }),
+  );
+  return JSON.parse(text) as SpeakerProfile;
+}
+
+export async function deleteSpeakerProfile(profileId: number): Promise<void> {
+  await fetchLocal(`${SPEAKER_BASE}/v1/profiles/${profileId}`, "DELETE");
 }
