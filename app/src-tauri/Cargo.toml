@@ -26,3 +26,7 @@ objc2-av-foundation = { version = "0.3.2", default-features = false, features = 
 chrono = "0.4"
 regex = "1"
 libc = "0.2"
+hound = "3.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+screencapturekit = { version = "1.5", features = ["macos_13_0"] }

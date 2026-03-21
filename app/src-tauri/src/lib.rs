@@ -1,4 +1,5 @@
 mod commands;
+mod sck;
 
 use tauri::{
     Emitter,
@@ -39,6 +40,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(commands::HttpClient(http_client))
         .manage(commands::Recorder(std::sync::Mutex::new(commands::RecorderState::new())))
+        .manage(sck::SckRecorder(std::sync::Mutex::new(sck::SckRecorderState::new())))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -157,6 +159,12 @@ pub fn run() {
             commands::list_recordings,
             commands::delete_recording,
             commands::rename_recording,
+            sck::get_screen_recording_permission_status,
+            sck::open_screen_recording_settings,
+            sck::list_capturable_apps,
+            sck::start_sck_recording,
+            sck::stop_sck_recording,
+            sck::get_sck_recording_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -165,6 +173,10 @@ pub fn run() {
                 // Gracefully stop any active recording on app exit
                 if let Some(recorder) = app.try_state::<commands::Recorder>() {
                     commands::stop_active_recording(&recorder);
+                }
+                // Gracefully stop any active SCK recording on app exit
+                if let Some(sck_recorder) = app.try_state::<sck::SckRecorder>() {
+                    sck::stop_active_sck_recording(&sck_recorder);
                 }
             }
         });

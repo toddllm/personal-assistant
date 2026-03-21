@@ -68,9 +68,9 @@ pub struct MediaPermissionStatus {
 // --- Audio Recording ---
 
 #[derive(Debug, Default)]
-struct RecordingLevels {
-    momentary_lufs: f64,
-    peak_dbfs: f64,
+pub struct RecordingLevels {
+    pub momentary_lufs: f64,
+    pub peak_dbfs: f64,
 }
 
 #[derive(Debug, Serialize, Clone)]
