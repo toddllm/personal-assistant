@@ -67,7 +67,7 @@ async function startDashboardPolling() {
     await pollHealth(services);
     healthTimer = setInterval(() => {
       void pollHealth(services);
-    }, 5000);
+    }, 10000);
   }
 
   updateClock();
@@ -110,4 +110,8 @@ function updateClock() {
   }
 }
 
-window.addEventListener("DOMContentLoaded", init);
+window.addEventListener("DOMContentLoaded", () => {
+  init().catch((err) => {
+    document.body.innerHTML = `<pre style="color:red;padding:20px;white-space:pre-wrap">Init error: ${err}\n${err?.stack || ""}</pre>`;
+  });
+});
