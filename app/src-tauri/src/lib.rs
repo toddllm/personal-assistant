@@ -170,13 +170,11 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
-                // Gracefully stop any active recording on app exit
+                // Gracefully stop any active recording (ffmpeg + SCK) on app exit
                 if let Some(recorder) = app.try_state::<commands::Recorder>() {
-                    commands::stop_active_recording(&recorder);
-                }
-                // Gracefully stop any active SCK recording on app exit
-                if let Some(sck_recorder) = app.try_state::<sck::SckRecorder>() {
-                    sck::stop_active_sck_recording(&sck_recorder);
+                    let sck_opt = app.try_state::<sck::SckRecorder>();
+                    let sck_ref = sck_opt.as_ref().map(|s| &**s);
+                    commands::stop_active_recording(&recorder, sck_ref);
                 }
             }
         });

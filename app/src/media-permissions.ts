@@ -106,6 +106,22 @@ export async function ensureMicrophonePermission(): Promise<void> {
   }
 }
 
+// --- Screen Recording Permission ---
+
+export interface ScreenRecordingPermissionStatus {
+  available: boolean;
+  granted: boolean;
+  error: string | null;
+}
+
+export async function checkScreenRecordingPermission(): Promise<ScreenRecordingPermissionStatus> {
+  try {
+    return await invoke<ScreenRecordingPermissionStatus>("get_screen_recording_permission_status");
+  } catch {
+    return { available: false, granted: false, error: "failed to check permission" };
+  }
+}
+
 export async function primeMicrophonePermission(): Promise<void> {
   const status = await getMicrophonePermissionStatus();
   if (!status || status.granted || !status.canPrompt) {

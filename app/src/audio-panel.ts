@@ -30,7 +30,8 @@ import {
 } from "./api";
 import { checkHealth } from "./health";
 import { showLogPanel } from "./logs";
-import { ensureMicrophonePermission } from "./media-permissions";
+import { ensureMicrophonePermission, checkScreenRecordingPermission } from "./media-permissions";
+import type { ScreenRecordingPermissionStatus } from "./media-permissions";
 import type { HealthResult, HealthStatus, ServiceControlResult, ServiceDef } from "./services";
 
 let pollTimers: ReturnType<typeof setInterval>[] = [];
@@ -71,6 +72,19 @@ let lastAudioAssistHealth: HealthResult | null = null;
 let latestCaptureSources: SourceStatus[] = [];
 let recordingActive = false;
 let recordingBusy = false;
+let activePreset: string = "both";
+let lastCaptureMethod: string = "ffmpeg";
+let sckPermissionStatus: ScreenRecordingPermissionStatus | null = null;
+let sckPermissionChecked = false;
+let appsLoaded = false;
+
+interface CapturableApp {
+  bundleId: string;
+  name: string;
+  pid: number;
+}
+
+// cachedApps intentionally not stored — app list rendered directly from invoke result
 
 type AudioRouteAction = "restore-defaults" | "disable-bose-mic";
 
@@ -140,6 +154,7 @@ export function renderAudioPanel() {
             <button class="capture-service-btn secondary" id="audio-assist-logs">Logs</button>
           </div>
         </div>
+        <div id="sck-permission-banner"></div>
         <div class="recording-row" id="recording-row">
           <button class="record-btn" id="record-btn" title="Record audio to file">
             <span class="record-dot" id="record-dot"></span>
@@ -150,11 +165,19 @@ export function renderAudioPanel() {
             <button class="record-preset-btn" data-preset="mic">Mic</button>
             <button class="record-preset-btn" data-preset="system">System</button>
             <button class="record-preset-btn active" data-preset="both">Both</button>
+            <button class="record-preset-btn" data-preset="apps">Apps</button>
           </div>
           <div class="record-device-picker" id="record-device-picker">
             <button class="record-device-toggle" id="record-device-toggle" type="button">Default input</button>
             <div class="record-device-dropdown" id="record-device-dropdown">
               <label class="record-device-option"><input type="checkbox" value="default" checked /> System default</label>
+            </div>
+          </div>
+          <div class="record-app-picker" id="record-app-picker" style="display:none">
+            <button class="record-device-toggle" id="record-app-toggle" type="button">Select apps...</button>
+            <div class="record-app-dropdown" id="record-app-dropdown">
+              <label class="record-device-option"><input type="checkbox" id="sck-include-mic" /> Include microphone</label>
+              <div id="app-list">loading...</div>
             </div>
           </div>
           <select class="record-format-select" id="record-format-select" title="Output format">
@@ -954,18 +977,37 @@ export function setupAudioPanelEvents() {
     if (!target.classList.contains("record-preset-btn")) return;
     const preset = target.dataset.preset;
     if (!preset) return;
-    // Uncheck all device checkboxes
-    const dropdown = document.getElementById("record-device-dropdown");
-    if (!dropdown) return;
-    const allCbs = dropdown.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
-    allCbs.forEach((cb) => { cb.checked = false; });
-    // Check the appropriate ones
-    allCbs.forEach((cb) => {
-      if (preset === "mic" && cb.value === "CaptureMic 2ch") cb.checked = true;
-      if (preset === "system" && cb.value === "CaptureAudio 2ch") cb.checked = true;
-      if (preset === "both" && (cb.value === "CaptureAudio 2ch" || cb.value === "CaptureMic 2ch")) cb.checked = true;
-    });
-    updateDeviceToggleLabel();
+
+    activePreset = preset;
+
+    const devicePicker = document.getElementById("record-device-picker");
+    const appPicker = document.getElementById("record-app-picker");
+
+    if (preset === "apps") {
+      // Show app picker, hide device picker
+      if (devicePicker) devicePicker.style.display = "none";
+      if (appPicker) appPicker.style.display = "block";
+      loadCapturableApps();
+    } else {
+      // Show device picker, hide app picker
+      if (devicePicker) devicePicker.style.display = "";
+      if (appPicker) appPicker.style.display = "none";
+
+      // Uncheck all device checkboxes
+      const dropdown = document.getElementById("record-device-dropdown");
+      if (dropdown) {
+        const allCbs = dropdown.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+        allCbs.forEach((cb) => { cb.checked = false; });
+        // Check the appropriate ones
+        allCbs.forEach((cb) => {
+          if (preset === "mic" && cb.value === "CaptureMic 2ch") cb.checked = true;
+          if (preset === "system" && cb.value === "CaptureAudio 2ch") cb.checked = true;
+          if (preset === "both" && (cb.value === "CaptureAudio 2ch" || cb.value === "CaptureMic 2ch")) cb.checked = true;
+        });
+        updateDeviceToggleLabel();
+      }
+    }
+
     // Update active class
     document.querySelectorAll(".record-preset-btn").forEach((b) => b.classList.remove("active"));
     target.classList.add("active");
@@ -979,10 +1021,28 @@ export function setupAudioPanelEvents() {
     deviceDropdown?.classList.toggle("open");
   });
   // Close dropdown when clicking outside
+  const appDropdown = document.getElementById("record-app-dropdown");
   document.addEventListener("click", () => {
     deviceDropdown?.classList.remove("open");
+    appDropdown?.classList.remove("open");
   });
   document.getElementById("record-device-picker")?.addEventListener("click", (e) => e.stopPropagation());
+
+  // App picker dropdown toggle
+  const appToggle = document.getElementById("record-app-toggle");
+  appToggle?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    appDropdown?.classList.toggle("open");
+  });
+  document.getElementById("record-app-picker")?.addEventListener("click", (e) => e.stopPropagation());
+
+  // SCK permission banner: grant button
+  document.getElementById("sck-permission-banner")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.id === "sck-grant-btn") {
+      invoke("open_screen_recording_settings").catch((err: unknown) => console.error("open settings failed:", err));
+    }
+  });
 
   // Reveal recording file in Finder (delegated since button is dynamically rendered)
   document.getElementById("record-file")?.addEventListener("click", (event) => {
@@ -1266,6 +1326,7 @@ interface RecordingStatusResult {
   levelDbfs?: number;
   peakDbfs?: number;
   fileSizeBytes?: number;
+  captureMethod?: string;
 }
 
 interface RecordingInfo {
@@ -1291,6 +1352,9 @@ function formatFileSize(bytes: number): string {
 
 function updateRecordingUI(status: RecordingStatusResult) {
   recordingActive = status.active;
+  if (status.captureMethod) {
+    lastCaptureMethod = status.captureMethod;
+  }
   const btn = document.getElementById("record-btn");
   const dot = document.getElementById("record-dot");
   const label = document.getElementById("record-label");
@@ -1320,10 +1384,14 @@ function updateRecordingUI(status: RecordingStatusResult) {
     }
   }
 
-  // Disable device picker and presets while recording
+  // Disable device picker, app picker, and presets while recording
   const deviceToggle = document.getElementById("record-device-toggle") as HTMLButtonElement | null;
   if (deviceToggle) {
     deviceToggle.disabled = status.active;
+  }
+  const appToggle = document.getElementById("record-app-toggle") as HTMLButtonElement | null;
+  if (appToggle) {
+    appToggle.disabled = status.active;
   }
   document.querySelectorAll<HTMLButtonElement>(".record-preset-btn").forEach((b) => {
     b.disabled = status.active;
@@ -1405,7 +1473,39 @@ async function toggleRecording() {
 
   try {
     if (recordingActive) {
-      const result = await invoke<RecordingStatusResult>("stop_recording");
+      // Stop: use the capture method from the last status to decide which stop command
+      if (lastCaptureMethod === "sck") {
+        await invoke("stop_sck_recording");
+        // Fetch unified status after stop
+        const result = await invoke<RecordingStatusResult>("get_recording_status");
+        updateRecordingUI(result);
+      } else {
+        const result = await invoke<RecordingStatusResult>("stop_recording");
+        updateRecordingUI(result);
+      }
+      // Refresh recordings list after stopping
+      refreshRecordings();
+    } else if (activePreset === "apps") {
+      // SCK recording: check permission first
+      const perm = await checkScreenRecordingPermission();
+      if (!perm.granted) {
+        const fileEl = document.getElementById("record-file");
+        if (fileEl) fileEl.textContent = "Error: Screen Recording permission not granted. Open System Settings to allow.";
+        return;
+      }
+      const selectedApps = getSelectedApps();
+      if (selectedApps.length === 0) {
+        const fileEl = document.getElementById("record-file");
+        if (fileEl) fileEl.textContent = "Error: No apps selected. Pick at least one app.";
+        return;
+      }
+      const includeMic = (document.getElementById("sck-include-mic") as HTMLInputElement | null)?.checked ?? false;
+      await invoke("start_sck_recording", {
+        appBundleIds: selectedApps,
+        includeMic,
+      });
+      // Fetch unified status
+      const result = await invoke<RecordingStatusResult>("get_recording_status");
       updateRecordingUI(result);
     } else {
       const selected = getSelectedDevices();
@@ -1628,6 +1728,85 @@ async function handleTranscribeClick(btn: HTMLButtonElement, _filePath: string) 
   }
 }
 
+// --- App Picker ---
+
+function getSelectedApps(): string[] {
+  const appList = document.getElementById("app-list");
+  if (!appList) return [];
+  const checks = appList.querySelectorAll<HTMLInputElement>("input[type=checkbox]:checked");
+  return Array.from(checks).map((c) => c.value);
+}
+
+function updateAppToggleLabel() {
+  const btn = document.getElementById("record-app-toggle");
+  if (!btn) return;
+  const selected = getSelectedApps();
+  if (selected.length === 0) {
+    btn.textContent = "Select apps...";
+  } else {
+    btn.textContent = `${selected.length} app${selected.length === 1 ? "" : "s"} selected`;
+  }
+  // Persist
+  localStorage.setItem("record-selected-apps", JSON.stringify(selected));
+}
+
+async function loadCapturableApps() {
+  if (appsLoaded) return;
+  const appList = document.getElementById("app-list");
+  if (!appList) return;
+  try {
+    const apps = await invoke<CapturableApp[]>("list_capturable_apps");
+    renderAppList(apps);
+    appsLoaded = true;
+  } catch (err) {
+    console.error("failed to load capturable apps:", err);
+    appList.textContent = "Could not load apps";
+  }
+}
+
+function renderAppList(apps: CapturableApp[]) {
+  const appList = document.getElementById("app-list");
+  if (!appList) return;
+
+  // Restore saved selection
+  let savedApps: string[] = [];
+  const saved = localStorage.getItem("record-selected-apps");
+  if (saved) {
+    try { savedApps = JSON.parse(saved); } catch { /* ignore */ }
+  }
+
+  appList.innerHTML = "";
+  for (const app of apps) {
+    const label = document.createElement("label");
+    label.className = "record-device-option";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = app.bundleId;
+    if (savedApps.includes(app.bundleId)) cb.checked = true;
+    cb.addEventListener("change", updateAppToggleLabel);
+    label.appendChild(cb);
+    label.append(` ${app.name}`);
+    appList.appendChild(label);
+  }
+  updateAppToggleLabel();
+}
+
+function renderSckPermissionBanner() {
+  const el = document.getElementById("sck-permission-banner");
+  if (!el) return;
+
+  if (sckPermissionStatus && sckPermissionStatus.available && !sckPermissionStatus.granted) {
+    el.innerHTML = `
+      <div class="sck-permission-banner">
+        Screen Recording permission required for per-app capture.
+        <button class="capture-service-btn" id="sck-grant-btn">Open Settings</button>
+      </div>
+    `;
+  } else {
+    el.innerHTML = "";
+  }
+}
+
 let devicesLoaded = false;
 
 function getSelectedDevices(): string[] {
@@ -1771,6 +1950,11 @@ async function refreshCapture() {
   }
 }
 
+async function refreshSckPermission() {
+  sckPermissionStatus = await checkScreenRecordingPermission();
+  renderSckPermissionBanner();
+}
+
 export function pollAudioPanel() {
   if (pollTimers.length > 0) {
     return;
@@ -1789,6 +1973,12 @@ export function pollAudioPanel() {
   refreshRecordings();
   loadInputDevices();
 
+  // Check SCK permission on initial load and periodically
+  if (!sckPermissionChecked) {
+    sckPermissionChecked = true;
+    refreshSckPermission();
+  }
+
   // Staggered intervals — volume/mic poll skips when locked
   pollTimers.push(setInterval(() => { if (!volumeLocked) refreshVolume(); }, 3000));
   pollTimers.push(setInterval(() => { if (!micLocked) refreshMics(); }, 10000));
@@ -1800,6 +1990,8 @@ export function pollAudioPanel() {
   pollTimers.push(setInterval(refreshAudioAssistService, 10000));
   pollTimers.push(setInterval(refreshRecordingStatus, 500));
   pollTimers.push(setInterval(refreshRecordings, 30000));
+  // Re-check SCK permission periodically to auto-hide banner when granted
+  pollTimers.push(setInterval(refreshSckPermission, 10000));
 }
 
 export function stopAudioPanelPolling() {

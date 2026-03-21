@@ -84,6 +84,7 @@ pub struct RecordingStatus {
     pub level_dbfs: f64,
     pub peak_dbfs: f64,
     pub file_size_bytes: u64,
+    pub capture_method: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -156,6 +157,7 @@ impl RecorderState {
             level_dbfs: lvl.momentary_lufs,
             peak_dbfs: lvl.peak_dbfs,
             file_size_bytes: self.total_file_size(),
+            capture_method: "ffmpeg".to_string(),
         }
     }
 
@@ -642,7 +644,33 @@ pub fn list_audio_input_devices() -> Result<Vec<AudioInputDevice>, String> {
 }
 
 #[tauri::command]
-pub fn get_recording_status(recorder: tauri::State<'_, Recorder>) -> RecordingStatus {
+pub fn get_recording_status(
+    recorder: tauri::State<'_, Recorder>,
+    sck_recorder: tauri::State<'_, crate::sck::SckRecorder>,
+) -> RecordingStatus {
+    // Check SCK recorder first — if it's active, return its status
+    {
+        let sck_state = sck_recorder.0.lock().unwrap();
+        let sck_status = crate::sck::get_sck_status_from_state(&sck_state);
+        if sck_status.active {
+            return RecordingStatus {
+                active: true,
+                paused: sck_status.paused,
+                file_path: sck_status.file_path,
+                input_device: if sck_status.app_names.is_empty() {
+                    None
+                } else {
+                    Some(sck_status.app_names.join(", "))
+                },
+                started_at: sck_status.started_at,
+                level_dbfs: sck_status.level_dbfs,
+                peak_dbfs: sck_status.peak_dbfs,
+                file_size_bytes: sck_status.file_size_bytes,
+                capture_method: "sck".to_string(),
+            };
+        }
+    }
+
     let mut state = recorder.0.lock().unwrap();
 
     // Auto-stop if limits exceeded
@@ -674,10 +702,13 @@ fn kill_stale_recording_ffmpeg() {
         .output();
 }
 
-/// Stop any active recording. Called on app exit.
-pub fn stop_active_recording(recorder: &Recorder) {
+/// Stop any active recording (ffmpeg and/or SCK). Called on app exit.
+pub fn stop_active_recording(recorder: &Recorder, sck_recorder: Option<&crate::sck::SckRecorder>) {
     if let Ok(mut state) = recorder.0.lock() {
         state.stop();
+    }
+    if let Some(sck) = sck_recorder {
+        crate::sck::stop_active_sck_recording(sck);
     }
 }
 
@@ -876,6 +907,7 @@ pub fn stop_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingS
         level_dbfs: 0.0,
         peak_dbfs: 0.0,
         file_size_bytes: file_size,
+        capture_method: "ffmpeg".to_string(),
     })
 }
 

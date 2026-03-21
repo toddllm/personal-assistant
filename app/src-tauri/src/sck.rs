@@ -511,6 +511,11 @@ pub fn stop_active_sck_recording(recorder: &SckRecorder) {
     }
 }
 
+/// Get SCK recording status from a locked state reference (used by unified status).
+pub fn get_sck_status_from_state(state: &SckRecorderState) -> SckRecordingStatus {
+    platform::get_recording_status(state)
+}
+
 // ─── Tauri Commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]

@@ -854,6 +854,46 @@ header h1 {
   animation: none;
 }
 
+/* SCK permission banner */
+.sck-permission-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: rgba(0, 188, 212, 0.08);
+  border: 1px solid rgba(0, 188, 212, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #80deea;
+  line-height: 1.4;
+}
+
+.record-app-picker {
+  position: relative;
+}
+
+.record-app-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  margin-top: 4px;
+  padding: 6px 0;
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  min-width: 200px;
+  max-height: 300px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.record-app-dropdown.open {
+  display: block;
+}
+
 .record-device-picker {
   position: relative;
 }
