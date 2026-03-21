@@ -349,7 +349,7 @@ def _update_speaker_volume(slug: str, volume: int) -> None:
     _save_speaker_settings(spk)
 
 
-PROTECTED_MIC_SLUGS = {"bose-qc45"}
+PROTECTED_MIC_SLUGS: set[str] = set()
 
 
 def _normalize_mic_setting(slug: str, data: dict | None = None) -> dict:

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   fetchVolumeDevices,
   fetchSpeakerSettings,
@@ -66,6 +67,9 @@ let latestMicDevices: Record<string, MicDevice> = {};
 let latestAudioRouteStatus: AudioRouteStatus | null = null;
 let audioRouteError: string | null = null;
 let lastAudioAssistHealth: HealthResult | null = null;
+let latestCaptureSources: SourceStatus[] = [];
+let recordingActive = false;
+let recordingBusy = false;
 
 type AudioRouteAction = "restore-defaults" | "disable-bose-mic";
 
@@ -109,7 +113,9 @@ export function renderAudioPanel() {
         </div>
       </div>
       <div class="audio-card" id="mic-panel">
-        <h3 class="audio-card-title">Microphones</h3>
+        <h3 class="audio-card-title">CaptureMic Mix</h3>
+        <div class="mic-panel-hint">Controls audio sent to CaptureMic 2ch (voice chat). Does not stop the Recorder.</div>
+        <div id="recorder-mute-banner"></div>
         <div id="mic-devices">
           <span class="audio-unavailable">loading...</span>
         </div>
@@ -133,6 +139,27 @@ export function renderAudioPanel() {
             <button class="capture-service-btn secondary" id="audio-assist-logs">Logs</button>
           </div>
         </div>
+        <div class="recording-row" id="recording-row">
+          <button class="record-btn" id="record-btn" title="Record audio to file">
+            <span class="record-dot" id="record-dot"></span>
+            <span id="record-label">Record</span>
+          </button>
+          <div class="record-device-picker" id="record-device-picker">
+            <button class="record-device-toggle" id="record-device-toggle" type="button">Default input</button>
+            <div class="record-device-dropdown" id="record-device-dropdown">
+              <label class="record-device-option"><input type="checkbox" value="default" checked /> System default</label>
+            </div>
+          </div>
+          <span class="record-time" id="record-time"></span>
+          <span class="record-size" id="record-size"></span>
+        </div>
+        <div class="record-meter-row" id="record-meter-row" style="display:none">
+          <div class="record-meter-track">
+            <div class="record-meter-fill" id="record-meter-fill"></div>
+          </div>
+          <span class="record-meter-label" id="record-meter-label"></span>
+        </div>
+        <div class="record-file" id="record-file"></div>
         <div id="capture-readiness"></div>
         <div class="capture-subsection">
           <div class="capture-subsection-header">
@@ -559,6 +586,10 @@ function sourceWarning(src: SourceStatus): string {
   if (src.details?.suppressed === "true") {
     return "Manually stopped. This source will stay off until you explicitly ensure defaults or restart it.";
   }
+  if (lowered.includes("desk-mic")) {
+    const device = src.details?.device || "MacBook Pro Microphone";
+    return `Recorder mic: reads directly from ${device}. Muting the CaptureMic mix does not stop this source.`;
+  }
   if (lowered.includes("app-audio")) {
     return "Captures app and desktop playback. Stop this source if background media should not be transcribed.";
   }
@@ -566,6 +597,45 @@ function sourceWarning(src: SourceStatus): string {
     return "Captures routed system output. Verify loopback routing if remote audio should be transcribed.";
   }
   return "";
+}
+
+// --- Recorder / Mic Mute Disagreement Banner ---
+
+function renderRecorderMuteBanner() {
+  const el = document.getElementById("recorder-mute-banner");
+  if (!el) return;
+
+  // Check: are all mics muted/disabled?
+  const micEntries = Object.entries(latestMicDevices);
+  const allMuted = micEntries.length > 0 && micEntries.every(([, d]) => !d.enabled || d.volume === 0);
+
+  // Check: is any desk-mic source still running?
+  const deskMicRunning = latestCaptureSources.some(
+    (s) => s.running && s.source_id.toLowerCase().includes("desk-mic"),
+  );
+
+  if (allMuted && deskMicRunning) {
+    const deskMicId = latestCaptureSources.find(
+      (s) => s.running && s.source_id.toLowerCase().includes("desk-mic"),
+    )?.source_id;
+    el.innerHTML = `
+      <div class="recorder-mute-warning">
+        <span class="recorder-mute-icon">&#9888;</span>
+        <span class="recorder-mute-text">Recorder is still listening via MacBook Pro Microphone even though the mic mix is muted.</span>
+        ${deskMicId ? `<button class="recorder-mute-btn" data-pause-recorder="${deskMicId}">Pause Recorder</button>` : ""}
+      </div>
+    `;
+    // Attach click handler for pause button
+    const btn = el.querySelector("[data-pause-recorder]") as HTMLButtonElement | null;
+    if (btn) {
+      btn.addEventListener("click", () => {
+        const srcId = btn.dataset.pauseRecorder;
+        if (srcId) stopCaptureSourceFromPanel(srcId);
+      });
+    }
+  } else {
+    el.innerHTML = "";
+  }
 }
 
 // --- Capture Readiness ---
@@ -725,10 +795,14 @@ async function refreshCaptureSources() {
       fetchSourceLevels(),
       fetchRecentTranscripts(180, 30),
     ]);
+    latestCaptureSources = statuses;
     renderCaptureSources(statuses, levels, transcripts);
+    renderRecorderMuteBanner();
   } catch {
+    latestCaptureSources = [];
     const el = document.getElementById("capture-sources");
     if (el) el.innerHTML = `<span class="audio-unavailable">capture sources unavailable</span>`;
+    renderRecorderMuteBanner();
   }
 }
 
@@ -837,6 +911,36 @@ export function setupAudioPanelEvents() {
     micTestBtn.disabled = false;
     micTestBtn.textContent = "Test Mic";
     if (statusEl) statusEl.textContent = "";
+  });
+
+  const recordBtn = document.getElementById("record-btn") as HTMLButtonElement | null;
+  recordBtn?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await toggleRecording();
+  });
+
+  // Device picker dropdown toggle
+  const deviceToggle = document.getElementById("record-device-toggle");
+  const deviceDropdown = document.getElementById("record-device-dropdown");
+  deviceToggle?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    deviceDropdown?.classList.toggle("open");
+  });
+  // Close dropdown when clicking outside
+  document.addEventListener("click", () => {
+    deviceDropdown?.classList.remove("open");
+  });
+  document.getElementById("record-device-picker")?.addEventListener("click", (e) => e.stopPropagation());
+
+  // Reveal recording file in Finder (delegated since button is dynamically rendered)
+  document.getElementById("record-file")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (target.classList.contains("record-reveal-btn")) {
+      const path = target.dataset.path;
+      if (path) {
+        revealItemInDir(path).catch((err) => console.error("reveal failed:", err));
+      }
+    }
   });
 
   // Lock poll while the user is dragging a volume slider
@@ -1037,6 +1141,220 @@ export function setupAudioPanelEvents() {
   });
 }
 
+// --- Recording ---
+
+interface RecordingStatusResult {
+  active: boolean;
+  filePath?: string | null;
+  inputDevice?: string | null;
+  startedAt?: string | null;
+  levelDbfs?: number;
+  peakDbfs?: number;
+  fileSizeBytes?: number;
+}
+
+interface AudioInputDevice {
+  index: number;
+  name: string;
+  isDefault: boolean;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function updateRecordingUI(status: RecordingStatusResult) {
+  recordingActive = status.active;
+  const btn = document.getElementById("record-btn");
+  const dot = document.getElementById("record-dot");
+  const label = document.getElementById("record-label");
+  const timeEl = document.getElementById("record-time");
+  const sizeEl = document.getElementById("record-size");
+  const meterRow = document.getElementById("record-meter-row");
+  const meterFill = document.getElementById("record-meter-fill");
+  const meterLabel = document.getElementById("record-meter-label");
+  const fileEl = document.getElementById("record-file");
+  const headerInd = document.getElementById("header-rec-indicator");
+  if (!btn || !dot || !label) return;
+
+  btn.classList.toggle("recording", status.active);
+  dot.classList.toggle("recording", status.active);
+  label.textContent = status.active ? "Stop" : "Record";
+
+  // Disable device picker while recording
+  const deviceToggle = document.getElementById("record-device-toggle") as HTMLButtonElement | null;
+  if (deviceToggle) {
+    deviceToggle.disabled = status.active;
+  }
+
+  // Header recording indicator
+  if (headerInd) {
+    headerInd.classList.toggle("active", status.active);
+  }
+
+  // Elapsed time
+  if (timeEl) {
+    if (status.active && status.startedAt) {
+      const start = new Date(status.startedAt);
+      const elapsed = Math.floor((Date.now() - start.getTime()) / 1000);
+      const h = Math.floor(elapsed / 3600);
+      const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, "0");
+      const s = (elapsed % 60).toString().padStart(2, "0");
+      timeEl.textContent = h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+    } else {
+      timeEl.textContent = "";
+    }
+  }
+
+  // File size
+  if (sizeEl) {
+    const bytes = status.fileSizeBytes ?? 0;
+    sizeEl.textContent = status.active && bytes > 0 ? formatFileSize(bytes) : "";
+  }
+
+  // Level meter
+  if (meterRow && meterFill && meterLabel) {
+    if (status.active) {
+      meterRow.style.display = "flex";
+      const dbfs = status.levelDbfs ?? -60;
+      const pct = Math.max(0, Math.min(100, ((dbfs + 60) / 60) * 100));
+      meterFill.style.width = `${pct}%`;
+      meterFill.classList.toggle("level-green", dbfs < -12);
+      meterFill.classList.toggle("level-yellow", dbfs >= -12 && dbfs < -3);
+      meterFill.classList.toggle("level-red", dbfs >= -3);
+      const peak = status.peakDbfs ?? -60;
+      meterLabel.textContent = `${dbfs.toFixed(1)} dB  pk ${peak.toFixed(1)}`;
+    } else {
+      meterRow.style.display = "none";
+      meterFill.style.width = "0%";
+      meterLabel.textContent = "";
+    }
+  }
+
+  // Saved file / active file
+  if (fileEl) {
+    const path = status.filePath;
+    if (path) {
+      const name = path.split("/").pop() ?? path;
+      if (status.active) {
+        fileEl.innerHTML = `<span class="record-file-name">${name}</span>`;
+      } else {
+        const sizeStr = status.fileSizeBytes ? ` (${formatFileSize(status.fileSizeBytes)})` : "";
+        fileEl.innerHTML = `<span class="record-file-name">${name}${sizeStr}</span> <button class="record-reveal-btn" data-path="${path.replace(/"/g, "&quot;")}">Show in Finder</button>`;
+      }
+    } else {
+      fileEl.textContent = "";
+    }
+  }
+}
+
+async function toggleRecording() {
+  if (recordingBusy) return;
+  recordingBusy = true;
+  const btn = document.getElementById("record-btn") as HTMLButtonElement | null;
+  if (btn) btn.disabled = true;
+
+  try {
+    if (recordingActive) {
+      const result = await invoke<RecordingStatusResult>("stop_recording");
+      updateRecordingUI(result);
+    } else {
+      const selected = getSelectedDevices();
+      const result = await invoke<RecordingStatusResult>("start_recording", {
+        inputDevices: selected.length > 0 ? selected : undefined,
+      });
+      updateRecordingUI(result);
+    }
+  } catch (err) {
+    console.error("recording toggle failed:", err);
+    const fileEl = document.getElementById("record-file");
+    if (fileEl) fileEl.textContent = `Error: ${err}`;
+  } finally {
+    recordingBusy = false;
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function refreshRecordingStatus() {
+  try {
+    const result = await invoke<RecordingStatusResult>("get_recording_status");
+    updateRecordingUI(result);
+  } catch {
+    // silent
+  }
+}
+
+let devicesLoaded = false;
+
+function getSelectedDevices(): string[] {
+  const dropdown = document.getElementById("record-device-dropdown");
+  if (!dropdown) return ["default"];
+  const checks = dropdown.querySelectorAll<HTMLInputElement>("input[type=checkbox]:checked");
+  return Array.from(checks).map((c) => c.value);
+}
+
+function updateDeviceToggleLabel() {
+  const btn = document.getElementById("record-device-toggle");
+  if (!btn) return;
+  const selected = getSelectedDevices();
+  if (selected.length === 0 || (selected.length === 1 && selected[0] === "default")) {
+    btn.textContent = "Default input";
+  } else {
+    const names = selected.map((s) => {
+      // Shorten long names
+      if (s.length > 18) return s.slice(0, 16) + "...";
+      return s;
+    });
+    btn.textContent = names.length === 1 ? names[0] : `${names.length} devices`;
+  }
+  // Persist
+  localStorage.setItem("record-input-devices", JSON.stringify(selected));
+}
+
+async function loadInputDevices() {
+  if (devicesLoaded) return;
+  const dropdown = document.getElementById("record-device-dropdown");
+  if (!dropdown) return;
+  try {
+    const devices = await invoke<AudioInputDevice[]>("list_audio_input_devices");
+    // Default selection: CaptureAudio (system) + CaptureMic (mic)
+    const defaultDevices = new Set(["CaptureAudio 2ch", "CaptureMic 2ch"]);
+    dropdown.innerHTML = "";
+    for (const d of devices) {
+      const label = document.createElement("label");
+      label.className = "record-device-option";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = d.name;
+      if (defaultDevices.has(d.name)) cb.checked = true;
+      cb.addEventListener("change", updateDeviceToggleLabel);
+      label.appendChild(cb);
+      label.append(` ${d.name}${d.isDefault ? " (default)" : ""}`);
+      dropdown.appendChild(label);
+    }
+    // Restore saved selection (only if saved devices exist in current list)
+    const saved = localStorage.getItem("record-input-devices");
+    if (saved) {
+      try {
+        const savedDevices: string[] = JSON.parse(saved);
+        const deviceNames = new Set(devices.map((d) => d.name));
+        const validSaved = savedDevices.filter((s) => deviceNames.has(s));
+        if (validSaved.length > 0) {
+          const allCbs = dropdown.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+          allCbs.forEach((cb) => { cb.checked = validSaved.includes(cb.value); });
+        }
+      } catch { /* ignore */ }
+    }
+    updateDeviceToggleLabel();
+    devicesLoaded = true;
+  } catch (err) {
+    console.error("failed to load input devices:", err);
+  }
+}
+
 // --- Polling ---
 
 async function refreshVolume() {
@@ -1083,11 +1401,13 @@ async function refreshMics() {
     }
     updateMicDevices(devices);
     renderAudioRouteBanner();
+    renderRecorderMuteBanner();
   } catch {
     latestMicDevices = {};
     const el = document.getElementById("mic-devices");
     if (el) el.innerHTML = `<span class="audio-unavailable">mic service unavailable</span>`;
     renderAudioRouteBanner();
+    renderRecorderMuteBanner();
   }
 }
 
@@ -1124,16 +1444,19 @@ export function pollAudioPanel() {
   refreshLevels();
   refreshCapture();
   refreshCaptureSources();
+  refreshRecordingStatus();
+  loadInputDevices();
 
   // Staggered intervals — volume/mic poll skips when locked
-  pollTimers.push(setInterval(() => { if (!volumeLocked) refreshVolume(); }, 1000));
+  pollTimers.push(setInterval(() => { if (!volumeLocked) refreshVolume(); }, 3000));
   pollTimers.push(setInterval(() => { if (!micLocked) refreshMics(); }, 10000));
-  pollTimers.push(setInterval(refreshAudioRouteStatus, 5000));
-  pollTimers.push(setInterval(refreshMicLevels, 500));  // fast poll for live meters
-  pollTimers.push(setInterval(refreshLevels, 1000));
+  pollTimers.push(setInterval(refreshAudioRouteStatus, 10000));
+  pollTimers.push(setInterval(refreshMicLevels, 2000));
+  pollTimers.push(setInterval(refreshLevels, 3000));
   pollTimers.push(setInterval(refreshCapture, 15000));
-  pollTimers.push(setInterval(refreshCaptureSources, 3000));
-  pollTimers.push(setInterval(refreshAudioAssistService, 5000));
+  pollTimers.push(setInterval(refreshCaptureSources, 10000));
+  pollTimers.push(setInterval(refreshAudioAssistService, 10000));
+  pollTimers.push(setInterval(refreshRecordingStatus, 2000));
 }
 
 export function stopAudioPanelPolling() {

@@ -27,6 +27,25 @@ header h1 {
   color: #e94560;
 }
 
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.header-rec-indicator {
+  display: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ff5252;
+  animation: record-pulse 1.2s ease-in-out infinite;
+}
+
+.header-rec-indicator.active {
+  display: inline-block;
+}
+
 #clock {
   font-size: 13px;
   color: #888;
@@ -701,6 +720,227 @@ header h1 {
   color: #888;
 }
 
+/* --- Recording Button --- */
+
+.recording-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+  margin-bottom: 4px;
+}
+
+.record-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 5px 12px;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.record-btn:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
+.record-btn.recording {
+  background: rgba(255, 82, 82, 0.15);
+  border-color: #ff5252;
+  color: #ff5252;
+}
+
+.record-btn.recording:hover {
+  background: rgba(255, 82, 82, 0.25);
+}
+
+.record-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.record-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #888;
+  flex-shrink: 0;
+}
+
+.record-dot.recording {
+  background: #ff5252;
+  animation: record-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes record-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.record-device-picker {
+  position: relative;
+}
+
+.record-device-toggle {
+  font-size: 10px;
+  padding: 3px 8px;
+  border: 1px solid #0f3460;
+  border-radius: 3px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-device-toggle:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
+.record-device-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.record-device-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 100;
+  margin-top: 4px;
+  padding: 6px 0;
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  min-width: 200px;
+  max-height: 240px;
+  overflow-y: auto;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.record-device-dropdown.open {
+  display: block;
+}
+
+.record-device-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #c4cade;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.record-device-option:hover {
+  background: rgba(15, 52, 96, 0.6);
+}
+
+.record-device-option input[type="checkbox"] {
+  accent-color: #e94560;
+}
+
+.record-time {
+  font-size: 11px;
+  color: #ccc;
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+}
+
+.record-size {
+  font-size: 10px;
+  color: #888;
+  font-variant-numeric: tabular-nums;
+}
+
+.record-meter-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  margin-bottom: 2px;
+}
+
+.record-meter-track {
+  flex: 1;
+  height: 6px;
+  background: #0d1117;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.record-meter-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.15s ease-out;
+  width: 0;
+}
+
+.record-meter-fill.level-green {
+  background: #00e676;
+}
+
+.record-meter-fill.level-yellow {
+  background: #ffc107;
+}
+
+.record-meter-fill.level-red {
+  background: #ff5252;
+}
+
+.record-meter-label {
+  font-size: 10px;
+  color: #888;
+  font-variant-numeric: tabular-nums;
+  min-width: 110px;
+  text-align: right;
+}
+
+.record-file {
+  font-size: 10px;
+  color: #888;
+  margin-top: 3px;
+  min-height: 14px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.record-file-name {
+  color: #aaa;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-reveal-btn {
+  font-size: 10px;
+  padding: 1px 6px;
+  border: 1px solid #0f3460;
+  border-radius: 3px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.record-reveal-btn:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
 .capture-subsection {
   margin-top: 10px;
 }
@@ -792,6 +1032,49 @@ header h1 {
   margin-top: 6px;
   font-size: 11px;
   color: #f3c1ca;
+}
+
+/* Mic panel hint text */
+.mic-panel-hint {
+  font-size: 11px;
+  color: #8899aa;
+  margin-bottom: 8px;
+  line-height: 1.4;
+}
+
+/* Recorder-still-listening warning banner */
+.recorder-mute-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  background: rgba(255, 170, 50, 0.12);
+  border: 1px solid rgba(255, 170, 50, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  color: #ffcc66;
+  line-height: 1.4;
+}
+.recorder-mute-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+.recorder-mute-text {
+  flex: 1;
+}
+.recorder-mute-btn {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 4px 10px;
+  border: 1px solid rgba(255, 170, 50, 0.4);
+  border-radius: 4px;
+  background: rgba(255, 170, 50, 0.15);
+  color: #ffcc66;
+  cursor: pointer;
+}
+.recorder-mute-btn:hover {
+  background: rgba(255, 170, 50, 0.25);
 }
 
 .capture-source-actions {

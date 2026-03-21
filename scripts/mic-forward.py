@@ -84,9 +84,7 @@ def _slugify(name: str) -> str:
     return name.lower().replace(" ", "-")
 
 
-PROTECTED_MIC_SLUGS = {
-    _slugify(str(settings.capture_autostart_bose_mic_device or "Bose QC45")),
-}
+PROTECTED_MIC_SLUGS: set[str] = set()
 
 
 def _normalize_mic_setting(slug: str, data: dict | None = None) -> dict:

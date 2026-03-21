@@ -30,7 +30,15 @@ fn show_webview_window(window: &tauri::WebviewWindow) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .pool_max_idle_per_host(4)
+        .build()
+        .expect("failed to build HTTP client");
+
     tauri::Builder::default()
+        .manage(commands::HttpClient(http_client))
+        .manage(commands::Recorder(std::sync::Mutex::new(commands::RecorderState::new())))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -124,7 +132,19 @@ pub fn run() {
             commands::restore_capture_audio_defaults,
             commands::get_microphone_permission_status,
             commands::request_microphone_permission,
+            commands::get_recording_status,
+            commands::start_recording,
+            commands::stop_recording,
+            commands::list_audio_input_devices,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Gracefully stop any active recording on app exit
+                if let Some(recorder) = app.try_state::<commands::Recorder>() {
+                    commands::stop_active_recording(&recorder);
+                }
+            }
+        });
 }

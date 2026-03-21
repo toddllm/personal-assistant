@@ -23,3 +23,5 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["process", "io-util"] }
 block2 = "0.6.2"
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
+chrono = "0.4"
+regex = "1"

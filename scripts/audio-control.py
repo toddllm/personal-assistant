@@ -100,7 +100,7 @@ def _slugify(name: str) -> str:
     return name.lower().replace(" ", "-")
 
 
-PROTECTED_MIC_SLUGS = {_slugify("Bose QC45")}
+PROTECTED_MIC_SLUGS: set[str] = set()
 
 
 def _normalize_mic_setting(slug: str, data: dict | None = None) -> dict:

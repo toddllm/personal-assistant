@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
+
+pub struct HttpClient(pub reqwest::Client);
 
 #[cfg(target_os = "macos")]
 use block2::RcBlock;
@@ -62,6 +64,119 @@ pub struct MediaPermissionStatus {
     pub granted: bool,
     pub can_prompt: bool,
 }
+
+// --- Audio Recording ---
+
+#[derive(Debug, Default)]
+struct RecordingLevels {
+    momentary_lufs: f64,
+    peak_dbfs: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingStatus {
+    pub active: bool,
+    pub file_path: Option<String>,
+    pub input_device: Option<String>,
+    pub started_at: Option<String>,
+    pub level_dbfs: f64,
+    pub peak_dbfs: f64,
+    pub file_size_bytes: u64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioInputDevice {
+    pub index: usize,
+    pub name: String,
+    pub is_default: bool,
+}
+
+// Max recording limits
+const MAX_RECORDING_DURATION_SECS: u64 = 4 * 3600; // 4 hours
+const MAX_RECORDING_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
+
+struct RecordingTrack {
+    child: std::process::Child,
+    file_path: String,
+    device_name: String,
+}
+
+pub struct RecorderState {
+    tracks: Vec<RecordingTrack>,
+    started_at: Option<String>,
+    levels: Arc<Mutex<RecordingLevels>>,
+}
+
+impl RecorderState {
+    pub fn new() -> Self {
+        Self {
+            tracks: Vec::new(),
+            started_at: None,
+            levels: Arc::new(Mutex::new(RecordingLevels::default())),
+        }
+    }
+
+    fn total_file_size(&self) -> u64 {
+        self.tracks
+            .iter()
+            .map(|t| std::fs::metadata(&t.file_path).map(|m| m.len()).unwrap_or(0))
+            .sum()
+    }
+
+    fn primary_file_path(&self) -> Option<String> {
+        self.tracks.first().map(|t| t.file_path.clone())
+    }
+
+    fn device_names(&self) -> Option<String> {
+        if self.tracks.is_empty() {
+            return None;
+        }
+        Some(
+            self.tracks
+                .iter()
+                .map(|t| t.device_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+
+    fn status(&self) -> RecordingStatus {
+        let lvl = self.levels.lock().unwrap();
+        RecordingStatus {
+            active: !self.tracks.is_empty(),
+            file_path: self.primary_file_path(),
+            input_device: self.device_names(),
+            started_at: self.started_at.clone(),
+            level_dbfs: lvl.momentary_lufs,
+            peak_dbfs: lvl.peak_dbfs,
+            file_size_bytes: self.total_file_size(),
+        }
+    }
+
+    /// Stop all recording processes gracefully. Returns true if any were active.
+    pub fn stop(&mut self) -> bool {
+        if self.tracks.is_empty() {
+            return false;
+        }
+        for track in &mut self.tracks {
+            if let Some(ref mut stdin) = track.child.stdin {
+                use std::io::Write;
+                let _ = stdin.write_all(b"q");
+            }
+        }
+        for track in &mut self.tracks {
+            let _ = track.child.wait();
+        }
+        self.tracks.clear();
+        self.started_at = None;
+        self.levels = Arc::new(Mutex::new(RecordingLevels::default()));
+        true
+    }
+}
+
+pub struct Recorder(pub Mutex<RecorderState>);
 
 fn monorepo_root() -> PathBuf {
     let manifest = env!("CARGO_MANIFEST_DIR");
@@ -166,19 +281,16 @@ fn read_microphone_permission_status() -> Result<MediaPermissionStatus, String> 
 
 #[tauri::command]
 pub async fn check_health(
+    http: tauri::State<'_, HttpClient>,
     service_id: String,
     port: u16,
     health_endpoint: Option<String>,
-) -> HealthResult {
+) -> Result<HealthResult, String> {
+    let client = http.0.clone();
     let endpoint = health_endpoint.unwrap_or_else(|| "/health".to_string());
     let url = format!("http://127.0.0.1:{}{}", port, endpoint);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap_or_default();
-
-    match client.get(&url).send().await {
+    Ok(match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => HealthResult {
             service_id,
             status: "green".to_string(),
@@ -205,7 +317,7 @@ pub async fn check_health(
                 },
             }
         }
-    }
+    })
 }
 
 #[tauri::command]
@@ -306,6 +418,8 @@ pub async fn service_control(
 
 #[tauri::command]
 pub fn read_log_tail(log_file: String, lines: usize) -> Result<String, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
     let root = monorepo_root();
     let path = root.join(&log_file);
 
@@ -313,9 +427,30 @@ pub fn read_log_tail(log_file: String, lines: usize) -> Result<String, String> {
         return Ok(format!("(no log file: {})", log_file));
     }
 
-    let file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
-    let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+
+    if file_len == 0 {
+        return Ok(String::new());
+    }
+
+    // Read at most 64 KB from the end — plenty for 80 lines
+    let read_size: u64 = 65_536;
+    let start_pos = file_len.saturating_sub(read_size);
+    file.seek(SeekFrom::Start(start_pos)).map_err(|e| e.to_string())?;
+
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+
+    // If we started mid-file, drop the first partial line
+    if start_pos > 0 {
+        if let Some(pos) = buf.find('\n') {
+            buf = buf[pos + 1..].to_string();
+        }
+    }
+
+    // Take last N lines
+    let all_lines: Vec<&str> = buf.lines().collect();
     let start = all_lines.len().saturating_sub(lines);
     Ok(all_lines[start..].join("\n"))
 }
@@ -336,6 +471,7 @@ pub fn get_monorepo_root() -> String {
 
 #[tauri::command]
 pub async fn fetch_local_api(
+    http: tauri::State<'_, HttpClient>,
     url: String,
     method: Option<String>,
     body: Option<String>,
@@ -345,11 +481,7 @@ pub async fn fetch_local_api(
         return Err("only localhost URLs allowed".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| e.to_string())?;
-
+    let client = http.0.clone();
     let method_str = method.unwrap_or_else(|| "GET".to_string());
     let req = match method_str.to_uppercase().as_str() {
         "POST" => {
@@ -359,6 +491,7 @@ pub async fn fetch_local_api(
             }
             r
         }
+        "DELETE" => client.delete(&url),
         _ => client.get(&url),
     };
 
@@ -426,4 +559,259 @@ pub fn request_microphone_permission() -> Result<MediaPermissionStatus, String> 
     {
         Ok(microphone_permission_status_for_state("unsupported", false, false))
     }
+}
+
+// --- Audio Recording Commands ---
+
+fn default_recordings_dir() -> PathBuf {
+    monorepo_root().join("data").join("recordings")
+}
+
+#[tauri::command]
+pub fn list_audio_input_devices() -> Result<Vec<AudioInputDevice>, String> {
+    let output = Command::new("ffmpeg")
+        .args(["-f", "avfoundation", "-list_devices", "true", "-i", ""])
+        .output()
+        .map_err(|e| format!("failed to run ffmpeg: {}", e))?;
+
+    // ffmpeg prints device list to stderr
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let default_input = current_audio_device("input").ok().flatten();
+
+    let mut devices = Vec::new();
+    let mut in_audio = false;
+    // Lines: "[AVFoundation indev @ 0x...] [0] CaptureAudio 2ch"
+    let re = regex::Regex::new(r"\] \[(\d+)\] (.+)$").unwrap();
+    for line in stderr.lines() {
+        if line.contains("AVFoundation audio devices:") {
+            in_audio = true;
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        // Stop if we hit an error line (end of device list)
+        if line.contains("Error") || (!line.contains('[') && !line.trim().is_empty()) {
+            break;
+        }
+        if let Some(caps) = re.captures(line) {
+            let index: usize = caps[1].parse().unwrap_or(0);
+            let name = caps[2].trim().to_string();
+            let is_default = default_input.as_deref() == Some(&name);
+            devices.push(AudioInputDevice { index, name, is_default });
+        }
+    }
+    Ok(devices)
+}
+
+#[tauri::command]
+pub fn get_recording_status(recorder: tauri::State<'_, Recorder>) -> RecordingStatus {
+    let mut state = recorder.0.lock().unwrap();
+
+    // Auto-stop if limits exceeded
+    if !state.tracks.is_empty() {
+        let should_stop = {
+            let size = state.total_file_size();
+            let duration_exceeded = state.started_at.as_ref().map_or(false, |s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|start| {
+                        let elapsed = chrono::Local::now().signed_duration_since(start);
+                        elapsed.num_seconds() as u64 > MAX_RECORDING_DURATION_SECS
+                    })
+                    .unwrap_or(false)
+            });
+            size > MAX_RECORDING_FILE_BYTES || duration_exceeded
+        };
+        if should_stop {
+            state.stop();
+        }
+    }
+
+    state.status()
+}
+
+fn kill_stale_recording_ffmpeg() {
+    // Kill any orphaned ffmpeg processes from prior app sessions
+    let _ = Command::new("pkill")
+        .args(["-f", "ffmpeg.*avfoundation.*data/recordings"])
+        .output();
+}
+
+/// Stop any active recording. Called on app exit.
+pub fn stop_active_recording(recorder: &Recorder) {
+    if let Ok(mut state) = recorder.0.lock() {
+        state.stop();
+    }
+}
+
+fn resolve_device_name(device: &str) -> String {
+    if device == "default" {
+        // Try to resolve the actual default input device name
+        current_audio_device("input")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| device.to_string())
+    } else {
+        device.to_string()
+    }
+}
+
+fn spawn_level_reader(stderr: std::process::ChildStderr, levels: Arc<Mutex<RecordingLevels>>) {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            // Parse ebur128 output: "... M: -20.3 S: ... FTPK: -10.2 -10.2 dBFS ..."
+            if !line.contains("Parsed_ebur128") {
+                continue;
+            }
+            let mut m_val = None;
+            let mut p_val = None;
+
+            if let Some(pos) = line.find("M:") {
+                let after = &line[pos + 2..];
+                let token = after.trim_start().split_whitespace().next().unwrap_or("");
+                m_val = token.parse::<f64>().ok();
+            }
+            if let Some(pos) = line.find("FTPK:") {
+                let after = &line[pos + 5..];
+                let token = after.trim_start().split_whitespace().next().unwrap_or("");
+                p_val = token.parse::<f64>().ok();
+            }
+
+            if m_val.is_some() || p_val.is_some() {
+                if let Ok(mut lvl) = levels.lock() {
+                    if let Some(m) = m_val {
+                        lvl.momentary_lufs = m;
+                    }
+                    if let Some(p) = p_val {
+                        lvl.peak_dbfs = p;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn start_recording(
+    recorder: tauri::State<'_, Recorder>,
+    input_devices: Option<Vec<String>>,
+    output_dir: Option<String>,
+) -> Result<RecordingStatus, String> {
+    let mut state = recorder.0.lock().unwrap();
+    if !state.tracks.is_empty() {
+        return Err("recording already in progress".to_string());
+    }
+
+    // Clean up any orphaned ffmpeg recording processes from prior app sessions
+    kill_stale_recording_ffmpeg();
+
+    let dir = output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(default_recordings_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create recordings directory: {}", e))?;
+
+    let devices = input_devices
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| vec!["default".to_string()]);
+
+    let now = chrono::Local::now();
+    let timestamp = now.format("%Y-%m-%d_%H%M%S");
+    let levels = Arc::new(Mutex::new(RecordingLevels::default()));
+    let mut first_error: Option<String> = None;
+
+    for (i, device_arg) in devices.iter().enumerate() {
+        let device_display = resolve_device_name(device_arg);
+        let suffix = if devices.len() > 1 {
+            // Sanitize device name for filename
+            let safe: String = device_display
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                .collect();
+            format!("__{}", safe)
+        } else {
+            String::new()
+        };
+        let filename = format!("recording_{}{}.wav", timestamp, suffix);
+        let file_path = dir.join(&filename);
+
+        // Only attach ebur128 level reader to the first track
+        let use_ebur128 = i == 0;
+        let af_arg = if use_ebur128 { "ebur128=peak=true" } else { "anull" };
+
+        let mut child = match Command::new("ffmpeg")
+            .args([
+                "-f", "avfoundation",
+                "-i", &format!(":{}", device_arg),
+                "-af", af_arg,
+                "-ac", "1",
+                "-ar", "48000",
+                "-sample_fmt", "s16",
+                "-y",
+                file_path.to_str().unwrap(),
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("failed to start ffmpeg for {}: {}", device_display, e));
+                }
+                continue;
+            }
+        };
+
+        if use_ebur128 {
+            if let Some(stderr) = child.stderr.take() {
+                spawn_level_reader(stderr, Arc::clone(&levels));
+            }
+        }
+
+        state.tracks.push(RecordingTrack {
+            child,
+            file_path: file_path.to_string_lossy().to_string(),
+            device_name: device_display,
+        });
+    }
+
+    if state.tracks.is_empty() {
+        return Err(first_error.unwrap_or_else(|| "no devices to record from".to_string()));
+    }
+
+    state.started_at = Some(now.to_rfc3339());
+    state.levels = levels;
+
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn stop_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingStatus, String> {
+    let mut state = recorder.0.lock().unwrap();
+    // Capture info before stopping
+    let file_path = state.primary_file_path();
+    let device_names = state.device_names();
+    let file_size = state.total_file_size();
+
+    if !state.stop() {
+        return Err("no recording in progress".to_string());
+    }
+
+    Ok(RecordingStatus {
+        active: false,
+        file_path,
+        input_device: device_names,
+        started_at: None,
+        level_dbfs: 0.0,
+        peak_dbfs: 0.0,
+        file_size_bytes: file_size,
+    })
 }
