@@ -148,12 +148,15 @@ pub fn run() {
             commands::get_recording_status,
             commands::start_recording,
             commands::stop_recording,
+            commands::pause_recording,
+            commands::resume_recording,
             commands::list_audio_input_devices,
             commands::get_recording_output_dir,
             commands::set_recording_output_dir,
             commands::reveal_recording_output_dir,
             commands::list_recordings,
             commands::delete_recording,
+            commands::rename_recording,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

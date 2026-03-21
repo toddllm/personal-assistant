@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
@@ -145,6 +145,12 @@ export function renderAudioPanel() {
             <span class="record-dot" id="record-dot"></span>
             <span id="record-label">Record</span>
           </button>
+          <button class="pause-btn" id="pause-btn" style="display:none">Pause</button>
+          <div class="record-presets" id="record-presets">
+            <button class="record-preset-btn" data-preset="mic">Mic</button>
+            <button class="record-preset-btn" data-preset="system">System</button>
+            <button class="record-preset-btn active" data-preset="both">Both</button>
+          </div>
           <div class="record-device-picker" id="record-device-picker">
             <button class="record-device-toggle" id="record-device-toggle" type="button">Default input</button>
             <div class="record-device-dropdown" id="record-device-dropdown">
@@ -935,6 +941,36 @@ export function setupAudioPanelEvents() {
     await toggleRecording();
   });
 
+  // Pause / Resume button
+  const pauseBtn = document.getElementById("pause-btn") as HTMLButtonElement | null;
+  pauseBtn?.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    await togglePauseRecording();
+  });
+
+  // Preset buttons (delegated)
+  document.getElementById("record-presets")?.addEventListener("click", (event) => {
+    const target = event.target as HTMLElement;
+    if (!target.classList.contains("record-preset-btn")) return;
+    const preset = target.dataset.preset;
+    if (!preset) return;
+    // Uncheck all device checkboxes
+    const dropdown = document.getElementById("record-device-dropdown");
+    if (!dropdown) return;
+    const allCbs = dropdown.querySelectorAll<HTMLInputElement>("input[type=checkbox]");
+    allCbs.forEach((cb) => { cb.checked = false; });
+    // Check the appropriate ones
+    allCbs.forEach((cb) => {
+      if (preset === "mic" && cb.value === "CaptureMic 2ch") cb.checked = true;
+      if (preset === "system" && cb.value === "CaptureAudio 2ch") cb.checked = true;
+      if (preset === "both" && (cb.value === "CaptureAudio 2ch" || cb.value === "CaptureMic 2ch")) cb.checked = true;
+    });
+    updateDeviceToggleLabel();
+    // Update active class
+    document.querySelectorAll(".record-preset-btn").forEach((b) => b.classList.remove("active"));
+    target.classList.add("active");
+  });
+
   // Device picker dropdown toggle
   const deviceToggle = document.getElementById("record-device-toggle");
   const deviceDropdown = document.getElementById("record-device-dropdown");
@@ -993,12 +1029,26 @@ export function setupAudioPanelEvents() {
       const name = target.dataset.name || "this recording";
       if (path && confirm(`Delete "${name}"?`)) {
         try {
+          if (currentPlayingPath === path) stopCurrentAudio();
           await invoke("delete_recording", { filePath: path });
           refreshRecordings();
         } catch (err) {
           console.error("delete recording failed:", err);
         }
       }
+    }
+    if (target.classList.contains("recording-play-btn")) {
+      const path = target.dataset.path;
+      if (path) handlePlayClick(path);
+    }
+    if (target.classList.contains("recording-rename-btn")) {
+      const path = target.dataset.path;
+      const name = target.dataset.name || "";
+      if (path) handleRenameClick(path, name);
+    }
+    if (target.classList.contains("recording-transcribe-btn")) {
+      const path = target.dataset.path;
+      if (path) handleTranscribeClick(target as HTMLButtonElement, path);
     }
   });
 
@@ -1209,6 +1259,7 @@ export function setupAudioPanelEvents() {
 
 interface RecordingStatusResult {
   active: boolean;
+  paused: boolean;
   filePath?: string | null;
   inputDevice?: string | null;
   startedAt?: string | null;
@@ -1250,17 +1301,33 @@ function updateRecordingUI(status: RecordingStatusResult) {
   const meterLabel = document.getElementById("record-meter-label");
   const fileEl = document.getElementById("record-file");
   const headerInd = document.getElementById("header-rec-indicator");
+  const pauseBtn = document.getElementById("pause-btn") as HTMLButtonElement | null;
   if (!btn || !dot || !label) return;
 
   btn.classList.toggle("recording", status.active);
-  dot.classList.toggle("recording", status.active);
+  dot.classList.toggle("recording", status.active && !status.paused);
+  dot.classList.toggle("paused", status.active && status.paused);
   label.textContent = status.active ? "Stop" : "Record";
 
-  // Disable device picker while recording
+  // Pause/Resume button visibility and label
+  if (pauseBtn) {
+    if (status.active) {
+      pauseBtn.style.display = "";
+      pauseBtn.textContent = status.paused ? "Resume" : "Pause";
+      pauseBtn.classList.toggle("paused", status.paused);
+    } else {
+      pauseBtn.style.display = "none";
+    }
+  }
+
+  // Disable device picker and presets while recording
   const deviceToggle = document.getElementById("record-device-toggle") as HTMLButtonElement | null;
   if (deviceToggle) {
     deviceToggle.disabled = status.active;
   }
+  document.querySelectorAll<HTMLButtonElement>(".record-preset-btn").forEach((b) => {
+    b.disabled = status.active;
+  });
 
   // Header recording indicator
   if (headerInd) {
@@ -1270,12 +1337,19 @@ function updateRecordingUI(status: RecordingStatusResult) {
   // Elapsed time
   if (timeEl) {
     if (status.active && status.startedAt) {
-      const start = new Date(status.startedAt);
-      const elapsed = Math.floor((Date.now() - start.getTime()) / 1000);
-      const h = Math.floor(elapsed / 3600);
-      const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, "0");
-      const s = (elapsed % 60).toString().padStart(2, "0");
-      timeEl.textContent = h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+      if (status.paused) {
+        // Freeze time display, append PAUSED
+        const existing = timeEl.textContent || "";
+        const timeOnly = existing.replace(" PAUSED", "");
+        timeEl.textContent = timeOnly + " PAUSED";
+      } else {
+        const start = new Date(status.startedAt);
+        const elapsed = Math.floor((Date.now() - start.getTime()) / 1000);
+        const h = Math.floor(elapsed / 3600);
+        const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, "0");
+        const s = (elapsed % 60).toString().padStart(2, "0");
+        timeEl.textContent = h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+      }
     } else {
       timeEl.textContent = "";
     }
@@ -1353,6 +1427,22 @@ async function toggleRecording() {
   }
 }
 
+async function togglePauseRecording() {
+  const pauseBtn = document.getElementById("pause-btn") as HTMLButtonElement | null;
+  if (!pauseBtn || recordingBusy) return;
+  pauseBtn.disabled = true;
+  try {
+    const isPaused = pauseBtn.classList.contains("paused");
+    const cmd = isPaused ? "resume_recording" : "pause_recording";
+    const result = await invoke<RecordingStatusResult>(cmd);
+    updateRecordingUI(result);
+  } catch (err) {
+    console.error("pause/resume failed:", err);
+  } finally {
+    if (pauseBtn) pauseBtn.disabled = false;
+  }
+}
+
 async function refreshRecordingStatus() {
   try {
     const result = await invoke<RecordingStatusResult>("get_recording_status");
@@ -1413,20 +1503,128 @@ async function refreshRecordings() {
         const dur =
           r.durationSeconds != null ? formatDuration(r.durationSeconds) : "";
         const escapedPath = r.filePath.replace(/"/g, "&quot;");
+        const escapedName = r.fileName.replace(/"/g, "&quot;");
+        const isWav = r.fileName.toLowerCase().endsWith(".wav");
+        const isPlaying = currentPlayingPath === r.filePath;
         return `<div class="recording-item">
           <div class="recording-item-info">
             <span class="recording-item-name">${r.fileName}</span>
             <span class="recording-item-meta">${size}${dur ? " \u00b7 " + dur : ""} \u00b7 ${dateStr}</span>
           </div>
           <div class="recording-item-actions">
+            <button class="recording-play-btn" data-path="${escapedPath}" data-name="${escapedName}" title="Play recording">${isPlaying ? "Stop" : "Play"}</button>
+            <button class="recording-rename-btn" data-path="${escapedPath}" data-name="${escapedName}" title="Rename recording">Rename</button>
+            ${isWav ? `<button class="recording-transcribe-btn" data-path="${escapedPath}" data-name="${escapedName}" title="Transcribe recording">Transcribe</button>` : ""}
             <button class="recording-reveal-btn" data-path="${escapedPath}" title="Show in Finder">Finder</button>
-            <button class="recording-delete-btn" data-path="${escapedPath}" data-name="${r.fileName.replace(/"/g, "&quot;")}" title="Delete recording">Del</button>
+            <button class="recording-delete-btn" data-path="${escapedPath}" data-name="${escapedName}" title="Delete recording">Del</button>
           </div>
         </div>`;
       })
       .join("");
   } catch {
     el.innerHTML = `<span class="audio-unavailable">could not list recordings</span>`;
+  }
+}
+
+// --- Issue #45: In-app audio playback ---
+let currentAudio: HTMLAudioElement | null = null;
+let currentPlayingPath: string | null = null;
+
+function stopCurrentAudio() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.src = "";
+    currentAudio = null;
+  }
+  currentPlayingPath = null;
+}
+
+function handlePlayClick(path: string) {
+  if (currentPlayingPath === path) {
+    // Already playing this file — stop it
+    stopCurrentAudio();
+    refreshRecordings();
+    return;
+  }
+
+  stopCurrentAudio();
+  const assetUrl = convertFileSrc(path);
+  const audio = new Audio(assetUrl);
+  currentAudio = audio;
+  currentPlayingPath = path;
+
+  audio.addEventListener("ended", () => {
+    if (currentAudio === audio) {
+      currentPlayingPath = null;
+      currentAudio = null;
+      refreshRecordings();
+    }
+  });
+
+  audio.addEventListener("error", () => {
+    if (currentAudio === audio) {
+      currentPlayingPath = null;
+      currentAudio = null;
+      refreshRecordings();
+    }
+  });
+
+  audio.play().catch(() => {
+    currentPlayingPath = null;
+    currentAudio = null;
+    refreshRecordings();
+  });
+
+  refreshRecordings();
+}
+
+// --- Issue #46: Rename recording handler ---
+
+async function handleRenameClick(oldPath: string, currentName: string) {
+  // Strip extension for prompt default
+  const dotIdx = currentName.lastIndexOf(".");
+  const baseName = dotIdx > 0 ? currentName.substring(0, dotIdx) : currentName;
+  const newName = prompt("Enter new name for recording:", baseName);
+  if (newName === null || newName.trim() === "" || newName.trim() === baseName) {
+    return;
+  }
+  try {
+    await invoke<string>("rename_recording", { oldPath, newName: newName.trim() });
+    // If the renamed file was playing, stop playback
+    if (currentPlayingPath === oldPath) {
+      stopCurrentAudio();
+    }
+    await refreshRecordings();
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    alert("Failed to rename: " + msg);
+  }
+}
+
+// --- Issue #47: Transcribe recording handler ---
+
+async function handleTranscribeClick(btn: HTMLButtonElement, _filePath: string) {
+  btn.disabled = true;
+  btn.textContent = "Transcribing...";
+  try {
+    // TODO: pass _filePath to a dedicated single-file transcription endpoint when available
+    const body = JSON.stringify({ source_id: null, since_seconds: 3600, limit: 30, apply: true });
+    await invoke<string>("fetch_local_api", {
+      url: "http://127.0.0.1:8787/v1/transcripts/postprocess",
+      method: "POST",
+      body,
+    });
+    btn.textContent = "Sent";
+    setTimeout(() => {
+      btn.textContent = "Transcribe";
+      btn.disabled = false;
+    }, 3000);
+  } catch {
+    btn.textContent = "Error";
+    setTimeout(() => {
+      btn.textContent = "Transcribe";
+      btn.disabled = false;
+    }, 3000);
   }
 }
 

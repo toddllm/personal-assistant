@@ -783,6 +783,77 @@ header h1 {
   50% { opacity: 0.3; }
 }
 
+/* Record presets */
+.record-presets {
+  display: flex;
+  gap: 4px;
+}
+
+.record-preset-btn {
+  font-size: 10px;
+  padding: 3px 8px;
+  border: 1px solid #0f3460;
+  border-radius: 999px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.record-preset-btn:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
+.record-preset-btn.active {
+  background: rgba(233, 69, 96, 0.18);
+  border-color: #e94560;
+  color: #e94560;
+}
+
+.record-preset-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Pause/Resume button */
+.pause-btn {
+  font-size: 11px;
+  padding: 5px 10px;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.pause-btn:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
+.pause-btn.paused {
+  background: rgba(255, 152, 0, 0.15);
+  border-color: #ff9800;
+  color: #ff9800;
+}
+
+.pause-btn.paused:hover {
+  background: rgba(255, 152, 0, 0.25);
+}
+
+.pause-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Paused recording dot */
+.record-dot.paused {
+  background: #ff9800;
+  animation: none;
+}
+
 .record-device-picker {
   position: relative;
 }
@@ -1814,4 +1885,64 @@ header h1 {
   color: #8b949e;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+/* --- Issue #45: Play button --- */
+.recording-play-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.recording-play-btn:hover {
+  background: #0f3460;
+  border-color: #00bcd4;
+  color: #00bcd4;
+}
+
+/* --- Issue #46: Rename button --- */
+.recording-rename-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.recording-rename-btn:hover {
+  background: #0f3460;
+  border-color: #e94560;
+}
+
+/* --- Issue #47: Transcribe button --- */
+.recording-transcribe-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid rgba(0, 230, 118, 0.3);
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #00e676;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.recording-transcribe-btn:hover {
+  background: rgba(0, 230, 118, 0.1);
+  border-color: #00e676;
+}
+
+.recording-transcribe-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+  border-color: #555;
+  color: #888;
+  background: rgba(85, 85, 85, 0.1);
 }

@@ -77,6 +77,7 @@ struct RecordingLevels {
 #[serde(rename_all = "camelCase")]
 pub struct RecordingStatus {
     pub active: bool,
+    pub paused: bool,
     pub file_path: Option<String>,
     pub input_device: Option<String>,
     pub started_at: Option<String>,
@@ -107,6 +108,7 @@ pub struct RecorderState {
     tracks: Vec<RecordingTrack>,
     started_at: Option<String>,
     levels: Arc<Mutex<RecordingLevels>>,
+    paused: bool,
 }
 
 impl RecorderState {
@@ -115,6 +117,7 @@ impl RecorderState {
             tracks: Vec::new(),
             started_at: None,
             levels: Arc::new(Mutex::new(RecordingLevels::default())),
+            paused: false,
         }
     }
 
@@ -146,6 +149,7 @@ impl RecorderState {
         let lvl = self.levels.lock().unwrap();
         RecordingStatus {
             active: !self.tracks.is_empty(),
+            paused: self.paused,
             file_path: self.primary_file_path(),
             input_device: self.device_names(),
             started_at: self.started_at.clone(),
@@ -159,6 +163,14 @@ impl RecorderState {
     pub fn stop(&mut self) -> bool {
         if self.tracks.is_empty() {
             return false;
+        }
+        // If paused, resume first — can't quit a stopped process
+        if self.paused {
+            for track in &self.tracks {
+                let pid = track.child.id() as i32;
+                unsafe { libc::kill(pid, libc::SIGCONT); }
+            }
+            self.paused = false;
         }
         for track in &mut self.tracks {
             if let Some(ref mut stdin) = track.child.stdin {
@@ -857,6 +869,7 @@ pub fn stop_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingS
 
     Ok(RecordingStatus {
         active: false,
+        paused: false,
         file_path,
         input_device: device_names,
         started_at: None,
@@ -864,6 +877,40 @@ pub fn stop_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingS
         peak_dbfs: 0.0,
         file_size_bytes: file_size,
     })
+}
+
+#[tauri::command]
+pub fn pause_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingStatus, String> {
+    let mut state = recorder.0.lock().unwrap();
+    if state.tracks.is_empty() {
+        return Err("no recording in progress".to_string());
+    }
+    if state.paused {
+        return Err("recording is already paused".to_string());
+    }
+    for track in &state.tracks {
+        let pid = track.child.id() as i32;
+        unsafe { libc::kill(pid, libc::SIGSTOP); }
+    }
+    state.paused = true;
+    Ok(state.status())
+}
+
+#[tauri::command]
+pub fn resume_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingStatus, String> {
+    let mut state = recorder.0.lock().unwrap();
+    if state.tracks.is_empty() {
+        return Err("no recording in progress".to_string());
+    }
+    if !state.paused {
+        return Err("recording is not paused".to_string());
+    }
+    for track in &state.tracks {
+        let pid = track.child.id() as i32;
+        unsafe { libc::kill(pid, libc::SIGCONT); }
+    }
+    state.paused = false;
+    Ok(state.status())
 }
 
 #[tauri::command]
@@ -993,4 +1040,44 @@ pub fn delete_recording(file_path: String) -> Result<(), String> {
 
     std::fs::remove_file(&canonical_target)
         .map_err(|e| format!("failed to delete recording: {}", e))
+}
+
+// --- Issue #46: Rename recordings ---
+
+#[tauri::command]
+pub fn rename_recording(old_path: String, new_name: String) -> Result<String, String> {
+    let recordings_dir = default_recordings_dir();
+    let old = PathBuf::from(&old_path);
+
+    // Security: must be within recordings dir
+    let canonical_dir = recordings_dir
+        .canonicalize()
+        .map_err(|e| format!("recordings dir not found: {}", e))?;
+    let canonical_old = old
+        .canonicalize()
+        .map_err(|e| format!("file not found: {}", e))?;
+    if !canonical_old.starts_with(&canonical_dir) {
+        return Err("path outside recordings directory".to_string());
+    }
+
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err("new name must not be empty".to_string());
+    }
+
+    // Build new path: keep same directory and extension, change base name
+    let ext = old
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("wav");
+    let new_filename = format!("{}.{}", trimmed, ext);
+    let new_path = canonical_dir.join(&new_filename);
+
+    if new_path.exists() {
+        return Err("a recording with that name already exists".to_string());
+    }
+
+    std::fs::rename(&canonical_old, &new_path)
+        .map_err(|e| format!("failed to rename recording: {}", e))?;
+    Ok(new_path.to_string_lossy().to_string())
 }

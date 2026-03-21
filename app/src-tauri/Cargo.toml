@@ -25,3 +25,4 @@ block2 = "0.6.2"
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["AVCaptureDevice", "AVMediaFormat", "block2"] }
 chrono = "0.4"
 regex = "1"
+libc = "0.2"
