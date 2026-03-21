@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   fetchVolumeDevices,
@@ -150,9 +151,15 @@ export function renderAudioPanel() {
               <label class="record-device-option"><input type="checkbox" value="default" checked /> System default</label>
             </div>
           </div>
+          <select class="record-format-select" id="record-format-select" title="Output format">
+            <option value="wav">WAV</option>
+            <option value="flac">FLAC</option>
+            <option value="mp3">MP3</option>
+          </select>
           <span class="record-time" id="record-time"></span>
           <span class="record-size" id="record-size"></span>
         </div>
+        <div class="record-output-dir" id="record-output-dir"></div>
         <div class="record-meter-row" id="record-meter-row" style="display:none">
           <div class="record-meter-track">
             <div class="record-meter-fill" id="record-meter-fill"></div>
@@ -160,6 +167,15 @@ export function renderAudioPanel() {
           <span class="record-meter-label" id="record-meter-label"></span>
         </div>
         <div class="record-file" id="record-file"></div>
+        <div class="capture-subsection">
+          <div class="capture-subsection-header">
+            <span>Recordings</span>
+            <button class="capture-service-btn secondary" id="recordings-refresh">Refresh</button>
+          </div>
+          <div id="recordings-list">
+            <span class="audio-unavailable">loading...</span>
+          </div>
+        </div>
         <div id="capture-readiness"></div>
         <div class="capture-subsection">
           <div class="capture-subsection-header">
@@ -943,6 +959,54 @@ export function setupAudioPanelEvents() {
     }
   });
 
+  // Format selector: persist to localStorage
+  const formatSelect = document.getElementById("record-format-select") as HTMLSelectElement | null;
+  if (formatSelect) {
+    const savedFmt = localStorage.getItem("record-format");
+    if (savedFmt && ["wav", "flac", "mp3"].includes(savedFmt)) {
+      formatSelect.value = savedFmt;
+    }
+    formatSelect.addEventListener("change", () => {
+      localStorage.setItem("record-format", formatSelect.value);
+    });
+  }
+
+  // Output directory label: show current dir, click to reveal in Finder
+  loadOutputDirLabel();
+
+  // Recordings list: refresh button
+  document.getElementById("recordings-refresh")?.addEventListener("click", () => {
+    refreshRecordings();
+  });
+
+  // Recordings list: delegated click handlers for reveal and delete
+  document.getElementById("recordings-list")?.addEventListener("click", async (event) => {
+    const target = event.target as HTMLElement;
+    if (target.classList.contains("recording-reveal-btn")) {
+      const path = target.dataset.path;
+      if (path) {
+        revealItemInDir(path).catch((err) => console.error("reveal recording failed:", err));
+      }
+    }
+    if (target.classList.contains("recording-delete-btn")) {
+      const path = target.dataset.path;
+      const name = target.dataset.name || "this recording";
+      if (path && confirm(`Delete "${name}"?`)) {
+        try {
+          await invoke("delete_recording", { filePath: path });
+          refreshRecordings();
+        } catch (err) {
+          console.error("delete recording failed:", err);
+        }
+      }
+    }
+  });
+
+  // Global shortcut: toggle recording via Cmd+Shift+R
+  listen("toggle-recording", () => {
+    toggleRecording();
+  });
+
   // Lock poll while the user is dragging a volume slider
   container.addEventListener("mousedown", (e) => {
     const cls = (e.target as HTMLElement).classList;
@@ -1153,6 +1217,14 @@ interface RecordingStatusResult {
   fileSizeBytes?: number;
 }
 
+interface RecordingInfo {
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  createdAt: string;
+  durationSeconds: number | null;
+}
+
 interface AudioInputDevice {
   index: number;
   name: string;
@@ -1263,8 +1335,11 @@ async function toggleRecording() {
       updateRecordingUI(result);
     } else {
       const selected = getSelectedDevices();
+      const formatSelect = document.getElementById("record-format-select") as HTMLSelectElement | null;
+      const fmt = formatSelect?.value || localStorage.getItem("record-format") || "wav";
       const result = await invoke<RecordingStatusResult>("start_recording", {
         inputDevices: selected.length > 0 ? selected : undefined,
+        format: fmt,
       });
       updateRecordingUI(result);
     }
@@ -1284,6 +1359,74 @@ async function refreshRecordingStatus() {
     updateRecordingUI(result);
   } catch {
     // silent
+  }
+}
+
+async function loadOutputDirLabel() {
+  const el = document.getElementById("record-output-dir");
+  if (!el) return;
+  try {
+    const dir = await invoke<string>("get_recording_output_dir");
+    el.innerHTML = `<span class="record-output-dir-path" id="record-output-dir-path" title="Click to open in Finder">${dir}</span>`;
+    const pathEl = document.getElementById("record-output-dir-path");
+    pathEl?.addEventListener("click", async () => {
+      try {
+        await invoke("reveal_recording_output_dir");
+      } catch (err) {
+        console.error("reveal output dir failed:", err);
+      }
+    });
+  } catch {
+    // silent
+  }
+}
+
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+async function refreshRecordings() {
+  const el = document.getElementById("recordings-list");
+  if (!el) return;
+
+  try {
+    const recordings = await invoke<RecordingInfo[]>("list_recordings");
+    if (recordings.length === 0) {
+      el.innerHTML = `<span class="audio-unavailable">No recordings</span>`;
+      return;
+    }
+
+    el.innerHTML = recordings
+      .map((r) => {
+        const size = formatFileSize(r.sizeBytes);
+        const date = new Date(r.createdAt);
+        const dateStr = date.toLocaleDateString(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        });
+        const dur =
+          r.durationSeconds != null ? formatDuration(r.durationSeconds) : "";
+        const escapedPath = r.filePath.replace(/"/g, "&quot;");
+        return `<div class="recording-item">
+          <div class="recording-item-info">
+            <span class="recording-item-name">${r.fileName}</span>
+            <span class="recording-item-meta">${size}${dur ? " \u00b7 " + dur : ""} \u00b7 ${dateStr}</span>
+          </div>
+          <div class="recording-item-actions">
+            <button class="recording-reveal-btn" data-path="${escapedPath}" title="Show in Finder">Finder</button>
+            <button class="recording-delete-btn" data-path="${escapedPath}" data-name="${r.fileName.replace(/"/g, "&quot;")}" title="Delete recording">Del</button>
+          </div>
+        </div>`;
+      })
+      .join("");
+  } catch {
+    el.innerHTML = `<span class="audio-unavailable">could not list recordings</span>`;
   }
 }
 
@@ -1445,6 +1588,7 @@ export function pollAudioPanel() {
   refreshCapture();
   refreshCaptureSources();
   refreshRecordingStatus();
+  refreshRecordings();
   loadInputDevices();
 
   // Staggered intervals — volume/mic poll skips when locked
@@ -1456,7 +1600,8 @@ export function pollAudioPanel() {
   pollTimers.push(setInterval(refreshCapture, 15000));
   pollTimers.push(setInterval(refreshCaptureSources, 10000));
   pollTimers.push(setInterval(refreshAudioAssistService, 10000));
-  pollTimers.push(setInterval(refreshRecordingStatus, 2000));
+  pollTimers.push(setInterval(refreshRecordingStatus, 500));
+  pollTimers.push(setInterval(refreshRecordings, 30000));
 }
 
 export function stopAudioPanelPolling() {

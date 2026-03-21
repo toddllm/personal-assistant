@@ -811,6 +811,51 @@ header h1 {
   cursor: not-allowed;
 }
 
+.record-format-select {
+  font-size: 10px;
+  padding: 3px 6px;
+  border: 1px solid #0f3460;
+  border-radius: 3px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  outline: none;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.record-format-select:hover {
+  background: #0f3460;
+  color: #eef2ff;
+}
+
+.record-format-select:focus {
+  border-color: #e94560;
+}
+
+.record-output-dir {
+  font-size: 10px;
+  color: #666;
+  margin-top: 2px;
+  margin-bottom: 2px;
+  min-height: 14px;
+}
+
+.record-output-dir-path {
+  cursor: pointer;
+  color: #888;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  max-width: 100%;
+}
+
+.record-output-dir-path:hover {
+  color: #e94560;
+  text-decoration: underline;
+}
+
 .record-device-dropdown {
   display: none;
   position: absolute;
@@ -883,7 +928,7 @@ header h1 {
 .record-meter-fill {
   height: 100%;
   border-radius: 3px;
-  transition: width 0.15s ease-out;
+  transition: width 0.4s ease-out;
   width: 0;
 }
 
@@ -1099,6 +1144,73 @@ header h1 {
 .capture-source-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+/* Recording list / file manager */
+.recording-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 1px solid rgba(15, 52, 96, 0.7);
+  border-radius: 6px;
+  background: rgba(15, 18, 36, 0.7);
+  margin-bottom: 4px;
+}
+
+.recording-item-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.recording-item-name {
+  font-size: 11px;
+  color: #eef2ff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-item-meta {
+  font-size: 10px;
+  color: #888;
+}
+
+.recording-item-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.recording-reveal-btn,
+.recording-delete-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  border: 1px solid #0f3460;
+  border-radius: 4px;
+  background: #1a1a2e;
+  color: #c4cade;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.recording-reveal-btn:hover {
+  background: #0f3460;
+  border-color: #e94560;
+}
+
+.recording-delete-btn {
+  border-color: rgba(255, 82, 82, 0.3);
+  color: #ff8a80;
+}
+
+.recording-delete-btn:hover {
+  background: rgba(255, 82, 82, 0.15);
+  border-color: #ff5252;
 }
 
 /* Voice Chat panel */

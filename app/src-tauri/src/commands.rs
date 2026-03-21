@@ -563,7 +563,32 @@ pub fn request_microphone_permission() -> Result<MediaPermissionStatus, String> 
 
 // --- Audio Recording Commands ---
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingInfo {
+    pub file_name: String,
+    pub file_path: String,
+    pub size_bytes: u64,
+    pub created_at: String, // ISO 8601
+    pub duration_seconds: Option<f64>,
+}
+
+fn recorder_config_path() -> PathBuf {
+    monorepo_root().join("data").join("recorder-config.json")
+}
+
 fn default_recordings_dir() -> PathBuf {
+    // Read from config file first, fall back to data/recordings/
+    if let Ok(data) = std::fs::read_to_string(recorder_config_path()) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(dir) = cfg.get("output_dir").and_then(|v| v.as_str()) {
+                let p = PathBuf::from(dir);
+                if !dir.is_empty() {
+                    return p;
+                }
+            }
+        }
+    }
     monorepo_root().join("data").join("recordings")
 }
 
@@ -702,6 +727,7 @@ pub fn start_recording(
     recorder: tauri::State<'_, Recorder>,
     input_devices: Option<Vec<String>>,
     output_dir: Option<String>,
+    format: Option<String>,
 ) -> Result<RecordingStatus, String> {
     let mut state = recorder.0.lock().unwrap();
     if !state.tracks.is_empty() {
@@ -725,6 +751,12 @@ pub fn start_recording(
     let timestamp = now.format("%Y-%m-%d_%H%M%S");
     let levels = Arc::new(Mutex::new(RecordingLevels::default()));
     let mut first_error: Option<String> = None;
+    let fmt = format.unwrap_or_else(|| "wav".to_string()).to_lowercase();
+    let file_ext = match fmt.as_str() {
+        "flac" => "flac",
+        "mp3" => "mp3",
+        _ => "wav",
+    };
 
     for (i, device_arg) in devices.iter().enumerate() {
         let device_display = resolve_device_name(device_arg);
@@ -738,24 +770,42 @@ pub fn start_recording(
         } else {
             String::new()
         };
-        let filename = format!("recording_{}{}.wav", timestamp, suffix);
+        let filename = format!("recording_{}{}.{}", timestamp, suffix, file_ext);
         let file_path = dir.join(&filename);
 
         // Only attach ebur128 level reader to the first track
         let use_ebur128 = i == 0;
         let af_arg = if use_ebur128 { "ebur128=peak=true" } else { "anull" };
 
+        // Build codec args based on format
+        let mut ffmpeg_args: Vec<String> = vec![
+            "-f".to_string(), "avfoundation".to_string(),
+            "-i".to_string(), format!(":{}", device_arg),
+            "-af".to_string(), af_arg.to_string(),
+            "-ac".to_string(), "1".to_string(),
+            "-ar".to_string(), "48000".to_string(),
+        ];
+        match file_ext {
+            "flac" => {
+                ffmpeg_args.extend(["-c:a".to_string(), "flac".to_string()]);
+            }
+            "mp3" => {
+                ffmpeg_args.extend([
+                    "-c:a".to_string(), "libmp3lame".to_string(),
+                    "-q:a".to_string(), "2".to_string(),
+                ]);
+            }
+            _ => {
+                // wav: keep sample format
+                ffmpeg_args.extend(["-sample_fmt".to_string(), "s16".to_string()]);
+            }
+        }
+        ffmpeg_args.extend(["-y".to_string(), file_path.to_str().unwrap().to_string()]);
+
+        let ffmpeg_arg_refs: Vec<&str> = ffmpeg_args.iter().map(|s| s.as_str()).collect();
+
         let mut child = match Command::new("ffmpeg")
-            .args([
-                "-f", "avfoundation",
-                "-i", &format!(":{}", device_arg),
-                "-af", af_arg,
-                "-ac", "1",
-                "-ar", "48000",
-                "-sample_fmt", "s16",
-                "-y",
-                file_path.to_str().unwrap(),
-            ])
+            .args(&ffmpeg_arg_refs)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
@@ -814,4 +864,133 @@ pub fn stop_recording(recorder: tauri::State<'_, Recorder>) -> Result<RecordingS
         peak_dbfs: 0.0,
         file_size_bytes: file_size,
     })
+}
+
+#[tauri::command]
+pub fn get_recording_output_dir() -> String {
+    default_recordings_dir().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+pub fn set_recording_output_dir(path: String) -> Result<String, String> {
+    let config_path = recorder_config_path();
+    // Ensure parent dir exists
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create config directory: {}", e))?;
+    }
+    let cfg = serde_json::json!({ "output_dir": path });
+    std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap())
+        .map_err(|e| format!("failed to write config: {}", e))?;
+    Ok(path)
+}
+
+#[tauri::command]
+pub fn reveal_recording_output_dir() -> Result<(), String> {
+    let dir = default_recordings_dir();
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("failed to create directory: {}", e))?;
+    Command::new("open")
+        .arg(dir.to_str().unwrap_or("."))
+        .spawn()
+        .map_err(|e| format!("failed to open Finder: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn list_recordings() -> Result<Vec<RecordingInfo>, String> {
+    let dir = default_recordings_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let entries =
+        std::fs::read_dir(&dir).map_err(|e| format!("failed to read recordings dir: {}", e))?;
+    let extensions = ["wav", "flac", "mp3"];
+    let mut recordings = Vec::new();
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !extensions.contains(&ext.as_str()) {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        let file_path = path.to_string_lossy().to_string();
+        let size_bytes = metadata.len();
+
+        let created_at = metadata
+            .created()
+            .or_else(|_| metadata.modified())
+            .map(|t| {
+                let dt: chrono::DateTime<chrono::Local> = t.into();
+                dt.to_rfc3339()
+            })
+            .unwrap_or_default();
+
+        // Estimate duration for WAV files: size / (sample_rate * bytes_per_sample * channels)
+        // 48000 Hz, 16-bit (2 bytes), mono (1 channel) = 96000 bytes/sec
+        // Subtract 44-byte WAV header
+        let duration_seconds = if ext == "wav" {
+            let data_bytes = size_bytes.saturating_sub(44);
+            Some(data_bytes as f64 / (48000.0 * 2.0 * 1.0))
+        } else {
+            None
+        };
+
+        recordings.push(RecordingInfo {
+            file_name,
+            file_path,
+            size_bytes,
+            created_at,
+            duration_seconds,
+        });
+    }
+
+    // Sort by created date, newest first
+    recordings.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(recordings)
+}
+
+#[tauri::command]
+pub fn delete_recording(file_path: String) -> Result<(), String> {
+    let recordings_dir = default_recordings_dir();
+    let target = PathBuf::from(&file_path);
+
+    // Security check: ensure path is within recordings directory
+    let canonical_dir = recordings_dir
+        .canonicalize()
+        .map_err(|e| format!("recordings dir not found: {}", e))?;
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|e| format!("file not found: {}", e))?;
+
+    if !canonical_target.starts_with(&canonical_dir) {
+        return Err("path is outside the recordings directory".to_string());
+    }
+
+    std::fs::remove_file(&canonical_target)
+        .map_err(|e| format!("failed to delete recording: {}", e))
 }

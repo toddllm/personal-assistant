@@ -48,11 +48,15 @@ pub fn run() {
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
                     if event.state == ShortcutState::Pressed {
-                        let s = Shortcut::new(
+                        let toggle_window = Shortcut::new(
                             Some(Modifiers::SUPER | Modifiers::SHIFT),
                             Code::Space,
                         );
-                        if shortcut == &s {
+                        let toggle_recording = Shortcut::new(
+                            Some(Modifiers::SUPER | Modifiers::SHIFT),
+                            Code::KeyR,
+                        );
+                        if shortcut == &toggle_window {
                             if let Some(w) = app.get_webview_window("main") {
                                 if w.is_visible().unwrap_or(false) {
                                     hide_webview_window(&w);
@@ -60,18 +64,27 @@ pub fn run() {
                                     show_webview_window(&w);
                                 }
                             }
+                        } else if shortcut == &toggle_recording {
+                            let _ = app.emit("toggle-recording", ());
                         }
                     }
                 })
                 .build(),
         )
         .setup(|app| {
-            // Register global shortcut: Cmd+Shift+Space
+            // Register global shortcut: Cmd+Shift+Space (toggle window)
             let shortcut = Shortcut::new(
                 Some(Modifiers::SUPER | Modifiers::SHIFT),
                 Code::Space,
             );
             app.global_shortcut().register(shortcut)?;
+
+            // Register global shortcut: Cmd+Shift+R (toggle recording)
+            let record_shortcut = Shortcut::new(
+                Some(Modifiers::SUPER | Modifiers::SHIFT),
+                Code::KeyR,
+            );
+            app.global_shortcut().register(record_shortcut)?;
 
             // Build tray menu
             let show_i = MenuItem::with_id(app, "show", "Show Dashboard", true, None::<&str>)?;
@@ -136,6 +149,11 @@ pub fn run() {
             commands::start_recording,
             commands::stop_recording,
             commands::list_audio_input_devices,
+            commands::get_recording_output_dir,
+            commands::set_recording_output_dir,
+            commands::reveal_recording_output_dir,
+            commands::list_recordings,
+            commands::delete_recording,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
